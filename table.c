@@ -1,6 +1,6 @@
 /*
-    Directory Table Management Subsystem
-    Copyright (C) 2008  Nan Dun <dunnan@yl.is.s.u-tokyoa.ac.jp>
+    Directory Table
+    Copyright (C) 2008  Nan Dun <sshfsm@gmail.com>
 
     This program can be distributed under the terms of the GNU GPL.
     See the file COPYING.
@@ -16,9 +16,6 @@
 
 #define DEFAULT_TABLE_MAX_SIZE	256
 #define DEFAULT_TLB_TIMEOUT	20
-
-#define DEBUG(format, args...)						\
-	do { if (sshfsm.debug) fprintf(stderr, format, args); } while(0)
 
 typedef struct table_tlb_data {
 	int idx;
@@ -362,8 +359,3 @@ int table_parse_options(struct fuse_args *args)
 	table.tlb_on = 1;
 	return fuse_opt_parse(args, &table, table_opts, NULL);
 }
-
-/****************************
- * TODO:
- * 1. Error handling
- ***************************/

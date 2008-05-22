@@ -1,5 +1,5 @@
 /*
-    SSHFS Mutiplex
+    SSHFS Mutiplex Filesystem
     Copyright (C) 2008  Nan Dun <sshfsmm@gmail.com>
 
     This program can be distributed under the terms of the GNU GPL.
@@ -34,8 +34,8 @@
 #include <netinet/tcp.h>
 #include <glib.h>
 
-#include "table.h"
 #include "cache.h"
+#include "table.h"
 
 #if FUSE_VERSION >= 23
 #define SSHFS_USE_INIT
@@ -160,9 +160,11 @@ struct sshfsm_file {
 	int connver;
 	int modifver;
 	int refs;
+	int host_idx;
 };
 
 struct sshfsm {
+	/* Basic configuration */
 	char *directport;
 	char *ssh_command;
 	char *sftp_server;
@@ -185,24 +187,18 @@ struct sshfsm {
 	int debug;
 	int foreground;
 	int reconnect;
-	char *host;
-	char *base_path;
-	GHashTable *reqtab;
-	pthread_mutex_t lock;
-	pthread_mutex_t lock_write;
-	int processing_thread_started;
+
+	/* Hosts */
+	struct host **hosts;
+	int hosts_num;
+	pthread_mutex_t lock_hosts;
+	
+	/* Misc */
 	unsigned int randseed;
-	int fd;
-	int ptyfd;
-	int ptyslavefd;
-	int connver;
-	int server_version;
-	unsigned remote_uid;
 	unsigned local_uid;
 	int remote_uid_detected;
 	unsigned blksize;
 	char *progname;
-	long modifver;
 	unsigned outstanding_len;
 	unsigned max_outstanding_len;
 	pthread_cond_t outstanding_cond;
@@ -511,11 +507,12 @@ static inline void buf_add_string(struct buffer *buf, const char *str)
 	buf_add_data(buf, &data);
 }
 
-static inline void buf_add_path(struct buffer *buf, const char *path)
+static inline void buf_add_path(const int idx, struct buffer *buf, 
+								const char *path)
 {
 	char *realpath;
 
-	realpath = g_strdup_printf("%s%s", sshfsm.base_path,
+	realpath = g_strdup_printf("%s%s", sshfsm.hosts[idx]->basepath,
 				   path[1] ? path+1 : ".");
 	buf_add_string(buf, realpath);
 	g_free(realpath);
@@ -589,7 +586,8 @@ static inline int buf_get_string(struct buffer *buf, char **str)
 	return 0;
 }
 
-static int buf_get_attrs(struct buffer *buf, struct stat *stbuf, int *flagsp)
+static int buf_get_attrs(const int idx, struct buffer *buf, 
+						 struct stat *stbuf, int *flagsp)
 {
 	uint32_t flags;
 	uint64_t size = 0;
@@ -634,7 +632,7 @@ static int buf_get_attrs(struct buffer *buf, struct stat *stbuf, int *flagsp)
 		}
 	}
 
-	if (sshfsm.remote_uid_detected && uid == sshfsm.remote_uid)
+	if (sshfsm.remote_uid_detected && uid == sshfsm.hosts[idx]->uid)
 		uid = sshfsm.local_uid;
 
 	memset(stbuf, 0, sizeof(struct stat));
@@ -782,7 +780,7 @@ static int do_ssh_nodelay_workaround(void)
 }
 #endif
 
-static int pty_expect_loop(void)
+static int pty_expect_loop(const int idx)
 {
 	int res;
 	char buf[256];
@@ -792,12 +790,14 @@ static int pty_expect_loop(void)
 	int len = 0;
 	char c;
 
+	struct host *hostp = sshfsm.hosts[idx];
+
 	while (1) {
 		struct pollfd fds[2];
 
-		fds[0].fd = sshfsm.fd;
+		fds[0].fd = hostp->fd;
 		fds[0].events = POLLIN;
-		fds[1].fd = sshfsm.ptyfd;
+		fds[1].fd = hostp->ptyfd;
 		fds[1].events = POLLIN;
 		res = poll(fds, 2, timeout);
 		if (res == -1) {
@@ -882,11 +882,13 @@ static void replace_arg(char **argp, const char *newarg)
 	}
 }
 
-static int start_ssh(void)
+static int start_ssh(const int idx)
 {
 	char *ptyname = NULL;
 	int sockpair[2];
 	int pid;
+
+	struct host *hostp = sshfsm.hosts[idx];
 
 	if (sshfsm.password_stdin) {
 
@@ -903,7 +905,7 @@ static int start_ssh(void)
 		perror("failed to create socket pair");
 		return -1;
 	}
-	sshfsm.fd = sockpair[0];
+	hostp->fd = sockpair[0];
 
 	pid = fork();
 	if (pid == -1) {
@@ -994,7 +996,7 @@ static int start_ssh(void)
 	return 0;
 }
 
-static int connect_to(char *host, char *port)
+static int connect_to(const int idx, char *port)
 {
 	int err;
 	int sock;
@@ -1002,10 +1004,12 @@ static int connect_to(char *host, char *port)
 	struct addrinfo *ai;
 	struct addrinfo hint;
 
+	struct host *hostp = sshfsm.hosts[idx];
+
 	memset(&hint, 0, sizeof(hint));
 	hint.ai_family = PF_INET;
 	hint.ai_socktype = SOCK_STREAM;
-	err = getaddrinfo(host, port, &hint, &ai);
+	err = getaddrinfo(hostp->hostname, port, &hint, &ai);
 	if (err) {
 		fprintf(stderr, "failed to resolve %s:%s: %s\n", host, port,
 			gai_strerror(err));
@@ -1028,15 +1032,16 @@ static int connect_to(char *host, char *port)
 
 	freeaddrinfo(ai);
 
-	sshfsm.fd = sock;
+	hostp->fd = sock;
 	return 0;
 }
 
-static int do_write(struct iovec *iov, size_t count)
+static int do_write(const int idx, struct iovec *iov, size_t count)
 {
 	int res;
+	struct host *hostp = sshfsm.hosts[idx];
 	while (count) {
-		res = writev(sshfsm.fd, iov, count);
+		res = writev(hostp->fd, iov, count);
 		if (res == -1) {
 			perror("write");
 			return -1;
@@ -1083,14 +1088,15 @@ static size_t iov_length(const struct iovec *iov, unsigned long nr_segs)
 
 #define SFTP_MAX_IOV 3
 
-static int sftp_send_iov(uint8_t type, uint32_t id, struct iovec iov[],
-                         size_t count)
+static int sftp_send_iov(const int idx, uint8_t type, uint32_t id, 
+						 struct iovec iov[], size_t count)
 {
 	int res;
 	struct buffer buf;
 	struct iovec iovout[SFTP_MAX_IOV];
 	unsigned i;
 	unsigned nout = 0;
+	struct host *hostp = sshfsm.hosts[idx];
 
 	assert(count <= SFTP_MAX_IOV - 1);
 	buf_init(&buf, 9);
@@ -1100,9 +1106,9 @@ static int sftp_send_iov(uint8_t type, uint32_t id, struct iovec iov[],
 	buf_to_iov(&buf, &iovout[nout++]);
 	for (i = 0; i < count; i++)
 		iovout[nout++] = iov[i];
-	pthread_mutex_lock(&sshfsm.lock_write);
+	pthread_mutex_lock(&(hostp->lock_write));
 	res = do_write(iovout, nout);
-	pthread_mutex_unlock(&sshfsm.lock_write);
+	pthread_mutex_unlock(&(hostp->lock_write));
 	buf_free(&buf);
 	return res;
 }

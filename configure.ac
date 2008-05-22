@@ -76,8 +76,8 @@ AC_ARG_ENABLE(hpnssh,
 if test -z "$enable_hpnssh"; then
 	AC_MSG_CHECKING([HPN-SSH])
 	[eval `ssh -V 2>&1 | sed -n 's/^OpenSSH_[.p0-9]*-\([hpn]*\)\([0-9][1-9]*\)v\([0-9]*\).*/hpn=\1 hpn_major=\2 hpn_minor=\3/p'`]
-	if test "x$hpn" != x -a "x$hpn_major" != x -a "x$hpn_minor" != x; then
-		AC_MSG_RESULT([$hpn$hpn_major.$hpn_minor, enabling HPN-SSH support])
+	if test "$hpn" = "hpn" -a "x$hpn_major" != x -a "x$hpn_minor" != x; then
+		AC_MSG_RESULT([$hpn${hpn_major}v$hpn_minor, enabling HPN-SSH support])
 		enable_hpnssh=yes
 	else
 		AC_MSG_RESULT([not found])

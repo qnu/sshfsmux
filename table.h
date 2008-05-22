@@ -15,13 +15,15 @@
 #include <fuse_opt.h>
 
 struct host {
-	char *host_name;
-	char *base_path;
+	char *hostname;
+	char *basepath;
 	int rank;
 	int server_version;
 	int connver;
 	int modifver;
 	int	fd;
+	int ptyfd;
+	int ptyslavefd;
 	unsigned uid;
 	GHashTable *reqtab;
 	pthread_mutex_t lock;

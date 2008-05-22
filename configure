@@ -7532,9 +7532,9 @@ if test -z "$enable_hpnssh"; then
 	{ echo "$as_me:$LINENO: checking HPN-SSH" >&5
 echo $ECHO_N "checking HPN-SSH... $ECHO_C" >&6; }
 	eval `ssh -V 2>&1 | sed -n 's/^OpenSSH_[.p0-9]*-\([hpn]*\)\([0-9][1-9]*\)v\([0-9]*\).*/hpn=\1 hpn_major=\2 hpn_minor=\3/p'`
-	if test "x$hpn" != x -a "x$hpn_major" != x -a "x$hpn_minor" != x; then
-		{ echo "$as_me:$LINENO: result: $hpn$hpn_major.$hpn_minor, enabling HPN-SSH support" >&5
-echo "${ECHO_T}$hpn$hpn_major.$hpn_minor, enabling HPN-SSH support" >&6; }
+	if test "$hpn" = "hpn" -a "x$hpn_major" != x -a "x$hpn_minor" != x; then
+		{ echo "$as_me:$LINENO: result: $hpn${hpn_major}v$hpn_minor, enabling HPN-SSH support" >&5
+echo "${ECHO_T}$hpn${hpn_major}v$hpn_minor, enabling HPN-SSH support" >&6; }
 		enable_hpnssh=yes
 	else
 		{ echo "$as_me:$LINENO: result: not found" >&5

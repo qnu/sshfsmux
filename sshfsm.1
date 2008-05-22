@@ -1,8 +1,8 @@
-.TH SSHFSMM "1" "April 2008" "SSHFSM version 2.0" "User Commands"
+.TH SSHFSM "1" "June 2008" "SSHFS-MUX version 1.1" "User Commands"
 .SH NAME
-SSHFSM \- filesystem client based on ssh
+SSHFSM \- SSHFS Mutiplex Filesystem
 .SH DESCRIPTION
-usage: sshfs [user@]host:[dir] mountpoint [options]
+usage: sshfsm [user@]host:[dir] [user@]host:[dir]... mountpoint [options]
 .SS "general options:"
 .TP
 \fB\-o\fR opt,[opt...]
@@ -27,13 +27,13 @@ equivalent to '\-o ssh_protocol=1'
 \fB\-o\fR reconnect
 reconnect to server
 .TP
-\fB\-o\fR sshfs_sync
+\fB\-o\fR sshfsm_sync
 synchronous writes
 .TP
 \fB\-o\fR no_readahead
 synchronous reads (no speculative readahead)
 .TP
-\fB\-o\fR sshfs_debug
+\fB\-o\fR sshfsm_debug
 print some debugging information
 .TP
 \fB\-o\fR cache=YESNO
