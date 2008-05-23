@@ -1,6 +1,6 @@
 /*
   Caching file system proxy
-  Copyright (C) 2004  Miklos Szeredi <miklos@szeredi.hu>
+  Copyright (C) 2008  Nan Dun <sshfsm@gmail.com>
 
   This program can be distributed under the terms of the GNU GPL.
   See the file COPYING.
@@ -538,6 +538,12 @@ struct fuse_operations *cache_init(struct fuse_cache_operations *oper)
 		}
 	}
 	return &cache_oper;
+}
+
+void cache_destroy()
+{	
+	if (cache.on)
+		g_hash_table_destroy(cache.table);
 }
 
 static const struct fuse_opt cache_opts[] = {

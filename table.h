@@ -30,11 +30,13 @@ struct host {
 	pthread_mutex_t lock;
 	pthread_mutex_t	lock_write;
 	int processing_thread_started;
+	unsigned outstanding_len;
+	pthread_cond_t outstanding_cond;
 	uint32_t idctr;
 };
 
 struct table_entry {
-	int size;
+	unsigned size;
 	int *idx_arr;
 	time_t atime;
 	unsigned long checksum;

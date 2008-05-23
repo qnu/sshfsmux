@@ -66,7 +66,7 @@ void table_entry_free(struct table_entry *entry)
 unsigned long table_entry_hash(struct table_entry *entry)
 {
 	unsigned long value;
-	int i;
+	unsigned i;
 	
 	value = 0;
 	for (i = 0; i < entry->size; i++)
@@ -102,8 +102,8 @@ int table_create(struct host **host_arr, int host_num)
 		/* Fill idx_arr for "/" */
 		entry->idx_arr[i] = i;
 		/* Fill host map */
-		hoststr = g_strdup_printf("%s:%s", hostp->host_name, 
-										   hostp->base_path);
+		hoststr = g_strdup_printf("%s:%s", hostp->hostname, 
+										   hostp->basepath);
 		table_host_map_insert(hoststr, i);
 		g_free(hoststr);
 	}
