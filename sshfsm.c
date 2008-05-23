@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <malloc.h>
 #include <fcntl.h>
 #include <string.h>
 #include <stdint.h>
@@ -164,6 +165,27 @@ struct sshfsm_file {
 	int modifver;
 	int refs;
 	int host_idx;
+};
+
+struct host {
+	char *hostname;
+	char *basepath;
+	int rank;
+	int server_version;
+	int connver;
+	int modifver;
+	int	fd;
+	int ptyfd;
+	int ptyslavefd;
+	unsigned uid;
+	int uid_detected;
+	GHashTable *reqtab;
+	pthread_mutex_t lock;
+	pthread_mutex_t	lock_write;
+	int processing_thread_started;
+	unsigned outstanding_len;
+	pthread_cond_t outstanding_cond;
+	uint32_t idctr;
 };
 
 struct sshfsm {
@@ -3405,7 +3427,7 @@ int main(int argc, char *argv[])
 	if (!sshfsm.no_check_root && sftp_check_root_all() == -1)
 		exit(1);
 	
-	if (table_create(sshfsm.hosts, sshfsm.hosts_num) == -1)
+	if (table_init() == -1)
 		exit(1);
 
 	res = cache_parse_options(&args);

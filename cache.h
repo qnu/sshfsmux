@@ -6,6 +6,9 @@
     See the file COPYING.
 */
 
+#ifndef	_SSHFSM_CACHE_H_
+#define	_SSHFSM_CACHE_H_
+
 #include <fuse.h>
 #include <fuse_opt.h>
 
@@ -27,3 +30,5 @@ void cache_destroy();
 int cache_parse_options(struct fuse_args *args);
 void cache_add_attr(const char *path, const struct stat *stbuf);
 void cache_invalidate(const char *path);
+
+#endif	/* _SSHFSM_CACHE_H_ */
