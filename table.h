@@ -25,6 +25,7 @@ struct host {
 	int ptyfd;
 	int ptyslavefd;
 	unsigned uid;
+	int uid_detected;
 	GHashTable *reqtab;
 	pthread_mutex_t lock;
 	pthread_mutex_t	lock_write;
