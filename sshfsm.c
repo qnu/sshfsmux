@@ -786,7 +786,8 @@ static int buf_get_entries(const int idx, const char *path,
 				}
 				
 				/* aggresively add directory to reduce query message */
-				if (S_ISDIR(stbuf.st_mode)) {
+				if (strcmp(name, ".") != 0 && strcmp(name, "..") != 0
+					 && S_ISDIR(stbuf.st_mode)) {
 					char *fullpath = concate_path(path, name);
 					table_insert(fullpath, idx, sshfsm.hosts[idx]->rank);
 					g_free(fullpath);
@@ -2054,19 +2055,20 @@ static int host_getattr(const int idx, const char *path, struct stat *stbuf)
 	return err;
 }
 
-static int sshfsm_getattr(const char *path_, struct stat *stbuf)
+static int sshfsm_getattr(const char *path, struct stat *stbuf)
 {
-	struct idx_item *item;
 	int r_flag;
-	char *path = get_parent_dir(g_strdup(path_));
-	idx_list_t list = table_lookup_r(path, &r_flag);
+	char *parent_dir = get_parent_dir(g_strdup(path));
+	idx_list_t list = table_lookup_r(parent_dir, &r_flag);
+	g_free(parent_dir);
 	int err = 0;
 	while (list) {
-		item = (struct idx_item *) list->data;
+		struct idx_item *item = (struct idx_item *) list->data;
 		err = host_getattr(item->idx, path, stbuf);
-		printf("*******dbg: getattr %s to %s:%s\n", path, 
-			sshfsm.hosts[item->idx]->hostname,
-			sshfsm.hosts[item->idx]->basepath);
+		DEBUG("  op:getattr(err: %d, path: %s, host: %s:%s)\n", 
+			  err, path, 
+			  sshfsm.hosts[item->idx]->hostname,
+			  sshfsm.hosts[item->idx]->basepath);
 		if (!err) {
 			if (S_ISDIR(stbuf->st_mode))
 				table_insert(path, item->idx, item->rank);
@@ -2183,7 +2185,21 @@ static int host_readlink(const int idx, const char *path, char *linkbuf, size_t 
 
 static int sshfsm_readlink(const char *path, char *linkbuf, size_t size)
 {
-	return host_readlink(0, path, linkbuf, size);
+	int r_flag;
+	idx_list_t list = table_lookup_r(path, &r_flag);
+	int err = 0;
+	while (list) {
+		struct idx_item *item = (struct idx_item *) list->data;
+		err = host_readlink(item->idx, path, linkbuf, size);
+		DEBUG("  op:readlink(err: %d, path: %s, host: %s:%s)\n", 
+			  err, path, 
+			  sshfsm.hosts[item->idx]->hostname,
+			  sshfsm.hosts[item->idx]->basepath);
+		if (!err)
+			break;
+		list = list->next;
+	}
+	return err;
 }
 
 static int host_getdir(const int idx, const char *path, GSList **entry_list)
