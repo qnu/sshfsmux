@@ -459,6 +459,25 @@ static int list_empty(const struct list_head *head)
 	return head->next == head;
 }
 
+static inline char * concate_path(const char *path, const char *name)
+{
+	if (strcmp(path, "/") == 0)
+		return g_strdup_printf("/%s", name);
+	return g_strdup_printf("%s/%s", path, name);
+}
+
+static inline char * get_parent_dir(char *path)
+{
+	if (strcmp(path, "/") == 0)
+		return path;
+	
+	int i = strlen(path) - 1;
+	do {
+		path[i--] = '\0';
+	} while (i != 0 && path[i] != '/');
+	return path;
+}
+
 static inline void buf_init(struct buffer *buf, size_t size)
 {
 	if (size) {
@@ -741,9 +760,9 @@ static int buf_get_statvfs(struct buffer *buf, struct statvfs *stbuf)
 	return 0;
 }
 
-static int buf_get_entries(const int idx, struct buffer *buf, 
-						fuse_cache_dirh_t h, fuse_cache_dirfil_t filler,
-						GHashTable *entry_filter)
+static int buf_get_entries(const int idx, const char *path, 
+						struct buffer *buf, GHashTable *entry_filter,
+						fuse_cache_dirh_t h, fuse_cache_dirfil_t filler)
 {
 	uint32_t count;
 	unsigned i;
@@ -767,8 +786,11 @@ static int buf_get_entries(const int idx, struct buffer *buf,
 				}
 				
 				/* aggresively add directory to reduce query message */
-				if (S_ISDIR(stbuf.st_mode)) 
-					table_insert(name, idx, sshfsm.hosts[idx]->rank);
+				if (S_ISDIR(stbuf.st_mode)) {
+					char *fullpath = concate_path(path, name);
+					table_insert(fullpath, idx, sshfsm.hosts[idx]->rank);
+					g_free(fullpath);
+				}
 			
 				err = 0;
 				/* filtering */
@@ -2032,18 +2054,29 @@ static int host_getattr(const int idx, const char *path, struct stat *stbuf)
 	return err;
 }
 
-static int sshfsm_getattr(const char *path, struct stat *stbuf)
+static int sshfsm_getattr(const char *path_, struct stat *stbuf)
 {
 	struct idx_item *item;
-	idx_list_t list = table_lookup_r(path); /* TODO: judge parent dir */
+	int r_flag;
+	char *path = get_parent_dir(g_strdup(path_));
+	idx_list_t list = table_lookup_r(path, &r_flag);
 	int err = 0;
 	while (list) {
 		item = (struct idx_item *) list->data;
 		err = host_getattr(item->idx, path, stbuf);
+		printf("*******dbg: getattr %s to %s:%s\n", path, 
+			sshfsm.hosts[item->idx]->hostname,
+			sshfsm.hosts[item->idx]->basepath);
 		if (!err) {
-			if (S_ISDIR(stbuf->st_mode)) /* TODO */
+			if (S_ISDIR(stbuf->st_mode))
 				table_insert(path, item->idx, item->rank);
-			break;
+			if (strcmp(path, "/") != 0)
+				break;
+		} else if (!r_flag) {
+			/* since only directory in table
+			 * error from remote request suggests that
+			 * previous entry has become invalid */
+			table_delete_idx(path, item->idx);
 		}
 		list = list->next;
 	}
@@ -2174,7 +2207,6 @@ static int host_getdir(const int idx, const char *path, GSList **entry_list)
 		} while (!err);
 		if (err == MY_EOF)
 			err = 0;
-
 		err2 = sftp_request(idx, SSH_FXP_CLOSE, &handle, 0, NULL);
 		if (!err)
 			err = err2;
@@ -2199,16 +2231,16 @@ static void * getdir_thread_func(void *data)
 	datap->err ? pthread_exit((void *) -1) : pthread_exit((void *) 0);
 }
 
-static int entry_list_get_entries(const int idx, GSList **list, 
-				fuse_cache_dirh_t h, fuse_cache_dirfil_t filler, 
-				GHashTable *entry_filter)
+static int entry_list_get_entries(const int idx, const char *path,
+				GSList **list, GHashTable *entry_filter,
+				fuse_cache_dirh_t h, fuse_cache_dirfil_t filler)
 {
 	int err = 0;
 	GSList *curr = *list;
 	GSList *temp = *list;
 	while (curr) {
 		struct buffer *name = (struct buffer *) curr->data;
-		if (buf_get_entries(idx, name, h, filler, entry_filter) == -1)
+		if (buf_get_entries(idx, path, name, entry_filter, h, filler) == -1)
 			err = -EIO;
 		temp = curr;
 		curr = curr->next;
@@ -2225,8 +2257,9 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 {	
 	pthread_t *threads;
 	pthread_attr_t attr;
-
-	idx_list_t idx_list = table_lookup_r(path);
+	
+	int r_flag;
+	idx_list_t idx_list = table_lookup_r(path, &r_flag);
 	unsigned idx_list_len = g_slist_length(idx_list);
 	int err = 0; 
 	unsigned i = 0;
@@ -2262,23 +2295,25 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 		fprintf(stderr, "failed to create directory entry filter\n");
 		return -EIO;
 	}
-	int retval;
+	int err2;
 	curr = idx_list;
 	for (i = 0; i < idx_list_len; i++) {
 		item = (struct idx_item *) curr->data;
-		err = pthread_join(threads[i], (void *) &retval);
+		err = pthread_join(threads[i], (void *) &err2);
 		if (err) {
 			fprintf(stderr, "sshfsm: join thread failed: %s\n", 
 					strerror(err));
 			return -EIO;
 		}
-		if (retval != 0)
-			DEBUG("debug: getdir from %s failed\n", 
-				 sshfsm.hosts[item->idx]->hostname);
-		
-		/* merge entries */
-		err = entry_list_get_entries(item->idx, &(thread_dat[i].entry_list), 
-					h, filler, entry_filter);
+		if (err2)
+			DEBUG("debug: getdir from %s:%s failed with %d %d\n", 
+				 sshfsm.hosts[item->idx]->hostname,
+				 sshfsm.hosts[item->idx]->basepath, err2,
+				 idx_list_len);
+		else	
+			/* merge entries */
+			err = entry_list_get_entries(item->idx, path, 
+					&(thread_dat[i].entry_list), entry_filter, h, filler);
 		if (err)
 			return err;
 		curr = curr->next;

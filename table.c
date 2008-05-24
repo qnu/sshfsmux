@@ -183,12 +183,14 @@ static inline char * get_parent_dir(char *path)
 	return path;
 }
 
-idx_list_t table_lookup_r(const char *path)
-{	
+idx_list_t table_lookup_r(const char *path, int *r_flag)
+{
+	*r_flag = 0;
 	GSList *idx_list = g_hash_table_lookup(table.table, path);
 	if (idx_list)
 		return idx_list;
 	
+	*r_flag = 1;
 	char *parent_dir = g_strdup(path);
 	while (idx_list == NULL) {
 		parent_dir = get_parent_dir(parent_dir);
@@ -201,10 +203,12 @@ idx_list_t table_lookup_r(const char *path)
 	return idx_list;
 }
 
+#ifdef TEST_TABLE
 /* Debug utilities */
 void table_print_idx_list(const char *path)
 {
-	GSList *list = table_lookup_r(path);
+	int r_flag;
+	GSList *list = table_lookup_r(path, &r_flag);
 	printf("%s: ", path);
 	while (list != NULL) {
 		struct idx_item *item = (struct idx_item *) list->data;
@@ -214,7 +218,6 @@ void table_print_idx_list(const char *path)
 	printf("\n");
 }
 
-#ifdef TEST_TABLE
 int main(void)
 {
 	int res;

@@ -41,13 +41,14 @@ void table_delete_idx(const char *path, const int idx);
 /* Clear all entries in table */
 void table_empty(void);
 
-/* Lookup a entry for path */
+/* Lookup a entry for path 
+ * r_flag is to indicate if recursive lookup happend */
 idx_list_t table_lookup(const char *path);
 
 /* Lookup a entry for recursively 
  * if entry for path not found,
  * return entry for parent directory of path */
-idx_list_t table_lookup_r(const char *path);
+idx_list_t table_lookup_r(const char *path, int *r_flag);
 
 /* Option parser */
 int table_parse_options(struct fuse_args *args);
