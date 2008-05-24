@@ -9,31 +9,38 @@
 #include "table.h"
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <malloc.h>
 #include <pthread.h>
+#include <assert.h>
 
 struct table {
 	GHashTable *table;
 	pthread_mutex_t lock;
+	int debug;
 };
 
 static struct table table;
 
-void item_free(void *data, void *data_)
+#define DEBUG(format, args...)						\
+	do { if (table.debug) fprintf(stderr, format, args); } while(0)
+
+static inline void item_free(void *data, void *data_)
 {
 	(void) data_;
-	free(data);
+	g_free(data);
 }
 
-void table_entry_free(void *entry)
+static inline void table_entry_free(void *entry)
 {
 	GSList *list = (GSList *) entry;
 	g_slist_foreach(list, item_free, NULL);
 	g_slist_free(list);
 }
 
-int table_init()
+int table_create(int debug)
 {
+	table.debug = debug;
 	table.table = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, 
 						table_entry_free);
 	if (!table.table) {
@@ -80,29 +87,146 @@ static inline GSList* find_item(GSList *list, struct idx_item *item)
 	return g_slist_find_custom(list, item, item_compare_by_idx);
 }
 
+static inline GSList* remove_item(GSList *list, GSList *itemp)
+{
+	GSList *newlist = g_slist_remove_link(list, itemp);
+	g_free(itemp->data);
+	g_slist_free(itemp);
+	return newlist;
+}
+
 void table_insert(const char *path, const int idx, const int rank)
 {
-	struct idx_item *item = malloc(sizeof(struct idx_item));
-	if (!item) {
-		fprintf(stderr, "sshfsm: memory alloation failed\n");
-		abort();
-	}
+	struct idx_item *item = g_new(struct idx_item, 1);
 	item->idx = idx;
 	item->rank = rank;
-
-	idx_list_t idx_list = g_hash_table_lookup(table.table, path);
-	if (idx_list == NULL) {	
+	
+	gpointer orig_key, orig_value;
+	gboolean exist = g_hash_table_lookup_extended(table.table, path,
+						&orig_key, &orig_value);
+	if (exist == FALSE) {	
 		/* no entry for path, create one */
-		idx_list = insert_item(idx_list, item);
+		pthread_mutex_lock(&table.lock);
+		GSList* idx_list = insert_item(NULL, item);
 		g_hash_table_insert(table.table, g_strdup(path), idx_list);
-	} else {
-		/* insert if idx does not exist */
-		GSList* found = find_item(idx_list, item);
-		if (found) {
-			free(item);
-			return;
-		} else {
-			return;		
-		}
+		pthread_mutex_unlock(&table.lock);
+		DEBUG("debug: table insert (idx=%d, rank=%d) to %s\n",
+			  item->idx, item->rank, path);
+		return;
 	}
+
+	GSList* found = find_item(orig_value, item);
+	if (found) {
+		/* no duplicate indices */
+		free(item);
+		return;
+	}
+	/* insert if idx does not exist */
+	pthread_mutex_lock(&table.lock);
+	orig_value = insert_item(orig_value, item);
+	g_hash_table_steal(table.table, (const void *) orig_key);
+	g_hash_table_insert(table.table, orig_key, orig_value);
+	pthread_mutex_unlock(&table.lock);
+	DEBUG("debug: table insert (idx=%d, rank=%d) to %s\n",
+		  item->idx, item->rank, path);
 }
+
+void table_remove(const char *path)
+{
+	g_hash_table_remove(table.table, path);
+}
+
+void table_delete_idx(const char *path, const int idx)
+{
+	gpointer orig_key, orig_value;
+	gboolean exist = g_hash_table_lookup_extended(table.table, path,
+						&orig_key, &orig_value);
+	if (exist == FALSE)
+		return;
+	
+	struct idx_item *item = g_new(struct idx_item, 1);
+	item->idx = idx;
+	item->rank = 0;
+	GSList* found = find_item(orig_value, item);
+	if (found) {
+		pthread_mutex_lock(&table.lock);
+		orig_value = remove_item(orig_value, found);
+		g_hash_table_steal(table.table, (const void *) orig_key);
+		g_hash_table_insert(table.table, orig_key, orig_value);
+		pthread_mutex_unlock(&table.lock);
+	}
+	free(item);
+}
+
+void table_empty(void)
+{
+	g_hash_table_remove_all(table.table);
+}
+
+idx_list_t table_lookup(const char *path)
+{
+	return g_hash_table_lookup(table.table, path);
+}
+
+/* Get parent directory of path
+ * strip from behind in place
+ * so use a copy of path */
+static inline char * get_parent_dir(char *path)
+{
+	if (strcmp(path, "/") == 0)
+		return path;
+	
+	int i = strlen(path) - 1;
+	do {
+		path[i--] = '\0';
+	} while (i != 0 && path[i] != '/');
+	return path;
+}
+
+idx_list_t table_lookup_r(const char *path)
+{	
+	GSList *idx_list = g_hash_table_lookup(table.table, path);
+	if (idx_list)
+		return idx_list;
+	
+	char *parent_dir = g_strdup(path);
+	while (idx_list == NULL) {
+		parent_dir = get_parent_dir(parent_dir);
+		DEBUG("debug: table lookup recusively for %s\n", parent_dir);
+		idx_list = g_hash_table_lookup(table.table, parent_dir);
+		if (idx_list)
+			break;
+	}
+	g_free(parent_dir);
+	return idx_list;
+}
+
+/* Debug utilities */
+void table_print_idx_list(const char *path)
+{
+	GSList *list = table_lookup_r(path);
+	printf("%s: ", path);
+	while (list != NULL) {
+		struct idx_item *item = (struct idx_item *) list->data;
+		printf("(%d, %d) ", item->idx, item->rank);
+		list = list->next;
+	}
+	printf("\n");
+}
+
+#ifdef TEST_TABLE
+int main(void)
+{
+	int res;
+	res = table_create(1);
+	table_insert("/", 0, 0);
+	table_insert("/", 1, 10);
+	table_insert("/", 1, 20);
+	table_insert("/", 2, 30);
+	table_insert("/", 2, 40);
+	table_insert("/", 3, 40);
+	table_print_idx_list("/usr");
+	table_destroy();
+	return 0;
+}
+#endif

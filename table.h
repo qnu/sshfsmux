@@ -21,7 +21,7 @@ struct idx_item {
 typedef GSList* idx_list_t;
 
 /* Initial directory table */
-int table_init();
+int table_create(int debug);
 
 /* Destroy directory table */
 void table_destroy(void);
@@ -35,16 +35,22 @@ void table_insert(const char *path, const int idx, const int rank);
 /* Remove one entry from table */
 void table_remove(const char *path);
 
-/* Remove the idx from entry */
-void table_remove_idx(const char *path, const int idx);
-
-/* Lookup a entry for path */
-idx_list_t table_lookup(const char *path);
+/* Delete the idx from entry */
+void table_delete_idx(const char *path, const int idx);
 
 /* Clear all entries in table */
 void table_empty(void);
 
+/* Lookup a entry for path */
+idx_list_t table_lookup(const char *path);
+
+/* Lookup a entry for recursively 
+ * if entry for path not found,
+ * return entry for parent directory of path */
+idx_list_t table_lookup_r(const char *path);
+
 /* Option parser */
 int table_parse_options(struct fuse_args *args);
 
+#undef TEST_TABLE
 #endif	/* _SSHFSM_TABLE_H_ */

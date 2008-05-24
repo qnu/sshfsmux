@@ -114,6 +114,7 @@
 #define SSHNODELAY_SO "sshnodelay.so"
 
 #define DEFAULT_MAX_HOSTS_NUM 32
+#define DEFAULT_RANK_INTERVAL 32
 
 struct buffer {
 	uint8_t *p;
@@ -217,6 +218,7 @@ struct sshfsm {
 	struct host **hosts;
 	int hosts_num;
 	int hosts_num_max;
+	int rank_interval;
 	pthread_mutex_t lock_hosts;
 	
 	/* Misc */
@@ -362,9 +364,6 @@ static struct fuse_opt workaround_opts[] = {
 	FUSE_OPT_END
 };
 
-#define DEBUG(format, args...)						\
-	do { if (sshfsm.debug) fprintf(stderr, format, args); } while(0)
-
 static const char *type_name(uint8_t type)
 {
 	switch(type) {
@@ -398,6 +397,9 @@ static const char *type_name(uint8_t type)
 	default:                     return "???";
 	}
 }
+
+#define DEBUG(format, args...)						\
+	do { if (sshfsm.debug) fprintf(stderr, format, args); } while(0)
 
 #define container_of(ptr, type, member) ({				\
 			const typeof( ((type *)0)->member ) *__mptr = (ptr); \
@@ -1544,9 +1546,50 @@ out:
 	buf_free(&buf);
 }
 
+static void * sftp_detect_uid_thread_func(void *data)
+{
+	int *idxp = (int *) data;
+	sftp_detect_uid(*idxp); 
+	pthread_exit((void *) 0);
+}
+
 static void sftp_detect_uid_all()
 {
-	sftp_detect_uid(0);
+	pthread_t *threads;
+	pthread_attr_t attr;
+	
+	int *idxs = g_new(int, sshfsm.hosts_num);
+	threads = g_new(pthread_t, sshfsm.hosts_num);
+	
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+	int err, i;
+	for (i = 0; i < sshfsm.hosts_num; i++) {
+		idxs[i] = i;
+		err = pthread_create(&threads[i], &attr, 
+				sftp_detect_uid_thread_func, &idxs[i]);
+		if (err) {
+			fprintf(stderr, "sshfsm: create thread failed: %s\n", 
+					strerror(err));
+			return;
+		}
+	}
+
+	int retval;
+	for (i = 0; i < sshfsm.hosts_num; i++) {
+		err = pthread_join(threads[i], (void *) &retval);
+		if (err) {
+			fprintf(stderr, "sshfsm: join thread failed: %s\n", 
+					strerror(err));
+			return;
+		}
+		if (retval != 0) {
+			DEBUG("debug: detect uid of %s failed\n", 
+				 sshfsm.hosts[i]->hostname);
+		}
+	}
+	g_free(idxs);
+	return;
 }
 
 static int sftp_check_root(const int idx)
@@ -1609,10 +1652,51 @@ out:
 	return err;
 }
 
+static void * sftp_check_root_thread_func(void *data)
+{
+	int *idxp = (int *) data;
+	sftp_check_root(*idxp) ? 
+	pthread_exit((void *) -1) : pthread_exit((void *) 0);
+}
+
 static int sftp_check_root_all()
 {
-	/* TODO */
-	return sftp_check_root(0);
+	pthread_t *threads;
+	pthread_attr_t attr;
+	
+	int *idxs = g_new(int, sshfsm.hosts_num);
+	threads = g_new(pthread_t, sshfsm.hosts_num);
+	
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+
+	int err, i;
+	for (i = 0; i < sshfsm.hosts_num; i++) {
+		idxs[i] = i;
+		err = pthread_create(&threads[i], &attr, 
+				sftp_check_root_thread_func, &idxs[i]);
+		if (err) {
+			fprintf(stderr, "sshfsm: create thread failed: %s\n", 
+					strerror(err));
+			return -EIO;
+		}
+	}
+
+	int retval;
+	for (i = 0; i < sshfsm.hosts_num; i++) {
+		err = pthread_join(threads[i], (void *) &retval);
+		if (err) {
+			fprintf(stderr, "sshfsm: join thread failed: %s\n", 
+					strerror(err));
+			return -EIO;
+		}
+		if (retval != 0) {
+			DEBUG("debug: check root of %s failed\n", 
+				 sshfsm.hosts[i]->hostname);
+		}
+	}
+	g_free(idxs);
+	return 0;
 }
 
 static int connect_remote(const int idx)
@@ -1635,9 +1719,51 @@ static int connect_remote(const int idx)
 	return err;
 }
 
+static void * connect_remote_thread_func(void *data)
+{
+	int *idxp = (int *) data;
+	connect_remote(*idxp) ? 
+	pthread_exit((void *) -1) : pthread_exit((void *) 0);
+}
+
 static int connect_remote_all()
 {
-	return connect_remote(0);
+	pthread_t *threads;
+	pthread_attr_t attr;
+	
+	int *idxs = g_new(int, sshfsm.hosts_num);
+	threads = g_new(pthread_t, sshfsm.hosts_num);
+	
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+
+	int err, i;
+	for (i = 0; i < sshfsm.hosts_num; i++) {
+		idxs[i] = i;
+		err = pthread_create(&threads[i], &attr, 
+				connect_remote_thread_func, &idxs[i]);
+		if (err) {
+			fprintf(stderr, "sshfsm: create thread failed: %s\n", 
+					strerror(err));
+			return -EIO;
+		}
+	}
+
+	int retval;
+	for (i = 0; i < sshfsm.hosts_num; i++) {
+		err = pthread_join(threads[i], (void *) &retval);
+		if (err) {
+			fprintf(stderr, "sshfsm: join thread failed: %s\n", 
+					strerror(err));
+			return -EIO;
+		}
+		if (retval != 0) {
+			DEBUG("debug: connect to %s failed\n", 
+				 sshfsm.hosts[i]->hostname);
+		}
+	}
+	g_free(idxs);
+	return 0;
 }
 
 static int start_processing_thread(const int idx)
@@ -1894,7 +2020,20 @@ static int host_getattr(const int idx, const char *path, struct stat *stbuf)
 
 static int sshfsm_getattr(const char *path, struct stat *stbuf)
 {
-	return host_getattr(0, path, stbuf);
+	struct idx_item *item;
+	idx_list_t list = table_lookup_r(path);
+	int err;
+	while (list != NULL) {
+		item = (struct idx_item *) list->data;
+		err = host_getattr(item->idx, path, stbuf);
+		if (err == 0) {
+			if (S_ISDIR(stbuf->st_mode))
+				table_insert(path, item->idx, item->rank);
+			break;
+		}
+		list = list->next;
+	}
+	return err;
 }
 
 static int count_components(const char *p)
@@ -2984,7 +3123,6 @@ static int processing_init(void)
 	int i;
 	signal(SIGPIPE, SIG_IGN); /* TOASK */
 
-	//pthread_mutex_init(&sshfsm.lock_host_arr, NULL); TODO
 	for (i = 0; i < sshfsm.hosts_num; i++) {	/* TOUP */
 		hostp = sshfsm.hosts[i];
 		pthread_mutex_init(&hostp->lock, NULL);
@@ -2992,7 +3130,7 @@ static int processing_init(void)
 		pthread_cond_init(&hostp->outstanding_cond, NULL);
 		hostp->connver = 0;
 		hostp->processing_thread_started = 0;
-		//hostp->rank = i;	/* TODO */
+		hostp->rank = i * sshfsm.rank_interval;
 		hostp->fd = -1;
 		hostp->ptyfd = -1;
 		hostp->ptyslavefd = -1;
@@ -3001,6 +3139,21 @@ static int processing_init(void)
 			fprintf(stderr, "failed to create hash table\n");
 			return -1;
 		}
+	}
+	pthread_mutex_init(&sshfsm.lock_hosts, NULL);
+	return 0;
+}
+
+static int table_init()
+{
+	if (table_create(sshfsm.debug) == -1)
+		return -1;
+	
+	int i;
+	for (i = 0; i < sshfsm.hosts_num; i++) {
+		struct host *hostp = sshfsm.hosts[i];
+		if (hostp->fd != -1)
+			table_insert("/", i, hostp->rank);
 	}
 	return 0;
 }
@@ -3333,6 +3486,7 @@ static void set_ssh_command(void)
 	}
 }
 
+#ifndef TEST_TABLE
 int main(int argc, char *argv[])
 {
 	int res;
@@ -3354,9 +3508,10 @@ int main(int argc, char *argv[])
 	sshfsm.buflimit_workaround = 1;
 	sshfsm.ssh_ver = 2;
 	sshfsm.progname = argv[0];
-	sshfsm.hosts_num_max = DEFAULT_MAX_HOSTS_NUM;
-	sshfsm.hosts_num = 0;
 	sshfsm.hosts = NULL;
+	sshfsm.hosts_num = 0;
+	sshfsm.hosts_num_max = DEFAULT_MAX_HOSTS_NUM;
+	sshfsm.rank_interval = DEFAULT_RANK_INTERVAL;
 	ssh_add_arg("ssh");
 	ssh_add_arg("-x");
 	ssh_add_arg("-a");
@@ -3430,8 +3585,7 @@ int main(int argc, char *argv[])
 	if (table_init() == -1)
 		exit(1);
 
-	res = cache_parse_options(&args);
-	if (res == -1)
+	if (cache_parse_options(&args) == -1)
 		exit(1);
 
 	sshfsm.randseed = time(0);
@@ -3486,3 +3640,4 @@ int main(int argc, char *argv[])
 
 	return res;
 }
+#endif
