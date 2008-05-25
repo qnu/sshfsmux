@@ -1893,6 +1893,7 @@ static void sshfsm_destory(void *data_)
 }
 #endif
 
+/* SFTP primitives */
 static int sftp_request_wait(const int idx, struct request *req, uint8_t type,
                              uint8_t expect_type, struct buffer *outbuf)
 {
@@ -2036,6 +2037,70 @@ static int sftp_request(const int idx, uint8_t type, const struct buffer *buf,
 	return sftp_request_iov(idx, type, &iov, 1, expect_type, outbuf);
 }
 
+/* Thread processing functions */
+static int processing_by_threads(idx_list_t list, 
+			void *(*thread_func)(void *), unsigned data_size,
+			void (*pre_func)(void *, void *, idx_item_t), 
+			void * pre_data,
+			int (*post_func)(void *, void *, idx_item_t), 
+			void * post_data)
+{
+	pthread_t *threads;
+	pthread_attr_t attr;
+	unsigned list_len = g_slist_length(list);
+	void *thread_data = g_malloc(data_size * list_len);
+	threads = g_new(pthread_t, list_len);
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+	
+	/* start threads */
+	idx_list_t curr = list;
+	idx_item_t item = NULL;
+	int err = 0;
+	unsigned i;
+	for (i = 0; i < list_len; i++) {
+		item = (idx_item_t) curr->data;
+		if (pre_func)
+			pre_func(thread_data + i * data_size, pre_data, item);
+		err = pthread_create(&threads[i], &attr, thread_func,
+					(thread_data + i * data_size));
+		if (err) {
+			fprintf(stderr, "sshfsm: create thread failed: %s\n", 
+					strerror(err));
+			return -EIO;
+		}
+		curr = curr->next;
+	}
+
+	/* join threads */
+	curr = list;
+	int err2 = 0;
+	int err3 = 0;
+	for (i = 0; i < list_len; i++) {
+		item = (idx_item_t) curr->data;
+		err = pthread_join(threads[i], (void *) &err2);
+		if (err) {
+			fprintf(stderr, "sshfsm: join thread failed: %s\n", 
+					strerror(err));
+			return -EIO;
+		}
+		if (post_func) {
+			err = post_func(thread_data + i * data_size, 
+					post_data, item);
+			err3 = err ? err : err3;
+		}
+		curr = curr->next;
+	}
+	
+	/* cleanup */
+	pthread_attr_destroy(&attr);
+	g_free(thread_data);
+	g_free(threads);
+	err = err3 ? err3 : err;
+	return err;
+}
+
+/* FUSE primitives */
 static int host_getattr(const int idx, const char *path, struct stat *stbuf)
 {
 	int err;
@@ -2057,13 +2122,12 @@ static int host_getattr(const int idx, const char *path, struct stat *stbuf)
 
 static int sshfsm_getattr(const char *path, struct stat *stbuf)
 {
-	int r_flag;
-	char *parent_dir = get_parent_dir(g_strdup(path));
-	idx_list_t list = table_lookup_r(parent_dir, &r_flag);
-	g_free(parent_dir);
+	int r_flag = 1;
+	idx_list_t list = table_lookup_r(path, &r_flag);
+	struct idx_item *item = NULL;
 	int err = 0;
 	while (list) {
-		struct idx_item *item = (struct idx_item *) list->data;
+		item = (struct idx_item *) list->data;
 		err = host_getattr(item->idx, path, stbuf);
 		DEBUG("  op:getattr(err: %d, path: %s, host: %s:%s)\n", 
 			  err, path, 
@@ -2074,7 +2138,7 @@ static int sshfsm_getattr(const char *path, struct stat *stbuf)
 				table_insert(path, item->idx, item->rank);
 			if (strcmp(path, "/") != 0)
 				break;
-		} else if (!r_flag) {
+		} else {
 			/* since only directory in table
 			 * error from remote request suggests that
 			 * previous entry has become invalid */
@@ -2185,11 +2249,12 @@ static int host_readlink(const int idx, const char *path, char *linkbuf, size_t 
 
 static int sshfsm_readlink(const char *path, char *linkbuf, size_t size)
 {
-	int r_flag;
+	int r_flag = 0;
 	idx_list_t list = table_lookup_r(path, &r_flag);
+	struct idx_item *item = NULL;
 	int err = 0;
 	while (list) {
-		struct idx_item *item = (struct idx_item *) list->data;
+		item = (struct idx_item *) list->data;
 		err = host_readlink(item->idx, path, linkbuf, size);
 		DEBUG("  op:readlink(err: %d, path: %s, host: %s:%s)\n", 
 			  err, path, 
@@ -2274,7 +2339,7 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 	pthread_t *threads;
 	pthread_attr_t attr;
 	
-	int r_flag;
+	int r_flag = 0;
 	idx_list_t idx_list = table_lookup_r(path, &r_flag);
 	unsigned idx_list_len = g_slist_length(idx_list);
 	int err = 0; 
@@ -2322,16 +2387,16 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 			return -EIO;
 		}
 		if (err2)
-			DEBUG("debug: getdir from %s:%s failed with %d %d\n", 
+			DEBUG("debug: getdir from %s:%s failed with %d\n", 
 				 sshfsm.hosts[item->idx]->hostname,
-				 sshfsm.hosts[item->idx]->basepath, err2,
-				 idx_list_len);
-		else	
+				 sshfsm.hosts[item->idx]->basepath, err2);
+		else {
 			/* merge entries */
 			err = entry_list_get_entries(item->idx, path, 
 					&(thread_dat[i].entry_list), entry_filter, h, filler);
-		if (err)
-			return err;
+			if (err)
+				return err;
+		}
 		curr = curr->next;
 	}
 	
@@ -2357,8 +2422,25 @@ static int host_mkdir(const int idx, const char *path, mode_t mode)
 
 static int sshfsm_mkdir(const char *path, mode_t mode)
 {
+	int r_flag = 1;
+	idx_list_t list = table_lookup_r(path, &r_flag);
+	struct idx_item *item = NULL;
+	int err = 0;
+	while (list) {
+		item = (struct idx_item *) list->data;
+		err = host_mkdir(item->idx, path, mode);
+		DEBUG("  op:mkdir(err: %d, path: %s, host: %s:%s)\n", 
+			  err, path, 
+			  sshfsm.hosts[item->idx]->hostname,
+			  sshfsm.hosts[item->idx]->basepath);
+		if (!err) 
+			break;
+		list = list->next;
+	}
+	if (!err && S_ISDIR(mode))
+		table_insert(path, item->idx, item->rank);
 	
-	return host_mkdir(0, path, mode);
+	return err;
 }
 
 static int host_mknod(const int idx, const char *path, mode_t mode, dev_t rdev)
@@ -2392,24 +2474,24 @@ static int host_mknod(const int idx, const char *path, mode_t mode, dev_t rdev)
 
 static int sshfsm_mknod(const char *path, mode_t mode, dev_t rdev)
 {
-	int r_flag;
-	char *parent_dir = get_parent_dir(g_strdup(path));
-	idx_list_t list = table_lookup_r(parent_dir, &r_flag);
-	g_free(parent_dir);
+	int r_flag = 1;
+	idx_list_t list = table_lookup_r(path, &r_flag);
+	struct idx_item *item = NULL;
 	int err = 0;
 	while (list) {
-		struct idx_item *item = (struct idx_item *) list->data;
+		item = (struct idx_item *) list->data;
 		err = host_mknod(item->idx, path, mode, rdev);
 		DEBUG("  op:mknod(err: %d, path: %s, host: %s:%s)\n", 
 			  err, path, 
 			  sshfsm.hosts[item->idx]->hostname,
 			  sshfsm.hosts[item->idx]->basepath);
-		if (!err) {
-			if (S_ISDIR(mode))
-				table_insert(path, item->idx, item->rank);
-		}
+		if (!err)
+			break;
 		list = list->next;
 	}
+	if (!err && S_ISDIR(mode))
+		table_insert(path, item->idx, item->rank);
+	
 	return err;
 }
 
@@ -2433,7 +2515,22 @@ static int host_symlink(const int idx, const char *from, const char *to)
 
 static int sshfsm_symlink(const char *from, const char *to)
 {
-	return host_symlink(0, from, to);
+	int r_flag = 0;
+	idx_list_t list = table_lookup_r(from, &r_flag);
+	struct idx_item *item = NULL;
+	int err = 0;
+	while (list) {
+		item = (struct idx_item *) list->data;
+		err = host_symlink(item->idx, from, to);
+		DEBUG("  op:symlink(err: %d, from: %s, to: %s, host: %s:%s)\n", 
+			  err, from, to, 
+			  sshfsm.hosts[item->idx]->hostname,
+			  sshfsm.hosts[item->idx]->basepath);
+		if (!err)
+			break;
+		list = list->next;
+	}
+	return err;
 }
 
 static int host_unlink(const int idx, const char *path)
@@ -2447,9 +2544,51 @@ static int host_unlink(const int idx, const char *path)
 	return err;
 }
 
+struct unlink_thread_data {
+	int idx;
+	const char *path;
+	int err;
+};
+
+static void * unlink_thread_func(void *data)
+{
+	struct unlink_thread_data *datap
+		= (struct unlink_thread_data *) data;
+	datap->err = host_unlink(datap->idx, datap->path);
+	datap->err ? pthread_exit((void *) -1) : pthread_exit((void *) 0);
+}
+
+struct unlink_pre_data {
+	const char *path;
+};
+
+static void unlink_pre_func(void *t_dat, void *p_dat,
+							idx_item_t item)
+{
+	struct unlink_thread_data *tp
+		= (struct unlink_thread_data *) t_dat;
+	struct unlink_pre_data *pp
+		= (struct unlink_pre_data *) p_dat;
+	tp->idx = item->idx,
+	tp->path = pp->path,
+	tp->err = 0;
+}
+
 static int sshfsm_unlink(const char *path)
-{	
-	return host_unlink(0, path);
+{
+	int r_flag = 0;
+	idx_list_t idx_list = table_lookup_r(path, &r_flag);
+	struct unlink_pre_data pre_data;
+	pre_data.path = path;
+	int err = processing_by_threads(idx_list, 
+				unlink_thread_func,
+				sizeof(struct unlink_thread_data),
+				unlink_pre_func, &pre_data,
+				NULL, NULL);
+	if (err)
+		return err;
+	table_remove(path);
+	return 0;
 }
 
 static int host_rmdir(const int idx, const char *path)
@@ -2463,9 +2602,51 @@ static int host_rmdir(const int idx, const char *path)
 	return err;
 }
 
+struct rmdir_thread_data {
+	int idx;
+	const char *path;
+	int err;
+};
+
+static void * rmdir_thread_func(void *data)
+{
+	struct rmdir_thread_data *datap
+		= (struct rmdir_thread_data *) data;
+	datap->err = host_rmdir(datap->idx, datap->path);
+	datap->err ? pthread_exit((void *) -1) : pthread_exit((void *) 0);
+}
+
+struct rmdir_pre_data {
+	const char *path;	
+};
+
+static void rmdir_pre_func(void *t_dat, void *p_dat,
+						   idx_item_t item)
+{
+	struct rmdir_thread_data *tp
+		= (struct rmdir_thread_data *) t_dat;
+	struct rmdir_pre_data *pp
+		= (struct rmdir_pre_data *) p_dat;
+	tp->idx = item->idx,
+	tp->path = pp->path,
+	tp->err = 0;
+}
+
 static int sshfsm_rmdir(const char *path)
 {
-	return host_rmdir(0, path);
+	int r_flag = 0;
+	idx_list_t idx_list = table_lookup_r(path, &r_flag);
+	struct rmdir_pre_data pre_data;
+	pre_data.path = path;
+	int err = processing_by_threads(idx_list, 
+				rmdir_thread_func,
+				sizeof(struct rmdir_thread_data),
+				rmdir_pre_func, &pre_data,
+				NULL, NULL);
+	if (err)
+		return err;
+	table_remove(path);
+	return 0;
 }
 
 static int host_do_rename(const int idx, const char *from, const char *to)
@@ -2528,9 +2709,65 @@ static int host_rename(const int idx, const char *from, const char *to)
 	return err;
 }
 
+struct rename_thread_data {
+	int idx;
+	const char *from;
+	const char *to;
+	int err;
+};
+
+static void * rename_thread_func(void *data)
+{
+	struct rename_thread_data *datap
+		= (struct rename_thread_data *) data;
+	datap->err = host_rename(datap->idx, datap->from, datap->to);
+	datap->err ? pthread_exit((void *) -1) : pthread_exit((void *) 0);
+}
+
+struct rename_pre_data {
+	const char *from;
+	const char *to;
+};
+
+static void rename_pre_func(void *t_dat, void *p_dat,
+						   idx_item_t item)
+{
+	struct rename_thread_data *tp
+		= (struct rename_thread_data *) t_dat;
+	struct rename_pre_data *pp
+		= (struct rename_pre_data *) p_dat;
+	tp->idx = item->idx,
+	tp->from = pp->from,
+	tp->to = pp->to,
+	tp->err = 0;
+}
+
+static int rename_post_func(void *t_dat, void *p_dat,
+							idx_item_t item)
+{	
+	(void) p_dat;
+	(void) item;
+	struct rename_thread_data *tp
+		= (struct rename_thread_data *) t_dat;
+	return tp->err;
+}
+
 static int sshfsm_rename(const char *from, const char *to)
 {
-	return host_rename(0, from, to);
+	int r_flag = 0;
+	idx_list_t idx_list = table_lookup_r(from, &r_flag);
+	struct rename_pre_data pre_data;
+	pre_data.from = from;
+	pre_data.to = to;
+	int err = processing_by_threads(idx_list, 
+				rename_thread_func,
+				sizeof(struct rename_thread_data),
+				rename_pre_func, &pre_data,
+				rename_post_func, NULL);
+	if (err)
+		return err;
+	table_remove(from);
+	return 0;
 }
 
 static int host_chmod(const int idx, const char *path, mode_t mode)
@@ -2548,10 +2785,25 @@ static int host_chmod(const int idx, const char *path, mode_t mode)
 
 static int sshfsm_chmod(const char *path, mode_t mode)
 {
-	return host_chmod(0, path, mode);
+	int r_flag = 0;
+	idx_list_t list = table_lookup_r(path, &r_flag);
+	struct idx_item *item = NULL;
+	int err = 0;
+	while (list) {
+		item = (struct idx_item *) list->data;
+		err = host_chmod(item->idx, path, mode);
+		DEBUG("  op:chmod(err: %d, path: %s, host: %s:%s)\n", 
+			  err, path, 
+			  sshfsm.hosts[item->idx]->hostname,
+			  sshfsm.hosts[item->idx]->basepath);
+		if (!err)
+			break;
+		list = list->next;
+	}
+	return err;
 }
 
-static int do_chown(const int idx, const char *path, uid_t uid, gid_t gid)
+static int host_chown(const int idx, const char *path, uid_t uid, gid_t gid)
 {
 	int err;
 	struct buffer buf;
@@ -2564,10 +2816,27 @@ static int do_chown(const int idx, const char *path, uid_t uid, gid_t gid)
 	buf_free(&buf);
 	return err;
 }
-
 static int sshfsm_chown(const char *path, uid_t uid, gid_t gid)
 {
-	return do_chown(0, path, uid, gid);
+	int r_flag = 0;
+	idx_list_t list = table_lookup_r(path, &r_flag);
+	struct idx_item *item = NULL;
+	int err = 0;
+	int err2 = 0;
+	while (list) {
+		item = (struct idx_item *) list->data;
+		err = host_chown(item->idx, path, uid, gid);
+		DEBUG("  op:chown(err: %d, path: %s, host: %s:%s)\n", 
+			  err, path, 
+			  sshfsm.hosts[item->idx]->hostname,
+			  sshfsm.hosts[item->idx]->basepath);
+		if (!err)
+			break;
+		err2 = err < err2 ? err : err2;
+		list = list->next;
+	}
+	err = err2 < err ? err2 : err;
+	return err;
 }
 
 static int host_truncate_workaround(const int idx, const char *path, off_t size,
@@ -2593,7 +2862,22 @@ static int host_truncate(const int idx, const char *path, off_t size)
 
 static int sshfsm_truncate(const char *path, off_t size)
 {
-	return host_truncate(0, path, size);
+	int r_flag = 0;
+	idx_list_t list = table_lookup_r(path, &r_flag);
+	struct idx_item *item = NULL;
+	int err = 0;
+	while (list) {
+		item = (struct idx_item *) list->data;
+		err = host_truncate(item->idx, path, size);
+		DEBUG("  op:truncate(err: %d, path: %s, host: %s:%s)\n", 
+			  err, path, 
+			  sshfsm.hosts[item->idx]->hostname,
+			  sshfsm.hosts[item->idx]->basepath);
+		if (!err)
+			break;
+		list = list->next;
+	}
+	return err;
 }
 
 static int host_utime(const int idx, const char *path, struct utimbuf *ubuf)
@@ -2612,7 +2896,22 @@ static int host_utime(const int idx, const char *path, struct utimbuf *ubuf)
 
 static int sshfsm_utime(const char *path, struct utimbuf *ubuf)
 {
-	return host_utime(0, path, ubuf);
+	int r_flag = 0;
+	idx_list_t list = table_lookup_r(path, &r_flag);
+	struct idx_item *item = NULL;
+	int err = 0;
+	while (list) {
+		item = (struct idx_item *) list->data;
+		err = host_utime(item->idx, path, ubuf);
+		DEBUG("  op:utime(err: %d, path: %s, host: %s:%s)\n", 
+			  err, path, 
+			  sshfsm.hosts[item->idx]->hostname,
+			  sshfsm.hosts[item->idx]->basepath);
+		if (!err)
+			break;
+		list = list->next;
+	}
+	return err;
 }
 
 static inline int sshfsm_file_is_conn(const int idx, struct sshfsm_file *sf)
@@ -2701,7 +3000,22 @@ static int host_open_common(const int idx, const char *path, mode_t mode,
 
 static int sshfsm_open(const char *path, struct fuse_file_info *fi)
 {
-	return host_open_common(0, path, 0, fi);
+	int r_flag = 1;
+	idx_list_t list = table_lookup_r(path, &r_flag);
+	struct idx_item *item = NULL;
+	int err = 0;
+	while (list) {
+		item = (struct idx_item *) list->data;
+		err = host_open_common(item->idx, path, 0, fi);
+		DEBUG("  op:open(err: %d, path: %s, host: %s:%s)\n", 
+			  err, path, 
+			  sshfsm.hosts[item->idx]->hostname,
+			  sshfsm.hosts[item->idx]->basepath);
+		if (!err)
+			break;
+		list = list->next;
+	}
+	return err;
 }
 
 static inline struct sshfsm_file *get_sshfsm_file(struct fuse_file_info *fi)
@@ -3120,7 +3434,25 @@ static int sshfsm_statfs(const char *path, struct statfs *buf)
 static int sshfsm_create(const char *path, mode_t mode,
                         struct fuse_file_info *fi)
 {
-	return host_open_common(0, path, mode, fi);
+	int r_flag = 1;
+	idx_list_t list = table_lookup_r(path, &r_flag);
+	struct idx_item *item = NULL;
+	int err = 0;
+	while (list) {
+		item = (struct idx_item *) list->data;
+		err = host_open_common(item->idx, path, mode, fi);
+		DEBUG("  op:create(err: %d, path: %s, host: %s:%s)\n", 
+			  err, path, 
+			  sshfsm.hosts[item->idx]->hostname,
+			  sshfsm.hosts[item->idx]->basepath);
+		if (!err)
+			break;
+		list = list->next;
+	}
+	if (!err && S_ISDIR(mode))
+		table_insert(path, item->idx, item->rank);
+	
+	return err;
 }
 
 static int sshfsm_ftruncate(const char *path, off_t size,

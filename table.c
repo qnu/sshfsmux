@@ -185,14 +185,16 @@ static inline char * get_parent_dir(char *path)
 
 idx_list_t table_lookup_r(const char *path, int *r_flag)
 {
-	*r_flag = 0;
-	GSList *idx_list = g_hash_table_lookup(table.table, path);
-	if (idx_list)
-		return idx_list;
-	
-	*r_flag = 1;
+	GSList *idx_list = NULL;
+	if (*r_flag == 0) {
+		idx_list = g_hash_table_lookup(table.table, path);
+		if (idx_list)
+			return idx_list;
+	}
+	*r_flag = 0;	/* clear flag and do recursive */
 	char *parent_dir = g_strdup(path);
 	while (idx_list == NULL) {
+		*r_flag = *r_flag + 1;
 		parent_dir = get_parent_dir(parent_dir);
 		DEBUG("debug: table lookup recusively for %s\n", parent_dir);
 		idx_list = g_hash_table_lookup(table.table, parent_dir);

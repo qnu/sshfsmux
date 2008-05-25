@@ -17,6 +17,7 @@ struct idx_item {
 	int idx;
 	int rank;
 };
+typedef struct idx_item * idx_item_t;
 
 typedef GSList* idx_list_t;
 
