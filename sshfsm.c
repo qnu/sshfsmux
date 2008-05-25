@@ -2357,6 +2357,7 @@ static int host_mkdir(const int idx, const char *path, mode_t mode)
 
 static int sshfsm_mkdir(const char *path, mode_t mode)
 {
+	
 	return host_mkdir(0, path, mode);
 }
 
@@ -2391,7 +2392,25 @@ static int host_mknod(const int idx, const char *path, mode_t mode, dev_t rdev)
 
 static int sshfsm_mknod(const char *path, mode_t mode, dev_t rdev)
 {
-	return host_mknod(0, path, mode, rdev);
+	int r_flag;
+	char *parent_dir = get_parent_dir(g_strdup(path));
+	idx_list_t list = table_lookup_r(parent_dir, &r_flag);
+	g_free(parent_dir);
+	int err = 0;
+	while (list) {
+		struct idx_item *item = (struct idx_item *) list->data;
+		err = host_mknod(item->idx, path, mode, rdev);
+		DEBUG("  op:mknod(err: %d, path: %s, host: %s:%s)\n", 
+			  err, path, 
+			  sshfsm.hosts[item->idx]->hostname,
+			  sshfsm.hosts[item->idx]->basepath);
+		if (!err) {
+			if (S_ISDIR(mode))
+				table_insert(path, item->idx, item->rank);
+		}
+		list = list->next;
+	}
+	return err;
 }
 
 static int host_symlink(const int idx, const char *from, const char *to)
