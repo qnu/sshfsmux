@@ -3699,7 +3699,7 @@ static void usage(const char *progname)
 "    -o workaround=LIST     colon separated list of workarounds\n"
 "             none             no workarounds enabled\n"
 "             all              all workarounds enabled\n"
-"             [no]rename       fix renaming to existing file (default: off)\n"
+"             [no]rename       fix renaming to existing file (default: on)\n"
 #ifdef SSH_NODELAY_WORKAROUND
 "             [no]nodelay      set nodelay tcp flag in ssh (default: on)\n"
 #endif
@@ -3983,7 +3983,7 @@ int main(int argc, char *argv[])
 	sshfsm.max_write = 65536;
 	sshfsm.nodelay_workaround = 1;
 	sshfsm.nodelaysrv_workaround = 0;
-	sshfsm.rename_workaround = 0;
+	sshfsm.rename_workaround = 1;
 	sshfsm.truncate_workaround = 0;
 	sshfsm.buflimit_workaround = 1;
 	sshfsm.ssh_ver = 2;
