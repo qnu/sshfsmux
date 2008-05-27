@@ -319,9 +319,9 @@ static struct fuse_opt sshfsm_opts[] = {
 	SSHFSM_OPT("workaround=%s",     workarounds, 0),
 	SSHFSM_OPT("idmap=none",        detect_uid, 0),
 	SSHFSM_OPT("idmap=user",        detect_uid, 1),
-	SSHFSM_OPT("sshfsm_sync",        sync_write, 1),
+	SSHFSM_OPT("sshfsm_sync",       sync_write, 1),
 	SSHFSM_OPT("no_readahead",      sync_read, 1),
-	SSHFSM_OPT("sshfsm_debug",       debug, 1),
+	SSHFSM_OPT("sshfsm_debug",      debug, 1),
 	SSHFSM_OPT("reconnect",         reconnect, 1),
 	SSHFSM_OPT("transform_symlinks", transform_symlinks, 1),
 	SSHFSM_OPT("follow_symlinks",   follow_symlinks, 1),
@@ -3690,9 +3690,9 @@ static void usage(const char *progname)
 "    -C                     equivalent to '-o compression=yes'\n"
 "    -1                     equivalent to '-o ssh_protocol=1'\n"
 "    -o reconnect           reconnect to server\n"
-"    -o sshfsm_sync          synchronous writes\n"
+"    -o sshfsm_sync         synchronous writes\n"
 "    -o no_readahead        synchronous reads (no speculative readahead)\n"
-"    -o sshfsm_debug         print some debugging information\n"
+"    -o sshfsm_debug        print some debugging information\n"
 "    -o cache=YESNO         enable caching {yes,no} (default: yes)\n"
 "    -o cache_timeout=N     sets timeout for caches in seconds (default: 20)\n"
 "    -o cache_X_timeout=N   sets timeout for {stat,dir,link} cache\n"
