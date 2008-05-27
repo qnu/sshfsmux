@@ -2710,50 +2710,6 @@ static int host_rename(const int idx, const char *from, const char *to)
 	return err;
 }
 
-/*
-struct rename_thread_data {
-	int idx;
-	const char *from;
-	const char *to;
-	int err;
-};
-
-static void * rename_thread_func(void *data)
-{
-	struct rename_thread_data *datap
-		= (struct rename_thread_data *) data;
-	datap->err = host_rename(datap->idx, datap->from, datap->to);
-	datap->err ? pthread_exit((void *) -1) : pthread_exit((void *) 0);
-}
-
-struct rename_pre_data {
-	const char *from;
-	const char *to;
-};
-
-static void rename_pre_func(void *t_dat, void *p_dat,
-						   idx_item_t item)
-{
-	struct rename_thread_data *tp
-		= (struct rename_thread_data *) t_dat;
-	struct rename_pre_data *pp
-		= (struct rename_pre_data *) p_dat;
-	tp->idx = item->idx,
-	tp->from = pp->from,
-	tp->to = pp->to,
-	tp->err = 0;
-}
-
-static int rename_post_func(void *t_dat, void *p_dat,
-							idx_item_t item)
-{	
-	(void) p_dat;
-	(void) item;
-	struct rename_thread_data *tp
-		= (struct rename_thread_data *) t_dat;
-	return tp->err;
-}
-*/
 static int sshfsm_rename(const char *from, const char *to)
 {
 	int r_flag = 0;
@@ -3039,7 +2995,6 @@ static int sshfsm_flush(const char *path, struct fuse_file_info *fi)
 	struct list_head write_reqs;
 	struct list_head *curr_list;
 	int idx = sf->host_idx;
-	printf("TODO: in flush idx %d\n", idx);
 	struct host *hostp = sshfsm.hosts[idx];
 
 	if (!sshfsm_file_is_conn(idx, sf))
@@ -3284,7 +3239,6 @@ static int sshfsm_async_read(struct sshfsm_file *sf, char *rbuf, size_t size,
 		total += res;
 	if (res < 0)
 		return res;
-	printf("TODO: in async read res %d\n", res);
 	return total;
 }
 
@@ -3293,7 +3247,6 @@ static int sshfsm_read(const char *path, char *rbuf, size_t size,
 {
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
 	int idx = sf->host_idx;
-	printf("TODO: in sshfsm_read path %s idx %d\n", path, idx);
 	(void) path;
 
 	if (!sshfsm_file_is_conn(idx, sf))
