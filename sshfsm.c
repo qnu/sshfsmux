@@ -175,7 +175,7 @@ struct host {
 	int server_version;
 	int connver;
 	int modifver;
-	int	fd;
+	int fd;
 	int ptyfd;
 	int ptyslavefd;
 	unsigned uid;
@@ -3852,7 +3852,7 @@ static int sshfsm_opt_proc(void *data, const char *arg, int key,
 		exit(1);
 
 	case KEY_VERSION:
-		fprintf(stderr, "SSHFS version %s\n", PACKAGE_VERSION);
+		fprintf(stderr, "SSHFS-MUX version %s\n", PACKAGE_VERSION);
 #if FUSE_VERSION >= 25
 		fuse_opt_add_arg(outargs, "--version");
 		sshfsm_fuse_main(outargs);
