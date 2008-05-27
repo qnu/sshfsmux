@@ -699,9 +699,10 @@ static int buf_get_attrs(const int idx, struct buffer *buf,
 		}
 	}
 
+	/* TODO */
 	if (hostp->uid_detected && uid == hostp->uid)
 		uid = sshfsm.local_uid;
-
+	
 	memset(stbuf, 0, sizeof(struct stat));
 	stbuf->st_mode = mode;
 	stbuf->st_nlink = 1;
@@ -2709,6 +2710,7 @@ static int host_rename(const int idx, const char *from, const char *to)
 	return err;
 }
 
+/*
 struct rename_thread_data {
 	int idx;
 	const char *from;
@@ -2751,23 +2753,29 @@ static int rename_post_func(void *t_dat, void *p_dat,
 		= (struct rename_thread_data *) t_dat;
 	return tp->err;
 }
-
+*/
 static int sshfsm_rename(const char *from, const char *to)
 {
 	int r_flag = 0;
-	idx_list_t idx_list = table_lookup_r(from, &r_flag);
-	struct rename_pre_data pre_data;
-	pre_data.from = from;
-	pre_data.to = to;
-	int err = processing_by_threads(idx_list, 
-				rename_thread_func,
-				sizeof(struct rename_thread_data),
-				rename_pre_func, &pre_data,
-				rename_post_func, NULL);
+	idx_list_t list = table_lookup_r(from, &r_flag);
+	struct idx_item *item = NULL;
+	int err = 0;
+	int err2 = -INT_MAX;
+	while (list) {
+		item = (struct idx_item *) list->data;
+		err = host_rename(item->idx, from, to);
+		DEBUG("  op:rename(err: %d, from: %s, to: %s, host: %s:%s)\n", 
+			  err, from, to, 
+			  sshfsm.hosts[item->idx]->hostname,
+			  sshfsm.hosts[item->idx]->basepath);
+		if (!err)
+			break;
+		err2 = err2 < err ? err : err2;
+		list = list->next;
+	}
 	if (err)
-		return err;
-	table_remove(from);
-	return 0;
+		err = err2;
+	return err;
 }
 
 static int host_chmod(const int idx, const char *path, mode_t mode)
@@ -2959,6 +2967,7 @@ static int host_open_common(const int idx, const char *path, mode_t mode,
 	sf->is_seq = 0;
 	sf->refs = 1;
 	sf->next_pos = 0;
+	sf->host_idx = idx;
 	sf->modifver= hostp->modifver;
 	sf->connver = hostp->connver;
 	buf_init(&buf, 0);
@@ -3030,6 +3039,7 @@ static int sshfsm_flush(const char *path, struct fuse_file_info *fi)
 	struct list_head write_reqs;
 	struct list_head *curr_list;
 	int idx = sf->host_idx;
+	printf("TODO: in flush idx %d\n", idx);
 	struct host *hostp = sshfsm.hosts[idx];
 
 	if (!sshfsm_file_is_conn(idx, sf))
@@ -3274,7 +3284,7 @@ static int sshfsm_async_read(struct sshfsm_file *sf, char *rbuf, size_t size,
 		total += res;
 	if (res < 0)
 		return res;
-
+	printf("TODO: in async read res %d\n", res);
 	return total;
 }
 
@@ -3283,6 +3293,7 @@ static int sshfsm_read(const char *path, char *rbuf, size_t size,
 {
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
 	int idx = sf->host_idx;
+	printf("TODO: in sshfsm_read path %s idx %d\n", path, idx);
 	(void) path;
 
 	if (!sshfsm_file_is_conn(idx, sf))
@@ -3379,6 +3390,7 @@ static int host_ext_statvfs(const int idx, const char *path, struct statvfs *stb
 
 static int sshfsm_ext_statvfs(const char *path, struct statvfs *stbuf)
 {
+	/* TODO */
 	return host_ext_statvfs(0, path, stbuf);
 }
 
