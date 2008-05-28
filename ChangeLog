@@ -1,0 +1,17 @@
+2008-05-28	Nan Dun <sshfsm@gmail.com>
+	
+	*
+
+2008-05-20	Nan Dun <sshfsm@gmail.com>
+	
+	* Merge SSHFS-2.0 changes.
+	* Add HPN-SSH option support.
+
+2008-05-19	Nan Dun <sshfsm@gmail.com>
+	
+	* Add autoconf and automake files.
+	* Add manual page.
+
+2008-02-25	Nan Dun <sshfsm@gmail.com>
+	
+	* Release 1.0

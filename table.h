@@ -54,5 +54,4 @@ idx_list_t table_lookup_r(const char *path, int *r_flag);
 /* Option parser */
 int table_parse_options(struct fuse_args *args);
 
-#undef TEST_TABLE
 #endif	/* _SSHFSM_TABLE_H_ */

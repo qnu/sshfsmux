@@ -204,34 +204,3 @@ idx_list_t table_lookup_r(const char *path, int *r_flag)
 	g_free(parent_dir);
 	return idx_list;
 }
-
-#ifdef TEST_TABLE
-/* Debug utilities */
-void table_print_idx_list(const char *path)
-{
-	int r_flag;
-	GSList *list = table_lookup_r(path, &r_flag);
-	printf("%s: ", path);
-	while (list != NULL) {
-		struct idx_item *item = (struct idx_item *) list->data;
-		printf("(%d, %d) ", item->idx, item->rank);
-		list = list->next;
-	}
-	printf("\n");
-}
-
-int main(void)
-{
-	int res;
-	res = table_create(1);
-	table_insert("/", 0, 0);
-	table_insert("/", 1, 10);
-	table_insert("/", 1, 20);
-	table_insert("/", 2, 30);
-	table_insert("/", 2, 40);
-	table_insert("/", 3, 40);
-	table_print_idx_list("/usr");
-	table_destroy();
-	return 0;
-}
-#endif

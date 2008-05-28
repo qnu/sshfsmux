@@ -220,6 +220,7 @@ struct sshfsm {
 	int hosts_num_max;
 	int rank_interval;
 	pthread_mutex_t lock_hosts;
+	int idx_0;	/* idx when only one host */
 	
 	/* Misc */
 	unsigned int randseed;
@@ -761,6 +762,40 @@ static int buf_get_statvfs(struct buffer *buf, struct statvfs *stbuf)
 	return 0;
 }
 
+static int buf_get_entries_1(const int idx, struct buffer *buf, 
+						fuse_cache_dirh_t h, fuse_cache_dirfil_t filler)
+{
+	uint32_t count;
+	unsigned i;
+
+	if (buf_get_uint32(buf, &count) == -1)
+		return -1;
+
+	for (i = 0; i < count; i++) {
+		int err = -1;
+		char *name;
+		char *longname;
+		struct stat stbuf;
+		if (buf_get_string(buf, &name) == -1)
+			return -1;
+		if (buf_get_string(buf, &longname) != -1) {
+			free(longname);
+			if (buf_get_attrs(idx, buf, &stbuf, NULL) != -1) {
+				if (sshfsm.follow_symlinks &&
+				    S_ISLNK(stbuf.st_mode)) {
+					stbuf.st_mode = 0;
+				}
+				filler(h, name, &stbuf);
+				err = 0;
+			}
+		}
+		free(name);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
 static int buf_get_entries(const int idx, const char *path, 
 						struct buffer *buf, GHashTable *entry_filter,
 						fuse_cache_dirh_t h, fuse_cache_dirfil_t filler)
@@ -808,6 +843,22 @@ static int buf_get_entries(const int idx, const char *path,
 			return err;
 	}
 	return 0;
+}
+
+static int get_empty_host_slot()
+{
+	
+	if (sshfsm.hosts_num >= sshfsm.hosts_num_max)
+		return -1;
+	
+	static int idx = 0;
+	if (sshfsm.hosts_num == 1)
+		sshfsm.idx_0 = idx;
+
+	while (sshfsm.hosts[idx] != NULL)
+		idx = (idx + 1) % sshfsm.hosts_num_max;
+
+	return idx;
 }
 
 static void ssh_add_arg(const char *arg)
@@ -1884,13 +1935,14 @@ static void sshfsm_destory(void *data_)
 	table_destroy();
 	for (i = 0; i < sshfsm.hosts_num; i++) { /* TOUP */
 		hostp = sshfsm.hosts[i];	
-		free(hostp->hostname);
-		free(hostp->basepath);
+		g_free(hostp->hostname);
+		g_free(hostp->basepath);
 		g_hash_table_destroy(hostp->reqtab);
 		pthread_mutex_destroy(&hostp->lock);
 		pthread_mutex_destroy(&hostp->lock_write);
+		g_free(hostp);
 	}
-	free(sshfsm.hosts);
+	g_free(sshfsm.hosts);
 }
 #endif
 
@@ -2123,6 +2175,9 @@ static int host_getattr(const int idx, const char *path, struct stat *stbuf)
 
 static int sshfsm_getattr(const char *path, struct stat *stbuf)
 {
+	if (sshfsm.hosts_num == 1)
+		return host_getattr(sshfsm.idx_0, path, stbuf);
+	
 	int r_flag = 1;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
@@ -2250,6 +2305,9 @@ static int host_readlink(const int idx, const char *path, char *linkbuf, size_t 
 
 static int sshfsm_readlink(const char *path, char *linkbuf, size_t size)
 {
+	if (sshfsm.hosts_num == 1)
+		return host_readlink(sshfsm.idx_0, path, linkbuf, size);
+	
 	int r_flag = 0;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
@@ -2268,6 +2326,38 @@ static int sshfsm_readlink(const char *path, char *linkbuf, size_t size)
 	return err;
 }
 
+static int host_getdir_1(const int idx, const char *path, 
+					fuse_cache_dirh_t h, fuse_cache_dirfil_t filler)
+{
+	int err;
+	struct buffer buf;
+	struct buffer handle;
+	buf_init(&buf, 0);
+	buf_add_path(idx, &buf, path);
+	err = sftp_request(idx, SSH_FXP_OPENDIR, &buf, SSH_FXP_HANDLE, &handle);
+	if (!err) {
+		int err2;
+		buf_finish(&handle);
+		do {
+			struct buffer name;
+			err = sftp_request(idx, SSH_FXP_READDIR, &handle, SSH_FXP_NAME, &name);
+			if (!err) {
+				if (buf_get_entries_1(idx, &name, h, filler) == -1)
+					err = -EIO;
+				buf_free(&name);
+			}
+		} while (!err);
+		if (err == MY_EOF)
+			err = 0;
+
+		err2 = sftp_request(idx, SSH_FXP_CLOSE, &handle, 0, NULL);
+		if (!err)
+			err = err2;
+		buf_free(&handle);
+	}
+	buf_free(&buf);
+	return err;
+}
 static int host_getdir(const int idx, const char *path, GSList **entry_list)
 {
 	int err;
@@ -2337,6 +2427,9 @@ static int entry_list_get_entries(const int idx, const char *path,
 static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
                         fuse_cache_dirfil_t filler)
 {	
+	if (sshfsm.hosts_num == 1)
+		return host_getdir_1(sshfsm.idx_0, path, h, filler);
+
 	pthread_t *threads;
 	pthread_attr_t attr;
 	
@@ -2423,6 +2516,9 @@ static int host_mkdir(const int idx, const char *path, mode_t mode)
 
 static int sshfsm_mkdir(const char *path, mode_t mode)
 {
+	if (sshfsm.hosts_num == 1)
+		return host_mkdir(sshfsm.idx_0, path, mode);
+	
 	int r_flag = 1;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
@@ -2475,6 +2571,9 @@ static int host_mknod(const int idx, const char *path, mode_t mode, dev_t rdev)
 
 static int sshfsm_mknod(const char *path, mode_t mode, dev_t rdev)
 {
+	if (sshfsm.hosts_num == 1)
+		return host_mknod(sshfsm.idx_0, path, mode,rdev);
+	
 	int r_flag = 1;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
@@ -2516,6 +2615,9 @@ static int host_symlink(const int idx, const char *from, const char *to)
 
 static int sshfsm_symlink(const char *from, const char *to)
 {
+	if (sshfsm.hosts_num == 1)
+		return host_symlink(sshfsm.idx_0, from, to);
+	
 	int r_flag = 0;
 	idx_list_t list = table_lookup_r(from, &r_flag);
 	struct idx_item *item = NULL;
@@ -2577,6 +2679,9 @@ static void unlink_pre_func(void *t_dat, void *p_dat,
 
 static int sshfsm_unlink(const char *path)
 {
+	if (sshfsm.hosts_num == 1)
+		return host_unlink(sshfsm.idx_0, path);
+	
 	int r_flag = 0;
 	idx_list_t idx_list = table_lookup_r(path, &r_flag);
 	struct unlink_pre_data pre_data;
@@ -2635,6 +2740,9 @@ static void rmdir_pre_func(void *t_dat, void *p_dat,
 
 static int sshfsm_rmdir(const char *path)
 {
+	if (sshfsm.hosts_num == 1)
+		return host_rmdir(sshfsm.idx_0, path);
+	
 	int r_flag = 0;
 	idx_list_t idx_list = table_lookup_r(path, &r_flag);
 	struct rmdir_pre_data pre_data;
@@ -2712,6 +2820,9 @@ static int host_rename(const int idx, const char *from, const char *to)
 
 static int sshfsm_rename(const char *from, const char *to)
 {
+	if (sshfsm.hosts_num == 1)
+		return host_rename(sshfsm.idx_0, from, to);
+	
 	int r_flag = 0;
 	idx_list_t list = table_lookup_r(from, &r_flag);
 	struct idx_item *item = NULL;
@@ -2749,6 +2860,9 @@ static int host_chmod(const int idx, const char *path, mode_t mode)
 
 static int sshfsm_chmod(const char *path, mode_t mode)
 {
+	if (sshfsm.hosts_num == 1)
+		return host_chmod(sshfsm.idx_0, path, mode);
+	
 	int r_flag = 0;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
@@ -2782,6 +2896,9 @@ static int host_chown(const int idx, const char *path, uid_t uid, gid_t gid)
 }
 static int sshfsm_chown(const char *path, uid_t uid, gid_t gid)
 {
+	if (sshfsm.hosts_num == 1)
+		return host_chown(sshfsm.idx_0, path, uid, gid);
+	
 	int r_flag = 0;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
@@ -2826,6 +2943,9 @@ static int host_truncate(const int idx, const char *path, off_t size)
 
 static int sshfsm_truncate(const char *path, off_t size)
 {
+	if (sshfsm.hosts_num == 1)
+		return host_truncate(sshfsm.idx_0, path, size);
+	
 	int r_flag = 0;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
@@ -2860,6 +2980,9 @@ static int host_utime(const int idx, const char *path, struct utimbuf *ubuf)
 
 static int sshfsm_utime(const char *path, struct utimbuf *ubuf)
 {
+	if (sshfsm.hosts_num == 1)
+		return host_utime(sshfsm.idx_0, path, ubuf);
+	
 	int r_flag = 0;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
@@ -2965,6 +3088,9 @@ static int host_open_common(const int idx, const char *path, mode_t mode,
 
 static int sshfsm_open(const char *path, struct fuse_file_info *fi)
 {
+	if (sshfsm.hosts_num == 1)
+		return host_open_common(sshfsm.idx_0, path, 0, fi);
+	
 	int r_flag = 1;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
@@ -3344,7 +3470,7 @@ static int host_ext_statvfs(const int idx, const char *path, struct statvfs *stb
 static int sshfsm_ext_statvfs(const char *path, struct statvfs *stbuf)
 {
 	/* TODO */
-	return host_ext_statvfs(0, path, stbuf);
+	return host_ext_statvfs(sshfsm.idx_0, path, stbuf);
 }
 
 
@@ -3610,7 +3736,8 @@ static int processing_init(void)
 		pthread_cond_init(&hostp->outstanding_cond, NULL);
 		hostp->connver = 0;
 		hostp->processing_thread_started = 0;
-		hostp->rank = i * sshfsm.rank_interval;
+		if (hostp->rank == -1)
+			hostp->rank = i * sshfsm.rank_interval;
 		hostp->fd = -1;
 		hostp->ptyfd = -1;
 		hostp->ptyslavefd = -1;
@@ -3699,7 +3826,7 @@ static void usage(const char *progname)
 "    -o workaround=LIST     colon separated list of workarounds\n"
 "             none             no workarounds enabled\n"
 "             all              all workarounds enabled\n"
-"             [no]rename       fix renaming to existing file (default: on)\n"
+"             [no]rename       fix renaming to existing file (default: off)\n"
 #ifdef SSH_NODELAY_WORKAROUND
 "             [no]nodelay      set nodelay tcp flag in ssh (default: on)\n"
 #endif
@@ -3745,6 +3872,66 @@ static int sshfsm_fuse_main(struct fuse_args *args)
 #endif
 }
 
+static int parse_host_args(const char *arg)
+{
+	if (strchr(arg, ':')) {
+		assert(sshfsm.hosts);
+		int idx = get_empty_host_slot();
+		if (idx == -1) {
+			fprintf(stderr, "sshfsm: too many hosts, ignore");
+			return 1;
+		}
+		struct host *hostp = sshfsm.hosts[idx] = g_new0(struct host, 1);
+		char *cp = g_strdup(arg);
+		char *cp2 = NULL;
+		
+		hostp->rank = -1;
+
+		/* parsing hostname */
+		const char colon[] = ":";
+		char *tmp = strtok(cp, colon);
+		if (!tmp)
+			goto out;
+		else
+			hostp->hostname = g_strdup(tmp);
+	
+		/* parsing basepath */
+		tmp = strtok(NULL, colon);
+		if (!tmp)
+			hostp->basepath = g_strdup("");
+		else {
+			if (strchr(tmp, '=')) {
+				/* parsing rank */
+				const char equal[] = "=";
+				cp2 = strdup(tmp);
+				char *tmp2 = strtok(cp2, equal);
+				char *tmp3 = strtok(NULL, cp2);
+				if (tmp2 && tmp3) {
+					tmp = tmp2;
+					hostp->rank = atoi(tmp3);
+				}
+				if (tmp2 && !tmp3) {
+					tmp = "";
+					hostp->rank = atoi(tmp2);
+				}
+			} 
+			if (strcmp(tmp, "") != 0 && tmp[strlen(tmp) - 1] != '/')
+				hostp->basepath = g_strdup_printf("%s/", tmp);
+			else
+				hostp->basepath = g_strdup(tmp);
+		}
+		DEBUG("Add sshfsm.hosts[%d]: %s:%s=%d\n", sshfsm.hosts_num,
+				hostp->hostname, hostp->basepath, hostp->rank);
+		sshfsm.hosts_num ++;
+	  
+	  out:
+		g_free(cp2);
+		g_free(cp);
+		return 0;
+	}
+	return 1;
+}
+
 static int sshfsm_opt_proc(void *data, const char *arg, int key,
                           struct fuse_args *outargs)
 {
@@ -3762,43 +3949,7 @@ static int sshfsm_opt_proc(void *data, const char *arg, int key,
 		return 1;
 
 	case FUSE_OPT_KEY_NONOPT:
-		if (strchr(arg, ':')) {
-			char *arg_copy, *s;
-			const char delimiters[] = ":";
-			struct host *hostp;
-			/* Dynamically allocate hosts array */
-			if (!sshfsm.hosts) {
-				sshfsm.hosts = (struct host **)
-					sshfsm_calloc(sshfsm.hosts_num_max * sizeof(struct host *));
-			}
-			sshfsm.hosts[sshfsm.hosts_num] = hostp = (struct host *)
-				sshfsm_malloc(sizeof(struct host));
-			arg_copy = strdup(arg);
-			tmp = strtok(arg_copy, delimiters);
-			if (!tmp)
-				goto out;
-			else
-				hostp->hostname = strdup(tmp);
-			
-			tmp = strtok(NULL, delimiters);
-			if (!tmp)
-				hostp->basepath = strdup("");
-			else {
-				if (tmp[strlen(tmp) - 1] != '/') {
-					s = (char *) 
-						sshfsm_calloc((strlen(tmp)+2) * sizeof(char));
-					snprintf(s, strlen(tmp) + 2, "%s/", tmp);
-					hostp->basepath = s;
-				}
-				else
-					hostp->basepath = strdup(tmp);
-			}
-			sshfsm.hosts_num ++;
-		out:
-			free(arg_copy);
-			return 0;
-		}
-		return 1;
+		return parse_host_args(arg);
 
 	case KEY_PORT:
 		tmp = g_strdup_printf("-oPort=%s", arg + 2);
@@ -3966,7 +4117,6 @@ static void set_ssh_command(void)
 	}
 }
 
-#ifndef TEST_TABLE
 int main(int argc, char *argv[])
 {
 	int res;
@@ -3983,14 +4133,14 @@ int main(int argc, char *argv[])
 	sshfsm.max_write = 65536;
 	sshfsm.nodelay_workaround = 1;
 	sshfsm.nodelaysrv_workaround = 0;
-	sshfsm.rename_workaround = 1;
+	sshfsm.rename_workaround = 0;
 	sshfsm.truncate_workaround = 0;
 	sshfsm.buflimit_workaround = 1;
 	sshfsm.ssh_ver = 2;
 	sshfsm.progname = argv[0];
-	sshfsm.hosts = NULL;
 	sshfsm.hosts_num = 0;
 	sshfsm.hosts_num_max = DEFAULT_MAX_HOSTS_NUM;
+	sshfsm.hosts = g_new0(struct host *, sshfsm.hosts_num_max);
 	sshfsm.rank_interval = DEFAULT_RANK_INTERVAL;
 	ssh_add_arg("ssh");
 	ssh_add_arg("-x");
@@ -4120,4 +4270,3 @@ int main(int argc, char *argv[])
 
 	return res;
 }
-#endif
