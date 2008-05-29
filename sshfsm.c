@@ -242,6 +242,11 @@ struct sshfsm {
 	unsigned int max_rtt;
 	uint64_t total_rtt;
 	unsigned int num_connect;
+
+	/* fake link cache */
+	int fakelink_workaround;
+	GHashTable *fakelink_cache;
+	pthread_mutex_t lock_fakelink;
 };
 
 static struct sshfsm sshfsm;
@@ -347,11 +352,13 @@ static struct fuse_opt workaround_opts[] = {
 	SSHFSM_OPT("none",       nodelaysrv_workaround, 0),
 	SSHFSM_OPT("none",       truncate_workaround, 0),
 	SSHFSM_OPT("none",       buflimit_workaround, 0),
+	SSHFSM_OPT("none",		 fakelink_workaround, 0),
 	SSHFSM_OPT("all",        rename_workaround, 1),
 	SSHFSM_OPT("all",        nodelay_workaround, 1),
 	SSHFSM_OPT("all",        nodelaysrv_workaround, 1),
 	SSHFSM_OPT("all",        truncate_workaround, 1),
 	SSHFSM_OPT("all",        buflimit_workaround, 1),
+	SSHFSM_OPT("all",		 fakelink_workaround, 1),
 	SSHFSM_OPT("rename",     rename_workaround, 1),
 	SSHFSM_OPT("norename",   rename_workaround, 0),
 	SSHFSM_OPT("nodelay",    nodelay_workaround, 1),
@@ -362,6 +369,8 @@ static struct fuse_opt workaround_opts[] = {
 	SSHFSM_OPT("notruncate", truncate_workaround, 0),
 	SSHFSM_OPT("buflimit",   buflimit_workaround, 1),
 	SSHFSM_OPT("nobuflimit", buflimit_workaround, 0),
+	SSHFSM_OPT("fakelink",   fakelink_workaround, 1),
+	SSHFSM_OPT("nofakelink", fakelink_workaround, 0),
 	FUSE_OPT_END
 };
 
@@ -479,6 +488,68 @@ static inline char * get_parent_dir(char *path)
 	return path;
 }
 
+/* fakelink workaround routines */
+struct fakelink {
+	char *name;
+	int idx;
+};
+typedef struct fakelink *fakelink_t;
+
+static inline void fakelink_free(void *fakelinkp)
+{
+	fakelink_t p = (fakelink_t) fakelinkp;
+	g_free(p->name);
+	g_free(p);
+}
+
+static inline int fakelink_cache_init(void)
+{
+	sshfsm.fakelink_cache = g_hash_table_new_full(g_str_hash, g_str_equal,
+									g_free, fakelink_free);
+	if (!sshfsm.fakelink_cache) {
+		fprintf(stderr, "failed to create hash table\n");
+		return -1;
+	}
+	pthread_mutex_init(&sshfsm.lock_fakelink, NULL);
+	return 0;
+}
+
+static inline void fakelink_cache_destroy()
+{
+	g_hash_table_destroy(sshfsm.fakelink_cache);
+	pthread_mutex_destroy(&sshfsm.lock_fakelink);
+}
+
+static inline void fakelink_insert(const char *from, const char *to, 
+								  const int idx)
+{
+	char *key = g_strdup(to);
+	fakelink_t data = g_new(struct fakelink, 1);
+	data->name = g_strdup(from);
+	data->idx = idx;
+	pthread_mutex_lock(&sshfsm.lock_fakelink);
+	g_hash_table_insert(sshfsm.fakelink_cache, key, data);
+	pthread_mutex_unlock(&sshfsm.lock_fakelink);
+}
+
+static inline fakelink_t fakelink_lookup(const char *path)
+{
+	return g_hash_table_lookup(sshfsm.fakelink_cache, path);
+}
+
+static inline void fakelink_remove(const char *path)
+{
+	pthread_mutex_lock(&sshfsm.lock_fakelink);
+	g_hash_table_remove(sshfsm.fakelink_cache, path);
+	pthread_mutex_unlock(&sshfsm.lock_fakelink);
+}
+
+static inline void fakelink_empty(void)
+{
+	g_hash_table_remove_all(sshfsm.fakelink_cache);
+}
+
+/* buffer handling */
 static inline void buf_init(struct buffer *buf, size_t size)
 {
 	if (size) {
@@ -1943,6 +2014,9 @@ static void sshfsm_destory(void *data_)
 		g_free(hostp);
 	}
 	g_free(sshfsm.hosts);
+
+	if (sshfsm.fakelink_workaround)
+		fakelink_cache_destroy();
 }
 #endif
 
@@ -2174,7 +2248,15 @@ static int host_getattr(const int idx, const char *path, struct stat *stbuf)
 }
 
 static int sshfsm_getattr(const char *path, struct stat *stbuf)
-{
+{	
+	/* fakelink workaround 
+	 * check link cache first */
+	if (sshfsm.fakelink_workaround) {
+		fakelink_t alias = fakelink_lookup(path);
+		if (alias)
+			return host_getattr(alias->idx, alias->name, stbuf);
+	}
+		
 	if (sshfsm.hosts_num == 1)
 		return host_getattr(sshfsm.idx_0, path, stbuf);
 	
@@ -2470,6 +2552,7 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 		fprintf(stderr, "failed to create directory entry filter\n");
 		return -EIO;
 	}
+	
 	int err2;
 	curr = idx_list;
 	for (i = 0; i < idx_list_len; i++) {
@@ -2636,6 +2719,41 @@ static int sshfsm_symlink(const char *from, const char *to)
 	return err;
 }
 
+/* cache a alias as link, not hard link */
+static int sshfsm_fakelink(const char *from, const char *to)
+{
+	if (!sshfsm.fakelink_workaround)
+		return -38;	/* Not implemented as original */
+		
+	int r_flag = 1;
+	idx_list_t list = table_lookup_r(from, &r_flag);
+	struct idx_item *item = NULL;
+	struct stat stbuf;
+	int err = 0;
+	while (list) {
+		item = (struct idx_item *) list->data;
+		err = host_getattr(item->idx, from, &stbuf);
+		DEBUG("  op:fakelink_getattr(err: %d, path: %s, host: %s:%s)\n", 
+			  err, from, 
+			  sshfsm.hosts[item->idx]->hostname,
+			  sshfsm.hosts[item->idx]->basepath);
+		if (!err)
+			break;
+		list = list->next;
+	}
+
+	if (!err) {	/* add a alias to cache */
+		/* TODO: to investigate and remove 
+		 * check if there is a file first 
+		 * this may not necessary since we getattr() first */
+		fakelink_t alias = fakelink_lookup(to);
+		if (alias)
+			return -EEXIST;
+		fakelink_insert(from, to, item->idx);
+	}
+	return err;
+}
+
 static int host_unlink(const int idx, const char *path)
 {
 	int err;
@@ -2679,6 +2797,15 @@ static void unlink_pre_func(void *t_dat, void *p_dat,
 
 static int sshfsm_unlink(const char *path)
 {
+	/* fakelink workaround */
+	if (sshfsm.fakelink_workaround) {
+		fakelink_t alias = fakelink_lookup(path);
+		if (alias) {
+			fakelink_remove(path);
+			return 0;
+		}
+	}
+
 	if (sshfsm.hosts_num == 1)
 		return host_unlink(sshfsm.idx_0, path);
 	
@@ -2806,12 +2933,22 @@ static int host_rename(const int idx, const char *from, const char *to)
 			strcpy(totmp, to);
 			random_string(totmp + tolen, RENAME_TEMP_CHARS);
 			tmperr = host_do_rename(idx, to, totmp);
+			DEBUG("1: %d=host_do_rename(%d, %s, %s)\n", 
+					tmperr, idx, to, totmp);
 			if (!tmperr) {
 				err = host_do_rename(idx, from, to);
-				if (!err)
+				DEBUG("2: %d=host_do_rename(%d, %s, %s)\n", 
+						err, idx, from, to);
+				if (!err) {
 					err = host_unlink(idx, totmp);
-				else
+					DEBUG("3: %d=host_unlink(%d, %s)\n", 
+							err, idx, totmp);
+				}
+				else {
 					host_do_rename(idx, totmp, to);
+					DEBUG("4: host_do_rename(%d, %s, %s)\n", 
+							idx, totmp, to);
+				}
 			}
 		}
 	}
@@ -2860,6 +2997,13 @@ static int host_chmod(const int idx, const char *path, mode_t mode)
 
 static int sshfsm_chmod(const char *path, mode_t mode)
 {
+	/* fakelink workaround */
+	if (sshfsm.fakelink_workaround) {
+		fakelink_t alias = fakelink_lookup(path);
+		if (alias)
+			return host_chmod(alias->idx, alias->name, mode);
+	}
+
 	if (sshfsm.hosts_num == 1)
 		return host_chmod(sshfsm.idx_0, path, mode);
 	
@@ -2896,6 +3040,13 @@ static int host_chown(const int idx, const char *path, uid_t uid, gid_t gid)
 }
 static int sshfsm_chown(const char *path, uid_t uid, gid_t gid)
 {
+	/* fakelink workaround */
+	if (sshfsm.fakelink_workaround) {
+		fakelink_t alias = fakelink_lookup(path);
+		if (alias)
+			return host_chown(alias->idx, alias->name, uid, gid);
+	}
+
 	if (sshfsm.hosts_num == 1)
 		return host_chown(sshfsm.idx_0, path, uid, gid);
 	
@@ -2943,6 +3094,13 @@ static int host_truncate(const int idx, const char *path, off_t size)
 
 static int sshfsm_truncate(const char *path, off_t size)
 {
+	/* fakelink workaround */
+	if (sshfsm.fakelink_workaround) {
+		fakelink_t alias = fakelink_lookup(path);
+		if (alias)
+			return host_truncate(alias->idx, alias->name, size);
+	}
+
 	if (sshfsm.hosts_num == 1)
 		return host_truncate(sshfsm.idx_0, path, size);
 	
@@ -2980,6 +3138,13 @@ static int host_utime(const int idx, const char *path, struct utimbuf *ubuf)
 
 static int sshfsm_utime(const char *path, struct utimbuf *ubuf)
 {
+	/* fakelink workaround */
+	if (sshfsm.fakelink_workaround) {
+		fakelink_t alias = fakelink_lookup(path);
+		if (alias)
+			return host_utime(alias->idx, alias->name, ubuf);
+	}
+
 	if (sshfsm.hosts_num == 1)
 		return host_utime(sshfsm.idx_0, path, ubuf);
 	
@@ -3088,6 +3253,13 @@ static int host_open_common(const int idx, const char *path, mode_t mode,
 
 static int sshfsm_open(const char *path, struct fuse_file_info *fi)
 {
+	/* fakelink workaround */
+	if (sshfsm.fakelink_workaround) {
+		fakelink_t alias = fakelink_lookup(path);
+		if (alias)
+			return host_open_common(alias->idx, alias->name, 0, fi);
+	}
+
 	if (sshfsm.hosts_num == 1)
 		return host_open_common(sshfsm.idx_0, path, 0, fi);
 	
@@ -3748,6 +3920,14 @@ static int processing_init(void)
 		}
 	}
 	pthread_mutex_init(&sshfsm.lock_hosts, NULL);
+
+	/* fake link workaround init */
+	if (sshfsm.fakelink_workaround) {
+		int err = fakelink_cache_init();
+		if (err)
+			return err;
+	}
+
 	return 0;
 }
 
@@ -3778,7 +3958,7 @@ static struct fuse_cache_operations sshfsm_oper = {
 		.mknod      = sshfsm_mknod,
 		.mkdir      = sshfsm_mkdir,
 		.symlink    = sshfsm_symlink,
-		/* .link	= sshfsm_link,  wait for SFTP-6 */
+		.link		= sshfsm_fakelink,  /* wait for SFTP-6 */
 		.unlink     = sshfsm_unlink,
 		.rmdir      = sshfsm_rmdir,
 		.rename     = sshfsm_rename,
@@ -3833,6 +4013,7 @@ static void usage(const char *progname)
 "             [no]nodelaysrv   set nodelay tcp flag in sshd (default: off)\n"
 "             [no]truncate     fix truncate for old servers (default: off)\n"
 "             [no]buflimit     fix buffer fillup bug in server (default: on)\n"
+"             [no]fakelink     implement link as symbol link (default: off)\n"
 "    -o idmap=TYPE          user/group ID mapping, possible types are:\n"
 "             none             no translation of the ID space (default)\n"
 "             user             only translate UID of connecting user\n"
@@ -4133,6 +4314,7 @@ int main(int argc, char *argv[])
 	sshfsm.max_write = 65536;
 	sshfsm.nodelay_workaround = 1;
 	sshfsm.nodelaysrv_workaround = 0;
+	sshfsm.fakelink_workaround = 0;
 	sshfsm.rename_workaround = 0;
 	sshfsm.truncate_workaround = 0;
 	sshfsm.buflimit_workaround = 1;
