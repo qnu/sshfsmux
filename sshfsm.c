@@ -116,6 +116,10 @@
 #define DEFAULT_MAX_HOSTS_NUM 32
 #define DEFAULT_RANK_INTERVAL 32
 
+#if GLIB_CHECK_VERSION(2, 16, 0)
+#define HASH_TABLE_HAVE_ITER
+#endif
+
 struct buffer {
 	uint8_t *p;
 	size_t len;
@@ -488,9 +492,14 @@ static inline char * get_parent_dir(char *path)
 	return path;
 }
 
+static inline int is_parent(const char *path, const char *dir)
+{
+}
+
 /* fakelink workaround routines */
 struct fakelink {
 	char *name;
+	struct stat stbuf;
 	int idx;
 	int count;
 };
@@ -522,7 +531,7 @@ static void fakelink_cache_destroy()
 }
 
 static inline void fakelink_insert(const char *from, const char *to, 
-								  const int idx)
+								   const int idx, struct stat *stbuf)
 {	
 	char *orig_key;
 	fakelink_t orig_data;
@@ -538,6 +547,7 @@ static inline void fakelink_insert(const char *from, const char *to,
 		char *orig_key = g_strdup(from);
 		orig_data = g_new(struct fakelink, 1);
 		orig_data->name = orig_key;
+		orig_data->stbuf = *stbuf;
 		orig_data->idx = idx;
 		orig_data->count = 1;
 		pthread_mutex_lock(&sshfsm.lock_fakelink);
@@ -554,15 +564,7 @@ static inline fakelink_t fakelink_lookup(const char *path)
 
 static int host_rename(const int idx, const char *from, const char *to);
 
-#if GLIB_CHECK_VERSION(2, 16, 0)
-#define FAKELINK_USE_ITER
-#elif GLIB_CHECK_VERSION(2, 4, 0)
-#define FAKELINK_USE_FIND
-#else
-#error	"GLib (ver > 2.4.0) required"
-#endif
-
-#ifdef FAKELINK_USE_FIND
+#ifndef HASH_TABLE_HAVE_ITER
 struct fakelink_hash_find_data {
 	gpointer key;
 	gpointer data;
@@ -578,6 +580,24 @@ static gboolean fakelink_hash_find_func(gpointer key, gpointer data,
 	if (found)
 		p->key = key;
 	return found;
+}
+
+struct fakelink_filldir_data {
+	char *path;
+	fuse_cache_dirh_t h;
+	fuse_cache_dirfil_t filler;
+	GHashTable *filter;
+};
+
+static void fakelink_filldir_func(gpointer key, gpointer data, 
+								  gpointer user_data)
+{
+	char *k = (char *) key;
+	struct fakelink *d = (struct fakelink *) data;
+	struct fakelink_filldir_data *ud = 
+		(struct fakelink_filldir_data *) user_data;
+	if (is_parent(key, ud->path)) {
+	}
 }
 #endif
 
@@ -596,15 +616,15 @@ static inline int fakelink_remove(const char *path)
 		fakelink_t data;
 		pthread_mutex_lock(&sshfsm.lock_fakelink);
 		g_hash_table_steal(sshfsm.fakelink_cache, orig_key);
-#ifdef FAKELINK_USE_ITER
+#ifdef HASH_TABLE_HAVE_ITER
+#error "Not checked yet"
 		GHashTableIter iter;
 		g_hash_table_iter_init(&iter, sshfsm.fakelink_cache);
 		while (g_hash_table_iter_next(&iter, (void *) &key, (void *) &data)) {
 			if (data == orig_data)
 				break;
 		}
-#endif
-#ifdef FAKELINK_USE_FIND
+#else
 		struct fakelink_hash_find_data find_data;
 		find_data.key = NULL;
 		find_data.data = orig_data;
@@ -2646,7 +2666,20 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 		fprintf(stderr, "failed to create directory entry filter\n");
 		return -EIO;
 	}
-	
+
+	/* fakelink workaround */
+#ifdef HASH_TABLE_HAVE_ITER
+#error "fakelink in sshfsm_getdir not implemented yet"
+#else
+	struct fakelink_filldir_data fill_data;
+	fill_data.path = g_strdup(path);
+	fill_data.h = h;
+	fill_data.filler = filler;
+	fill_data.filter = entry_filter;
+	g_hash_table_foreach(sshfsm.fakelink_cache, fakelink_filldir_func, 
+			&fill_data);
+	g_free(fill_data.path);
+#endif
 	int err2;
 	curr = idx_list;
 	for (i = 0; i < idx_list_len; i++) {
@@ -2843,7 +2876,7 @@ static int sshfsm_fakelink(const char *from, const char *to)
 		fakelink_t alias = fakelink_lookup(to);
 		if (alias)
 			return -EEXIST;
-		fakelink_insert(from, to, item->idx);
+		fakelink_insert(from, to, item->idx, &stbuf);
 	}
 	return err;
 }
