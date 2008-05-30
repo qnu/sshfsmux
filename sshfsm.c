@@ -492,6 +492,7 @@ static inline char * get_parent_dir(char *path)
 struct fakelink {
 	char *name;
 	int idx;
+	int count;
 };
 typedef struct fakelink *fakelink_t;
 
@@ -502,7 +503,7 @@ static inline void fakelink_free(void *fakelinkp)
 	g_free(p);
 }
 
-static inline int fakelink_cache_init(void)
+static int fakelink_cache_init(void)
 {
 	sshfsm.fakelink_cache = g_hash_table_new_full(g_str_hash, g_str_equal,
 									g_free, fakelink_free);
@@ -514,7 +515,7 @@ static inline int fakelink_cache_init(void)
 	return 0;
 }
 
-static inline void fakelink_cache_destroy()
+static void fakelink_cache_destroy()
 {
 	g_hash_table_destroy(sshfsm.fakelink_cache);
 	pthread_mutex_destroy(&sshfsm.lock_fakelink);
@@ -522,14 +523,28 @@ static inline void fakelink_cache_destroy()
 
 static inline void fakelink_insert(const char *from, const char *to, 
 								  const int idx)
-{
-	char *key = g_strdup(to);
-	fakelink_t data = g_new(struct fakelink, 1);
-	data->name = g_strdup(from);
-	data->idx = idx;
-	pthread_mutex_lock(&sshfsm.lock_fakelink);
-	g_hash_table_insert(sshfsm.fakelink_cache, key, data);
-	pthread_mutex_unlock(&sshfsm.lock_fakelink);
+{	
+	char *orig_key;
+	fakelink_t orig_data;
+	int found = g_hash_table_lookup_extended(sshfsm.fakelink_cache, from,
+					(void *) &orig_key, (void *) &orig_data);
+	if (found) {		/* insert duplicate */
+		orig_data->count ++;
+		assert(orig_data->idx == idx);
+		pthread_mutex_lock(&sshfsm.lock_fakelink);
+		g_hash_table_insert(sshfsm.fakelink_cache, g_strdup(to), orig_data);
+		pthread_mutex_unlock(&sshfsm.lock_fakelink);
+	} else {				/* insert original and duplicate */
+		char *orig_key = g_strdup(from);
+		orig_data = g_new(struct fakelink, 1);
+		orig_data->name = orig_key;
+		orig_data->idx = idx;
+		orig_data->count = 1;
+		pthread_mutex_lock(&sshfsm.lock_fakelink);
+		g_hash_table_insert(sshfsm.fakelink_cache, orig_key, orig_data);
+		g_hash_table_insert(sshfsm.fakelink_cache, g_strdup(to), orig_data);
+		pthread_mutex_unlock(&sshfsm.lock_fakelink);
+	}
 }
 
 static inline fakelink_t fakelink_lookup(const char *path)
@@ -537,11 +552,90 @@ static inline fakelink_t fakelink_lookup(const char *path)
 	return g_hash_table_lookup(sshfsm.fakelink_cache, path);
 }
 
-static inline void fakelink_remove(const char *path)
+static int host_rename(const int idx, const char *from, const char *to);
+
+#if GLIB_CHECK_VERSION(2, 16, 0)
+#define FAKELINK_USE_ITER
+#elif GLIB_CHECK_VERSION(2, 4, 0)
+#define FAKELINK_USE_FIND
+#else
+#error	"GLib (ver > 2.4.0) required"
+#endif
+
+#ifdef FAKELINK_USE_FIND
+struct fakelink_hash_find_data {
+	gpointer key;
+	gpointer data;
+};
+
+static gboolean fakelink_hash_find_func(gpointer key, gpointer data,
+										gpointer user_data)
 {
-	pthread_mutex_lock(&sshfsm.lock_fakelink);
-	g_hash_table_remove(sshfsm.fakelink_cache, path);
-	pthread_mutex_unlock(&sshfsm.lock_fakelink);
+	struct fakelink_hash_find_data *p = 
+		(struct fakelink_hash_find_data *) user_data;
+	
+	gboolean found = g_direct_equal(data, p->data);
+	if (found)
+		p->key = key;
+	return found;
+}
+#endif
+
+static inline int fakelink_remove(const char *path)
+{
+	char *orig_key;
+	fakelink_t orig_data;
+	int found = g_hash_table_lookup_extended(sshfsm.fakelink_cache, path,
+					(void *) &orig_key, (void *) &orig_data);
+	if (!found)
+		return -ENOENT;
+	
+	int err = 0;
+	if (orig_key == orig_data->name) {
+		char *key;
+		fakelink_t data;
+		pthread_mutex_lock(&sshfsm.lock_fakelink);
+		g_hash_table_steal(sshfsm.fakelink_cache, orig_key);
+#ifdef FAKELINK_USE_ITER
+		GHashTableIter iter;
+		g_hash_table_iter_init(&iter, sshfsm.fakelink_cache);
+		while (g_hash_table_iter_next(&iter, (void *) &key, (void *) &data)) {
+			if (data == orig_data)
+				break;
+		}
+#endif
+#ifdef FAKELINK_USE_FIND
+		struct fakelink_hash_find_data find_data;
+		find_data.key = NULL;
+		find_data.data = orig_data;
+		g_hash_table_find(sshfsm.fakelink_cache, fakelink_hash_find_func,
+				&find_data);
+		key = find_data.key;
+		data = find_data.data;
+#endif
+		err = host_rename(data->idx, orig_key, key);
+		if (!err) {	
+			data->count --;
+			if (data->count == 0) {
+				g_hash_table_steal(sshfsm.fakelink_cache, key);
+				g_free(orig_data);
+			}
+			else
+				data->name = key;
+		}
+		pthread_mutex_unlock(&sshfsm.lock_fakelink);
+	} else {
+		pthread_mutex_lock(&sshfsm.lock_fakelink);
+		g_hash_table_steal(sshfsm.fakelink_cache, orig_key);
+		orig_data->count --;
+		if (orig_data->count == 0) {
+			g_hash_table_steal(sshfsm.fakelink_cache, orig_data->name);
+			g_free(orig_data);
+		}
+		pthread_mutex_unlock(&sshfsm.lock_fakelink);
+	}
+	g_free(orig_key);
+	return err;
 }
 
 static inline void fakelink_empty(void)
@@ -2799,11 +2893,8 @@ static int sshfsm_unlink(const char *path)
 {
 	/* fakelink workaround */
 	if (sshfsm.fakelink_workaround) {
-		fakelink_t alias = fakelink_lookup(path);
-		if (alias) {
-			fakelink_remove(path);
+		if (!fakelink_remove(path))
 			return 0;
-		}
 	}
 
 	if (sshfsm.hosts_num == 1)
