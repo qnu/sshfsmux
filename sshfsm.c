@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <malloc.h>
 #include <fcntl.h>
+#include <libgen.h>		/* basename and dirname */
 #include <string.h>
 #include <stdint.h>
 #include <errno.h>
@@ -480,22 +481,6 @@ static inline char * concate_path(const char *path, const char *name)
 	return g_strdup_printf("%s/%s", path, name);
 }
 
-static inline char * get_parent_dir(char *path)
-{
-	if (strcmp(path, "/") == 0)
-		return path;
-	
-	int i = strlen(path) - 1;
-	do {
-		path[i--] = '\0';
-	} while (i != 0 && path[i] != '/');
-	return path;
-}
-
-static inline int is_parent(const char *path, const char *dir)
-{
-}
-
 /* fakelink workaround routines */
 struct fakelink {
 	char *name;
@@ -596,8 +581,18 @@ static void fakelink_filldir_func(gpointer key, gpointer data,
 	struct fakelink *d = (struct fakelink *) data;
 	struct fakelink_filldir_data *ud = 
 		(struct fakelink_filldir_data *) user_data;
-	if (is_parent(key, ud->path)) {
+	char *p = strdup(k);
+	char *n = strdup(k);
+	char *parent_dir = dirname(p);
+	char *name = basename(n);
+	if (strcmp(parent_dir, ud->path) == 0 && 
+		!g_hash_table_lookup(ud->filter, name)) {
+		ud->filler(ud->h, name, &d->stbuf);
+		g_hash_table_insert(ud->filter, g_strdup(name),
+			g_strdup(""));
 	}
+	free(p);
+	free(n);
 }
 #endif
 
@@ -2623,7 +2618,7 @@ static int entry_list_get_entries(const int idx, const char *path,
 static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
                         fuse_cache_dirfil_t filler)
 {	
-	if (sshfsm.hosts_num == 1)
+	if (sshfsm.hosts_num == 1 && !sshfsm.fakelink_workaround)
 		return host_getdir_1(sshfsm.idx_0, path, h, filler);
 
 	pthread_t *threads;
@@ -2680,6 +2675,7 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 			&fill_data);
 	g_free(fill_data.path);
 #endif
+
 	int err2;
 	curr = idx_list;
 	for (i = 0; i < idx_list_len; i++) {
