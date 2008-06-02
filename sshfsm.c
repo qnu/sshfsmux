@@ -2369,7 +2369,7 @@ static int sshfsm_getattr(const char *path, struct stat *stbuf)
 	if (sshfsm.hosts_num == 1)
 		return host_getattr(sshfsm.idx_0, path, stbuf);
 	
-	int r_flag = 1;
+	int r_flag = 0;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
 	int err = 0;

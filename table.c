@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <libgen.h>
 #include <malloc.h>
 #include <pthread.h>
 #include <assert.h>
@@ -168,21 +169,6 @@ idx_list_t table_lookup(const char *path)
 	return g_hash_table_lookup(table.table, path);
 }
 
-/* Get parent directory of path
- * strip from behind in place
- * so use a copy of path */
-static inline char * get_parent_dir(char *path)
-{
-	if (strcmp(path, "/") == 0)
-		return path;
-	
-	int i = strlen(path) - 1;
-	do {
-		path[i--] = '\0';
-	} while (i != 0 && path[i] != '/');
-	return path;
-}
-
 idx_list_t table_lookup_r(const char *path, int *r_flag)
 {
 	GSList *idx_list = NULL;
@@ -192,15 +178,16 @@ idx_list_t table_lookup_r(const char *path, int *r_flag)
 			return idx_list;
 	}
 	*r_flag = 0;	/* clear flag and do recursive */
-	char *parent_dir = g_strdup(path);
+	char *p = strdup(path);
+	char *parent_dir = p;
 	while (idx_list == NULL) {
 		*r_flag = *r_flag + 1;
-		parent_dir = get_parent_dir(parent_dir);
-		DEBUG("debug: table lookup recusively for %s\n", parent_dir);
+		parent_dir = dirname(parent_dir);
 		idx_list = g_hash_table_lookup(table.table, parent_dir);
+		DEBUG("debug: table lookup recusively for %s\n", parent_dir);
 		if (idx_list)
 			break;
 	}
-	g_free(parent_dir);
+	free(p);
 	return idx_list;
 }
