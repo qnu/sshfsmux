@@ -15,9 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <malloc.h>
 #include <fcntl.h>
-#include <libgen.h>		/* basename and dirname */
 #include <string.h>
 #include <stdint.h>
 #include <errno.h>
@@ -34,7 +32,9 @@
 #include <sys/poll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <arpa/inet.h>
 #include <glib.h>
+#include <libgen.h>	/* basename and dirname */
 
 #include "cache.h"
 #include "table.h"
@@ -117,6 +117,11 @@
 #define DEFAULT_MAX_HOSTS_NUM 32
 #define DEFAULT_RANK_INTERVAL 32
 
+#define OP_SERVER_HOST "localhost"
+#define OP_SERVER_PORT 10000
+#define OP_SERVER_MAX_CONN 32
+#define OP_SERVER_MAX_BUF 512
+
 #if GLIB_CHECK_VERSION(2, 16, 0)
 #define HASH_TABLE_HAVE_ITER
 #endif
@@ -194,18 +199,47 @@ struct host {
 	uint32_t idctr;
 };
 
+enum operation_t {
+	OP_START 	= 0,
+	OP_FINISH	= 1,
+	OP_WHERE 	= 2,
+	OP_WHERER	= 3,
+	OP_UNKNOWN	= -1,
+};
+
+struct opserver {
+	struct sockaddr_in addr;
+	int sockfd;
+	char *hostname;
+	int port;
+	int processing_thread_started;
+	pthread_t thread_id;
+};
+
+struct opclient {
+	struct sockaddr_in serv_addr;
+	int sockfd;
+	char *hostname;
+	int port;
+	int opcode;
+	char *path;
+};
+
 struct sshfsm {
 	/* Basic configuration */
 	char *directport;
 	char *ssh_command;
 	char *sftp_server;
 	struct fuse_args ssh_args;
+
+	/* options and workarounds */
 	char *workarounds;
 	int rename_workaround;
 	int nodelay_workaround;
 	int nodelaysrv_workaround;
 	int truncate_workaround;
 	int buflimit_workaround;
+	int fakelink_workaround;
 	int transform_symlinks;
 	int follow_symlinks;
 	int no_check_root;
@@ -218,16 +252,9 @@ struct sshfsm {
 	int debug;
 	int foreground;
 	int reconnect;
+	int oper;
 
-	/* Hosts */
-	struct host **hosts;
-	int hosts_num;
-	int hosts_num_max;
-	int rank_interval;
-	pthread_mutex_t lock_hosts;
-	int idx_0;	/* idx when only one host */
-	
-	/* Misc */
+	/* misc */
 	unsigned int randseed;
 	unsigned local_uid;
 	unsigned blksize;
@@ -248,10 +275,24 @@ struct sshfsm {
 	uint64_t total_rtt;
 	unsigned int num_connect;
 
+	/* hosts*/
+	struct host **hosts;
+	int hosts_num;
+	int hosts_num_max;
+	int rank_interval;
+	pthread_mutex_t lock_hosts;
+	int idx_0;	/* index of the only one host */
+
 	/* fake link cache */
-	int fakelink_workaround;
 	GHashTable *fakelink_cache;
 	pthread_mutex_t lock_fakelink;
+
+	/* operation server */
+	struct opserver op_serv;
+	struct opclient op_clnt;
+	char *op_server;
+	unsigned op_port;
+	int op_flag;
 };
 
 static struct sshfsm sshfsm;
@@ -285,7 +326,7 @@ static const char *ssh_opts[] = {
 	"LogLevel",
 	"MACs",
 	"NoHostAuthenticationForLocalhost",
-#if USE_HPN_SSH
+#ifdef USE_HPN_SSH
 	"NoneEnabled",
 	"NoneSwitch",
 #endif
@@ -315,6 +356,7 @@ enum {
 	KEY_HELP,
 	KEY_VERSION,
 	KEY_FOREGROUND,
+	KEY_OPERATION,
 };
 
 #define SSHFSM_OPT(t, p, v) { t, offsetof(struct sshfsm, p), v }
@@ -338,6 +380,10 @@ static struct fuse_opt sshfsm_opts[] = {
 	SSHFSM_OPT("follow_symlinks",   follow_symlinks, 1),
 	SSHFSM_OPT("no_check_root",     no_check_root, 1),
 	SSHFSM_OPT("password_stdin",    password_stdin, 1),
+	SSHFSM_OPT("oper=yes",			oper, 1),
+	SSHFSM_OPT("oper=no",			oper, 0),
+	SSHFSM_OPT("op_server=%s",      op_server, 0), 
+	SSHFSM_OPT("op_port=%s",        op_port, 0),
 
 	FUSE_OPT_KEY("-p ",            KEY_PORT),
 	FUSE_OPT_KEY("-C",             KEY_COMPRESS),
@@ -348,6 +394,7 @@ static struct fuse_opt sshfsm_opts[] = {
 	FUSE_OPT_KEY("debug",          KEY_FOREGROUND),
 	FUSE_OPT_KEY("-d",             KEY_FOREGROUND),
 	FUSE_OPT_KEY("-f",             KEY_FOREGROUND),
+	FUSE_OPT_KEY("-c",			   KEY_OPERATION),
 	FUSE_OPT_END
 };
 
@@ -413,33 +460,22 @@ static const char *type_name(uint8_t type)
 	}
 }
 
+static int oper_code(const char *oper)
+{
+	if (strcasecmp(oper, "where") == 0)
+		return OP_WHERE;
+	if (strcasecmp(oper, "wherer") == 0)
+		return OP_WHERER;
+
+	return OP_UNKNOWN;
+}
+
 #define DEBUG(format, args...)						\
 	do { if (sshfsm.debug) fprintf(stderr, format, args); } while(0)
 
 #define container_of(ptr, type, member) ({				\
 			const typeof( ((type *)0)->member ) *__mptr = (ptr); \
 			(type *)( (char *)__mptr - offsetof(type,member) );})
-
-static inline void * sshfsm_malloc(size_t size)
-{	
-	void *p;
-	if (!(p = malloc(size))) {
-		fprintf(stderr, "sshfsm: memory allocation failed\n");
-		abort();
-	}
-	return p;
-}
-
-static inline void * sshfsm_calloc(size_t size)
-{
-	void *p;
-	if (!(p = malloc(size))) {
-		fprintf(stderr, "sshfsm: memory allocation failed\n");
-       	abort();
-	}
-	memset(p, 0, size);
-	return p;
-}
 
 #define list_entry(ptr, type, member)		\
 	container_of(ptr, type, member)
@@ -880,10 +916,10 @@ static int buf_get_attrs(const int idx, struct buffer *buf,
 		}
 	}
 
-	/* TODO */
+	/* TODO: properly set local uid */
 	if (hostp->uid_detected && uid == hostp->uid)
 		uid = sshfsm.local_uid;
-	
+
 	memset(stbuf, 0, sizeof(struct stat));
 	stbuf->st_mode = mode;
 	stbuf->st_nlink = 1;
@@ -1200,21 +1236,20 @@ static int start_ssh(const int idx)
 {
 	char *ptyname = NULL;
 	int sockpair[2];
-	int pid;
+	int pid, i;
 	struct fuse_args ssh_args = FUSE_ARGS_INIT(0, NULL);
 	struct host *hostp = sshfsm.hosts[idx];
 
-	/* Since we threading start_ssh, 
-	 * we have to ssh_args to local */
-	int i;
-	for (i = 0; i < sshfsm.ssh_args.argc; i++)
+	/* since we threading start_ssh, 
+	 * we have to make ssh_args local */
+	for (i = 0; i < sshfsm.ssh_args.argc; i++) {
 		if (fuse_opt_add_arg(&ssh_args, sshfsm.ssh_args.argv[i]) == -1)
 			return -1;
+	}
 	if (fuse_opt_insert_arg(&ssh_args, 1, hostp->hostname) == -1)
 		return -1;
 
 	if (sshfsm.password_stdin) {
-
 		hostp->ptyfd = pty_master(&ptyname);
 		if (hostp->ptyfd == -1)
 			return -1;
@@ -1296,7 +1331,7 @@ static int start_ssh(const int idx)
 			close(hostp->ptyslavefd);
 			close(hostp->ptyfd);
 		}
-		
+
 		if (sshfsm.debug) {
 			fprintf(stderr, "executing");
 			for (i = 0; i < ssh_args.argc; i++)
@@ -1331,7 +1366,7 @@ static int connect_to(const int idx, char *port)
 	err = getaddrinfo(hostp->hostname, port, &hint, &ai);
 	if (err) {
 		fprintf(stderr, "failed to resolve %s:%s: %s\n", hostp->hostname, 
-				port, gai_strerror(err));
+			port, gai_strerror(err));
 		return -1;
 	}
 	sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
@@ -1444,7 +1479,8 @@ static int do_read(const int idx, struct buffer *buf)
 			perror("read");
 			return -1;
 		} else if (res == 0) {
-			fprintf(stderr, "remote host has disconnected\n");
+			fprintf(stderr, "remote host %s has disconnected\n",
+					hostp->hostname);
 			return -1;
 		}
 		size -= res;
@@ -1500,7 +1536,7 @@ static void chunk_put(struct read_chunk *chunk)
 }
 
 static void chunk_put_locked(const int idx, struct read_chunk *chunk)
-{	
+{
 	struct host *hostp = sshfsm.hosts[idx];
 	pthread_mutex_lock(&hostp->lock);
 	chunk_put(chunk);
@@ -1596,7 +1632,7 @@ static int process_one_request(const int idx)
 }
 
 static void close_conn(const int idx)
-{	
+{
 	struct host *hostp = sshfsm.hosts[idx];
 	close(hostp->fd);
 	hostp->fd = -1;
@@ -1611,7 +1647,7 @@ static void close_conn(const int idx)
 }
 
 static void *process_requests(void *data)
-{	
+{
 	int *idxp = (int *) data;
 	int idx = *idxp;
 	struct host *hostp = sshfsm.hosts[idx];
@@ -1633,10 +1669,12 @@ static void *process_requests(void *data)
 		hostp->connver ++;
 		pthread_mutex_unlock(&hostp->lock);
 	}
+	g_free(data);
 	return NULL;
 }
 
-static int sftp_init_reply_ok(const int idx, struct buffer *buf, uint32_t *version)
+static int sftp_init_reply_ok(const int idx, struct buffer *buf, 
+							  uint32_t *version)
 {
 	uint32_t len;
 	uint8_t type;
@@ -1732,7 +1770,8 @@ static int sftp_init(const int idx)
 	hostp->server_version = version;
 	if (version > PROTO_VERSION) {
 		fprintf(stderr,
-			"Warning: server %s uses version: %i, we support: %i\n", hostp->hostname, version, PROTO_VERSION);
+			"Warning: server %s uses version: %i, we support: %i\n",
+			hostp->hostname, version, PROTO_VERSION);
 	}
 	res = 0;
 
@@ -1803,7 +1842,7 @@ static void sftp_detect_uid(const int idx)
 	hostp->uid = stbuf.st_uid;
 	sshfsm.local_uid = getuid();
 	hostp->uid_detected = 1;
-	DEBUG("host %s remote_uid = %i\n", hostp->hostname, hostp->uid);
+	DEBUG("host %s uid = %i\n", hostp->hostname, hostp->uid);
 
 out:
 	if (!hostp->uid_detected)
@@ -1982,7 +2021,7 @@ static int connect_remote(const int idx)
 	if (err)
 		close_conn(idx);
 	else
-		sshfsm.num_connect++; /* TODO: if stat for each host need hostp */
+		sshfsm.num_connect++; /* TODO: put this for each host */
 
 	return err;
 }
@@ -2026,8 +2065,7 @@ static int connect_remote_all()
 			return -EIO;
 		}
 		if (retval != 0)
-			DEBUG("debug: connect to %s failed\n", 
-				 sshfsm.hosts[i]->hostname);
+			DEBUG("debug: connect to %s failed\n", sshfsm.hosts[i]->hostname);
 	}
 	pthread_attr_destroy(&attr);
 	g_free(idxs);
@@ -2052,8 +2090,8 @@ static int start_processing_thread(const int idx)
 		if (err)
 			return -EIO;
 	}
-	
-	int *datap = (int *) sshfsm_malloc(sizeof(int));
+
+	int *datap = g_new(int, 1);
 	*datap = idx;
 	sigemptyset(&newset);
 	sigaddset(&newset, SIGTERM);
@@ -2073,7 +2111,7 @@ static int start_processing_thread(const int idx)
 }
 
 static int start_processing_thread_all(void)
-{	
+{
 	int err, i;
 	for (i = 0; i < sshfsm.hosts_num; i++)
 		if ((err = start_processing_thread(i)) != 0) {
@@ -2083,6 +2121,9 @@ static int start_processing_thread_all(void)
 		}
 	return 0;
 }
+
+static int op_server_init(void);
+static void op_server_destroy(void);
 
 #ifdef SSHFSM_USE_INIT
 #if FUSE_VERSION >= 26
@@ -2099,21 +2140,25 @@ static void *sshfsm_init(struct fuse_conn_info *conn)
 
 	if (sshfsm.detect_uid)
 		sftp_detect_uid_all();
+	
+	if (sshfsm.oper)
+		op_server_init();
 
 	start_processing_thread_all();
+	
 	return NULL;
 }
 #endif
 
 #ifdef SSHFSM_USE_DESTROY
-static void sshfsm_destory(void *data_)
+static void sshfsm_destroy(void *data_)
 {
 	struct host *hostp;
 	int i;
 	(void) data_;
 	cache_destroy();
 	table_destroy();
-	for (i = 0; i < sshfsm.hosts_num; i++) { /* TOUP */
+	for (i = 0; i < sshfsm.hosts_num; i++) { /* TODO: thread? */
 		hostp = sshfsm.hosts[i];	
 		g_free(hostp->hostname);
 		g_free(hostp->basepath);
@@ -2126,6 +2171,9 @@ static void sshfsm_destory(void *data_)
 
 	if (sshfsm.fakelink_workaround)
 		fakelink_cache_destroy();
+	
+	if (sshfsm.oper)
+		op_server_destroy();
 }
 #endif
 
@@ -2531,7 +2579,8 @@ static int host_getdir_1(const int idx, const char *path,
 		buf_finish(&handle);
 		do {
 			struct buffer name;
-			err = sftp_request(idx, SSH_FXP_READDIR, &handle, SSH_FXP_NAME, &name);
+			err = sftp_request(idx, SSH_FXP_READDIR, &handle, SSH_FXP_NAME, 
+							   &name);
 			if (!err) {
 				if (buf_get_entries_1(idx, &name, h, filler) == -1)
 					err = -EIO;
@@ -3053,22 +3102,12 @@ static int host_rename(const int idx, const char *from, const char *to)
 			strcpy(totmp, to);
 			random_string(totmp + tolen, RENAME_TEMP_CHARS);
 			tmperr = host_do_rename(idx, to, totmp);
-			DEBUG("1: %d=host_do_rename(%d, %s, %s)\n", 
-					tmperr, idx, to, totmp);
 			if (!tmperr) {
 				err = host_do_rename(idx, from, to);
-				DEBUG("2: %d=host_do_rename(%d, %s, %s)\n", 
-						err, idx, from, to);
-				if (!err) {
+				if (!err)
 					err = host_unlink(idx, totmp);
-					DEBUG("3: %d=host_unlink(%d, %s)\n", 
-							err, idx, totmp);
-				}
-				else {
+				else
 					host_do_rename(idx, totmp, to);
-					DEBUG("4: host_do_rename(%d, %s, %s)\n", 
-							idx, totmp, to);
-				}
 			}
 		}
 	}
@@ -3761,7 +3800,7 @@ static int host_ext_statvfs(const int idx, const char *path, struct statvfs *stb
 
 static int sshfsm_ext_statvfs(const char *path, struct statvfs *stbuf)
 {
-	/* TODO */
+	/* TODO: add up all vfs info */
 	return host_ext_statvfs(sshfsm.idx_0, path, stbuf);
 }
 
@@ -3992,8 +4031,8 @@ static int host_truncate_extend(const int idx, const char *path, off_t size,
  * If new size is greater than current size, then write a zero byte to
  * the new end of the file.
  */
-static int host_truncate_workaround(const int idx, const char *path, off_t size,
-                                     struct fuse_file_info *fi)
+static int host_truncate_workaround(const int idx, const char *path, 
+									off_t size, struct fuse_file_info *fi)
 {
 	if (size == 0)
 		return host_truncate_zero(idx, path);
@@ -4003,7 +4042,7 @@ static int host_truncate_workaround(const int idx, const char *path, off_t size,
 		if (fi)
 			err = sshfsm_fgetattr(path, &stbuf, fi);
 		else
-			err = host_getattr(idx, path, &stbuf); /* TODO */
+			err = host_getattr(idx, path, &stbuf);
 		if (err)
 			return err;
 		if (stbuf.st_size == size)
@@ -4021,7 +4060,7 @@ static int processing_init(void)
 	int i;
 	signal(SIGPIPE, SIG_IGN); /* TOASK */
 
-	for (i = 0; i < sshfsm.hosts_num; i++) {	/* TOUP */
+	for (i = 0; i < sshfsm.hosts_num; i++) {	/* TODO: thread? */
 		hostp = sshfsm.hosts[i];
 		pthread_mutex_init(&hostp->lock, NULL);
 		pthread_mutex_init(&hostp->lock_write, NULL);
@@ -4071,7 +4110,7 @@ static struct fuse_cache_operations sshfsm_oper = {
 		.init       = sshfsm_init,
 #endif
 #ifdef SSHFSM_USE_DESTROY
-		.destroy	= sshfsm_destory,
+		.destroy	= sshfsm_destroy,
 #endif
 		.getattr    = sshfsm_getattr,
 		.readlink   = sshfsm_readlink,
@@ -4146,6 +4185,12 @@ static void usage(const char *progname)
 "    -o no_check_root       don't check for existence of 'dir' on server\n"
 "    -o password_stdin      read password from stdin (only for pam_mount!)\n"
 "    -o SSHOPT=VAL          ssh options (see man ssh_config)\n"
+"\n"
+"SSHFSM operation options and commands:\n"
+"    -o oper=YESNO          enable operation {yes,no} (default: yes)\n"
+"    -o op_server=SERV      operation server (default: localhost)\n"
+"    -o op_port=PORT        operation server port (default: 10000)\n"
+"    -c where PATH          query real file location\n"
 "\n", progname);
 }
 
@@ -4221,7 +4266,7 @@ static int parse_host_args(const char *arg)
 			else
 				hostp->basepath = g_strdup(tmp);
 		}
-		DEBUG("Add sshfsm.hosts[%d]: %s:%s=%d\n", sshfsm.hosts_num,
+		DEBUG("add sshfsm.hosts[%d]: %s:%s=%d\n", sshfsm.hosts_num,
 				hostp->hostname, hostp->basepath, hostp->rank);
 		sshfsm.hosts_num ++;
 	  
@@ -4231,6 +4276,45 @@ static int parse_host_args(const char *arg)
 		return 0;
 	}
 	return 1;
+}
+
+static int parse_op_args(const char *arg)
+{
+	static int parse_stage = 0;
+	
+	switch (parse_stage) {
+	case 0:
+		sshfsm.op_clnt.opcode = oper_code(arg);
+		if (sshfsm.op_clnt.opcode < 0) {
+			fprintf(stderr, "unknown operation %s\n", arg);
+			return 1;
+		}
+		parse_stage ++;
+		break;
+	
+	case 1:
+		if (arg[0] != '/') {
+			fprintf(stderr, "path %s should be abosolute\n", arg);
+			return 1;
+		}
+		sshfsm.op_clnt.path = g_strdup(arg);
+		int len = strlen(arg);
+		if (len == 1) 
+			return 0;
+		/* tailing '/'s  */
+		int i = len - 1;
+		while (i > 0 && arg[i] == '/') {
+			sshfsm.op_clnt.path[i] = '\0';
+			i --;
+		}
+		parse_stage ++;
+		break;
+
+	default:
+		fprintf(stderr, "unknown operation argument %s\n", arg);
+		return 1;
+	}	
+	return 0;
 }
 
 static int sshfsm_opt_proc(void *data, const char *arg, int key,
@@ -4250,7 +4334,10 @@ static int sshfsm_opt_proc(void *data, const char *arg, int key,
 		return 1;
 
 	case FUSE_OPT_KEY_NONOPT:
-		return parse_host_args(arg);
+		if (sshfsm.op_flag)
+			return parse_op_args(arg);
+		else
+			return parse_host_args(arg);
 
 	case KEY_PORT:
 		tmp = g_strdup_printf("-oPort=%s", arg + 2);
@@ -4279,6 +4366,10 @@ static int sshfsm_opt_proc(void *data, const char *arg, int key,
 	case KEY_FOREGROUND:
 		sshfsm.foreground = 1;
 		return 1;
+
+	case KEY_OPERATION:
+		sshfsm.op_flag = 1;
+		return 0;
 
 	default:
 		fprintf(stderr, "internal error\n");
@@ -4418,6 +4509,189 @@ static void set_ssh_command(void)
 	}
 }
 
+/* operation server and client */
+
+static int op_client_on_where(struct opclient *clnt)
+{
+	char sendbuf[OP_SERVER_MAX_BUF];
+	char recvbuf[OP_SERVER_MAX_BUF];
+	int res;
+	
+	memset(sendbuf, 0, OP_SERVER_MAX_BUF);
+	snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d", clnt->opcode);
+	res = send(clnt->sockfd, sendbuf, strlen(sendbuf), 0);
+	if (res < 0) {
+		fprintf(stderr, "send failed, %s\n", strerror(errno));
+		return 1;
+	}
+	
+	memset(recvbuf, 0, OP_SERVER_MAX_BUF);
+	res = recv(clnt->sockfd, recvbuf, OP_SERVER_MAX_BUF, 0);
+	if (res < 0) {
+		fprintf(stderr, "recv failed, %s\n", strerror(errno));
+		return 1;
+	}
+	
+	DEBUG("client recv: %s\n", recvbuf);
+	return 0;
+}
+
+static int op_client_on_wherer(struct opclient *clnt)
+{
+	return 0;
+}
+
+static int op_client_process(struct opclient *clnt)
+{
+	int err;
+
+	clnt->sockfd = socket(AF_INET, SOCK_STREAM, 0);
+	if (clnt->sockfd == -1) {
+		fprintf(stderr, "create socket failed, %s\n", strerror(errno));
+		return 1;
+	};
+	
+	memset(&clnt->serv_addr, 0, sizeof(struct sockaddr_in));
+	clnt->serv_addr.sin_family = AF_INET;
+	clnt->serv_addr.sin_port = htons(clnt->port);
+	clnt->serv_addr.sin_addr.s_addr = INADDR_ANY;
+
+	err = connect(clnt->sockfd, &clnt->serv_addr, sizeof(struct sockaddr));
+	if (err == -1) {
+		fprintf(stderr, "connect to socket failed, %s\n", strerror(errno));
+		return 1;
+	}
+
+	switch (clnt->opcode) {
+		case OP_WHERE:	
+			err = op_client_on_where(clnt);
+			break;
+		case OP_WHERER:	
+			err = op_client_on_wherer(clnt);
+			break;
+		default:
+			return 1;
+	}
+	close(clnt->sockfd);
+	return err;
+}
+
+struct op_server_process_data {
+	int sockfd;
+};
+
+static void * op_server_process_func(void *data)
+{
+	struct op_server_process_data *p = 
+		(struct op_server_process_data *) data;
+	int sockfd = p->sockfd;
+	char sendbuf[OP_SERVER_MAX_BUF];
+	char recvbuf[OP_SERVER_MAX_BUF];
+	int res;
+	
+	do {
+		memset(recvbuf, 0, OP_SERVER_MAX_BUF);
+		res = recv(sockfd, recvbuf, OP_SERVER_MAX_BUF, 0);
+		if (res < 0) {
+			fprintf(stderr, "receive failed, %s\n", strerror(errno));
+			pthread_exit((void *) 1);
+		}
+		
+		DEBUG("server recv: %s\n", recvbuf);
+		
+		memset(sendbuf, 0, OP_SERVER_MAX_BUF);
+		snprintf(sendbuf, 5, "got it");
+		res = send(sockfd, sendbuf, strlen(sendbuf), 0);
+		if (res < 0) {
+			fprintf(stderr, "send failed, %s\n", strerror(errno));
+			pthread_exit((void *) 1);
+		}
+	} while (res >= 0);
+
+	pthread_exit((void *) 0);
+}
+
+static void * op_server_process(void *data)
+{
+	struct sockaddr_in clnt_addr;
+	int sockfd, clnt_len;
+	struct opserver *serv = &sshfsm.op_serv;
+	(void) data;
+
+	clnt_len = sizeof(struct sockaddr_in);
+	do {
+		sockfd = accept(serv->sockfd, (struct sockaddr *) &clnt_addr,
+						(socklen_t *) &clnt_len);
+		if (sockfd == -1) {
+			fprintf(stderr, "socket accept failed, %s\n", strerror(errno));
+		} else {
+			pthread_t thread_id;
+			struct op_server_process_data *thread_dat =
+				g_new(struct op_server_process_data, 1);
+			thread_dat->sockfd = sockfd;
+			if (pthread_create(&thread_id, NULL, op_server_process_func, 
+							   thread_dat) != 0) {
+				fprintf(stderr, "create thread failed\n");
+				exit(1);
+			}
+			pthread_detach(thread_id);
+		}
+	} while(1);
+
+	return NULL;
+}
+
+static int op_server_init(void)
+{
+	struct opserver *serv = &sshfsm.op_serv;
+	pthread_t thread_id;
+
+	serv->port = sshfsm.op_port ? sshfsm.op_port : OP_SERVER_PORT;
+	serv->sockfd = socket(AF_INET, SOCK_STREAM, 0);
+	if (serv->sockfd < 0) {
+		fprintf(stderr, "create socket failed, %s\n", strerror(errno));
+		return -1;
+	}
+
+	/* setsockopt */
+	
+	memset(&serv->addr, 0, sizeof(struct sockaddr_in));
+	serv->addr.sin_family = AF_INET;
+	serv->addr.sin_port = htons(serv->port);
+	serv->addr.sin_addr.s_addr = INADDR_ANY;
+
+	if (bind(serv->sockfd, (struct sockaddr *) &serv->addr, 
+		sizeof(struct sockaddr)) == -1) {
+		fprintf(stderr, "bind addr port %d failed %s\n", serv->port,
+				strerror(errno));
+		return -1;
+	}
+	
+	if (listen(serv->sockfd, OP_SERVER_MAX_CONN) == -1) {
+		fprintf(stderr, "listen failed %s\n", strerror(errno));
+		return -1;
+	}
+
+	if (pthread_create(&thread_id, NULL, op_server_process, NULL) != 0) {
+		fprintf(stderr, "create thread failed\n");
+		return -1;
+	};
+	pthread_detach(thread_id);
+	serv->thread_id = thread_id;
+	serv->processing_thread_started = 1;
+	DEBUG("opserver started on %s:%d\n", inet_ntoa(serv->addr.sin_addr),
+		serv->port);
+	return 0;
+}
+
+static void op_server_destroy(void)
+{
+	pthread_kill(sshfsm.op_serv.thread_id, SIGTERM);
+	close(sshfsm.op_serv.sockfd);
+	g_free(sshfsm.op_serv.hostname);
+	free(sshfsm.op_server);
+}
+
 int main(int argc, char *argv[])
 {
 	int res;
@@ -4426,8 +4700,9 @@ int main(int argc, char *argv[])
 	char *fsname;
 	const char *sftp_server;
 	int libver;
-
-	g_thread_init(NULL);
+	
+	if (!g_thread_supported())
+		g_thread_init(NULL);
 
 	sshfsm.blksize = 4096;
 	sshfsm.max_read = 65536;
@@ -4444,6 +4719,7 @@ int main(int argc, char *argv[])
 	sshfsm.hosts_num_max = DEFAULT_MAX_HOSTS_NUM;
 	sshfsm.hosts = g_new0(struct host *, sshfsm.hosts_num_max);
 	sshfsm.rank_interval = DEFAULT_RANK_INTERVAL;
+	sshfsm.oper = 1;
 	ssh_add_arg("ssh");
 	ssh_add_arg("-x");
 	ssh_add_arg("-a");
@@ -4452,6 +4728,21 @@ int main(int argc, char *argv[])
 	if (fuse_opt_parse(&args, &sshfsm, sshfsm_opts, sshfsm_opt_proc) == -1 ||
 	    parse_workarounds() == -1)
 		exit(1);
+	
+	/* operation handling */
+	if (sshfsm.op_flag) {
+		sshfsm.op_clnt.hostname = sshfsm.op_server ? 
+			g_strdup(sshfsm.op_server) : g_strdup(OP_SERVER_HOST);
+		sshfsm.op_clnt.port = sshfsm.op_port ? 
+			sshfsm.op_port : OP_SERVER_PORT;
+		int err = op_client_process(&sshfsm.op_clnt);	
+		g_free(sshfsm.hosts);
+		fuse_opt_free_args(&args);
+		fuse_opt_free_args(&sshfsm.ssh_args);
+		free(sshfsm.directport);
+
+		exit(err);
+	}
 
 	DEBUG("SSHFSM version %s\n", PACKAGE_VERSION);
 
@@ -4470,7 +4761,7 @@ int main(int argc, char *argv[])
 		sshfsm.max_outstanding_len = 8388608;
 	else
 		sshfsm.max_outstanding_len = ~0;
-	
+
 	if (sshfsm.hosts_num == 0) {
 		fprintf(stderr, "missing host\n");
 		fprintf(stderr, "see `%s -h' for usage\n", argv[0]);
@@ -4498,7 +4789,7 @@ int main(int argc, char *argv[])
 
 	ssh_add_arg(sftp_server);
 	free(sshfsm.sftp_server);
-	
+
 	res = processing_init();
 	if (res == -1)
 		exit(1);

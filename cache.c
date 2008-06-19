@@ -462,6 +462,7 @@ static void cache_unity_fill(struct fuse_cache_operations *oper,
 {
 #if FUSE_VERSION >= 23
 	cache_oper->init        = oper->oper.init;
+	cache_oper->destroy     = oper->oper.destroy;
 #endif
 	cache_oper->getattr     = oper->oper.getattr;
 	cache_oper->readlink    = oper->oper.readlink;

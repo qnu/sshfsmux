@@ -1,3 +1,7 @@
+2008-06-19	Nan Dun <sshfsm@gmail.com>
+	
+	* Add destroy function for filesystem umount
+
 2008-06-02	Nan Dun <sshfsm@gmail.com>
 	
 	* Bug fix
