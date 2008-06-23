@@ -121,6 +121,7 @@
 #define OP_SERVER_PORT 10000
 #define OP_SERVER_MAX_CONN 32
 #define OP_SERVER_MAX_BUF 512
+#define OP_MAX_FIELDS 2
 
 #if GLIB_CHECK_VERSION(2, 16, 0)
 #define HASH_TABLE_HAVE_ITER
@@ -200,15 +201,15 @@ struct host {
 };
 
 enum operation_t {
-	OP_START 	= 0,
+	OP_ERROR	= -1,
+	OP_SUCCESS	= 0,
 	OP_FINISH	= 1,
 	OP_WHERE 	= 2,
 	OP_WHERER	= 3,
-	OP_UNKNOWN	= -1,
+	OP_UNKNOWN	= 128,
 };
 
 struct opserver {
-	struct sockaddr_in addr;
 	int sockfd;
 	char *hostname;
 	int port;
@@ -217,7 +218,6 @@ struct opserver {
 };
 
 struct opclient {
-	struct sockaddr_in serv_addr;
 	int sockfd;
 	char *hostname;
 	int port;
@@ -4515,10 +4515,13 @@ static int op_client_on_where(struct opclient *clnt)
 {
 	char sendbuf[OP_SERVER_MAX_BUF];
 	char recvbuf[OP_SERVER_MAX_BUF];
-	int res;
+	const char delimiters[] = "|";
+	gchar **strv = NULL;
+	int res, err;
 	
 	memset(sendbuf, 0, OP_SERVER_MAX_BUF);
-	snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d", clnt->opcode);
+	snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d|%s", clnt->opcode,
+			 clnt->path);
 	res = send(clnt->sockfd, sendbuf, strlen(sendbuf), 0);
 	if (res < 0) {
 		fprintf(stderr, "send failed, %s\n", strerror(errno));
@@ -4527,13 +4530,42 @@ static int op_client_on_where(struct opclient *clnt)
 	
 	memset(recvbuf, 0, OP_SERVER_MAX_BUF);
 	res = recv(clnt->sockfd, recvbuf, OP_SERVER_MAX_BUF, 0);
-	if (res < 0) {
+	if (res <= 0) {
 		fprintf(stderr, "recv failed, %s\n", strerror(errno));
 		return 1;
 	}
 	
-	DEBUG("client recv: %s\n", recvbuf);
-	return 0;
+	DEBUG("opclient: received %s\n", recvbuf);
+	
+	strv = g_strsplit_set(recvbuf, delimiters, OP_MAX_FIELDS);
+	err = atoi(strv[0]);
+	switch(err) {
+		case OP_SUCCESS:
+			fprintf(stdout, "%s\n", strv[1]);
+			break;
+		
+		case OP_ERROR:
+			fprintf(stderr, "error: %s\n", strerror(atoi(strv[1])));
+			break;
+
+		default:
+			fprintf(stderr, "unknown return value from server\n");
+			break;
+	}
+	
+	g_strfreev(strv);
+	memset(sendbuf, 0, OP_SERVER_MAX_BUF);
+	snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d", OP_FINISH);
+	res = send(clnt->sockfd, sendbuf, strlen(sendbuf), 0);
+	if (res < 0) {
+		fprintf(stderr, "send failed, %s\n", strerror(errno));
+		return 1;
+	}
+
+	if (err)
+		return 1;
+	else
+		return 0;
 }
 
 static int op_client_on_wherer(struct opclient *clnt)
@@ -4543,6 +4575,7 @@ static int op_client_on_wherer(struct opclient *clnt)
 
 static int op_client_process(struct opclient *clnt)
 {
+	struct sockaddr_in serv_addr;
 	int err;
 
 	clnt->sockfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -4551,12 +4584,12 @@ static int op_client_process(struct opclient *clnt)
 		return 1;
 	};
 	
-	memset(&clnt->serv_addr, 0, sizeof(struct sockaddr_in));
-	clnt->serv_addr.sin_family = AF_INET;
-	clnt->serv_addr.sin_port = htons(clnt->port);
-	clnt->serv_addr.sin_addr.s_addr = INADDR_ANY;
+	memset(&serv_addr, 0, sizeof(struct sockaddr_in));
+	serv_addr.sin_family = AF_INET;
+	serv_addr.sin_port = htons(clnt->port);
+	serv_addr.sin_addr.s_addr = INADDR_ANY;
 
-	err = connect(clnt->sockfd, &clnt->serv_addr, sizeof(struct sockaddr));
+	err = connect(clnt->sockfd, &serv_addr, sizeof(struct sockaddr));
 	if (err == -1) {
 		fprintf(stderr, "connect to socket failed, %s\n", strerror(errno));
 		return 1;
@@ -4580,35 +4613,107 @@ struct op_server_process_data {
 	int sockfd;
 };
 
+static int op_do_where(const char *path)
+{
+	struct stat stbuf;
+
+	/* fakelink workaround 
+	 * check link cache first */
+	if (sshfsm.fakelink_workaround) {
+		fakelink_t alias = fakelink_lookup(path);
+		if (alias)
+			return host_getattr(alias->idx, alias->name, &stbuf);
+	}
+		
+	if (sshfsm.hosts_num == 1)
+		return host_getattr(sshfsm.idx_0, path, &stbuf);
+	
+	int r_flag = 0;
+	idx_list_t list = table_lookup_r(path, &r_flag);
+	struct idx_item *item = NULL;
+	int err = 0;
+	while (list) {
+		item = (struct idx_item *) list->data;
+		err = host_getattr(item->idx, path, &stbuf);
+		if (!err)
+			return item->idx;
+		list = list->next;
+	}
+	return -ENOENT;
+}
+
+static int op_server_on_where(int sockfd, gchar **strv)
+{
+	char sendbuf[OP_SERVER_MAX_BUF];
+	int res;
+	gchar *path = strv[1];
+	
+	DEBUG("opserver: now process WHERE:%s\n", path);
+	
+	int idx = op_do_where(path);
+	memset(sendbuf, 0, OP_SERVER_MAX_BUF);
+	if (idx >= 0)
+		snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d|%s:%s", OP_SUCCESS,
+				 sshfsm.hosts[idx]->hostname, sshfsm.hosts[idx]->basepath);
+	else
+		snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d|%d", OP_ERROR, -idx);
+
+	res = send(sockfd, sendbuf, strlen(sendbuf), 0);
+	if (res < 0) {
+		fprintf(stderr, "send failed, %s\n", strerror(errno));
+		return 1;
+	}
+	return 0;
+}
+
+static int op_server_on_wherer(int sockfd, gchar **strv)
+{
+	return 0;
+}
+
 static void * op_server_process_func(void *data)
 {
 	struct op_server_process_data *p = 
 		(struct op_server_process_data *) data;
 	int sockfd = p->sockfd;
-	char sendbuf[OP_SERVER_MAX_BUF];
 	char recvbuf[OP_SERVER_MAX_BUF];
-	int res;
+	const char delimiters[] = "|";
+	gchar **strv = NULL;
+	int opcode, res, err;
+	g_free(p);
 	
+	err = 0;
 	do {
 		memset(recvbuf, 0, OP_SERVER_MAX_BUF);
 		res = recv(sockfd, recvbuf, OP_SERVER_MAX_BUF, 0);
-		if (res < 0) {
+		if (res <= 0) {
 			fprintf(stderr, "receive failed, %s\n", strerror(errno));
-			pthread_exit((void *) 1);
+			err = 1;
+			goto out;
 		}
 		
-		DEBUG("server recv: %s\n", recvbuf);
-		
-		memset(sendbuf, 0, OP_SERVER_MAX_BUF);
-		snprintf(sendbuf, 5, "got it");
-		res = send(sockfd, sendbuf, strlen(sendbuf), 0);
-		if (res < 0) {
-			fprintf(stderr, "send failed, %s\n", strerror(errno));
-			pthread_exit((void *) 1);
+		DEBUG("opserver: received %s (%d)\n", recvbuf, res);
+	
+		strv = g_strsplit_set(recvbuf, delimiters, OP_MAX_FIELDS);
+		opcode = atoi(strv[0]);
+		switch(opcode) {
+			case OP_WHERE:
+				err = op_server_on_where(sockfd, strv);
+				goto out;
+			
+			case OP_WHERER:
+				err = op_server_on_wherer(sockfd, strv);
+				goto out;
+			
+			case OP_FINISH:
+				err = 0;
+				goto out;
 		}
 	} while (res >= 0);
 
-	pthread_exit((void *) 0);
+ out:
+ 	g_strfreev(strv);
+	err ? pthread_exit((void *) 1) : pthread_exit((void *) 0);
 }
 
 static void * op_server_process(void *data)
@@ -4643,6 +4748,7 @@ static void * op_server_process(void *data)
 
 static int op_server_init(void)
 {
+	struct sockaddr_in addr;
 	struct opserver *serv = &sshfsm.op_serv;
 	pthread_t thread_id;
 
@@ -4655,12 +4761,12 @@ static int op_server_init(void)
 
 	/* setsockopt */
 	
-	memset(&serv->addr, 0, sizeof(struct sockaddr_in));
-	serv->addr.sin_family = AF_INET;
-	serv->addr.sin_port = htons(serv->port);
-	serv->addr.sin_addr.s_addr = INADDR_ANY;
+	memset(&addr, 0, sizeof(struct sockaddr_in));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(serv->port);
+	addr.sin_addr.s_addr = INADDR_ANY;
 
-	if (bind(serv->sockfd, (struct sockaddr *) &serv->addr, 
+	if (bind(serv->sockfd, (struct sockaddr *) &addr, 
 		sizeof(struct sockaddr)) == -1) {
 		fprintf(stderr, "bind addr port %d failed %s\n", serv->port,
 				strerror(errno));
@@ -4679,7 +4785,7 @@ static int op_server_init(void)
 	pthread_detach(thread_id);
 	serv->thread_id = thread_id;
 	serv->processing_thread_started = 1;
-	DEBUG("opserver started on %s:%d\n", inet_ntoa(serv->addr.sin_addr),
+	DEBUG("opserver started on %s:%d\n", inet_ntoa(addr.sin_addr),
 		serv->port);
 	return 0;
 }
@@ -4793,7 +4899,7 @@ int main(int argc, char *argv[])
 	res = processing_init();
 	if (res == -1)
 		exit(1);
-
+	
 	if (connect_remote_all() == -1)
 		exit(1);
 
