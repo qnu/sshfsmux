@@ -114,6 +114,12 @@
 
 #define SSHNODELAY_SO "sshnodelay.so"
 
+/* permission and type of hosts */
+#define SRC_R	0x01
+#define	SRC_W	0x02
+#define SRC_RW	0x03
+#define SRC_I	0x10
+
 #define DEFAULT_MAX_HOSTS_NUM 32
 #define DEFAULT_RANK_INTERVAL 32
 
@@ -183,6 +189,7 @@ struct host {
 	char *hostname;
 	char *basepath;
 	int rank;
+	char perm;
 	int server_version;
 	int connver;
 	int modifver;
@@ -472,6 +479,11 @@ static int oper_code(const char *oper)
 
 #define DEBUG(format, args...)						\
 	do { if (sshfsm.debug) fprintf(stderr, format, args); } while(0)
+
+#define IS_SRC_R(m)		(m & SRC_R)
+#define IS_SRC_W(m)		(m & SRC_W)
+#define IS_SRC_RW(m)	((m & SRC_R) && (m & SRC_W))
+#define IS_SRC_I(m)		(m & SRC_I)
 
 #define container_of(ptr, type, member) ({				\
 			const typeof( ((type *)0)->member ) *__mptr = (ptr); \
@@ -4220,62 +4232,46 @@ static int sshfsm_fuse_main(struct fuse_args *args)
 
 static int parse_host_args(const char *arg)
 {
-	if (strchr(arg, ':')) {
-		assert(sshfsm.hosts);
-		int idx = get_empty_host_slot();
-		if (idx == -1) {
-			fprintf(stderr, "sshfsm: too many hosts, ignore");
-			return 1;
-		}
-		struct host *hostp = sshfsm.hosts[idx] = g_new0(struct host, 1);
-		char *cp = g_strdup(arg);
-		char *cp2 = NULL;
-		
-		hostp->rank = -1;
+	if (!strchr(arg, ':'))
+		return 1;
 
-		/* parsing hostname */
-		const char colon[] = ":";
-		char *tmp = strtok(cp, colon);
-		if (!tmp)
-			goto out;
-		else
-			hostp->hostname = g_strdup(tmp);
-	
-		/* parsing basepath */
-		tmp = strtok(NULL, colon);
-		if (!tmp)
-			hostp->basepath = g_strdup("");
-		else {
-			if (strchr(tmp, '=')) {
-				/* parsing rank */
-				const char equal[] = "=";
-				cp2 = strdup(tmp);
-				char *tmp2 = strtok(cp2, equal);
-				char *tmp3 = strtok(NULL, cp2);
-				if (tmp2 && tmp3) {
-					tmp = tmp2;
-					hostp->rank = atoi(tmp3);
-				}
-				if (tmp2 && !tmp3) {
-					tmp = "";
-					hostp->rank = atoi(tmp2);
-				}
-			} 
-			if (strcmp(tmp, "") != 0 && tmp[strlen(tmp) - 1] != '/')
-				hostp->basepath = g_strdup_printf("%s/", tmp);
-			else
-				hostp->basepath = g_strdup(tmp);
-		}
-		DEBUG("add sshfsm.hosts[%d]: %s:%s=%d\n", sshfsm.hosts_num,
-				hostp->hostname, hostp->basepath, hostp->rank);
-		sshfsm.hosts_num ++;
-	  
-	  out:
-		g_free(cp2);
-		g_free(cp);
-		return 0;
+	assert(sshfsm.hosts);
+	int idx = get_empty_host_slot();
+	if (idx == -1) {
+		fprintf(stderr, "sshfsm: too many hosts, ignore");
+		return 1;
 	}
-	return 1;
+	struct host *hostp = sshfsm.hosts[idx] = g_new0(struct host, 1);
+	const char delimiters[] = ":=#";
+	int stridx = 0;
+	
+	hostp->rank = -1;
+	hostp->perm |= SRC_RW;
+
+	gchar **strv = g_strsplit_set(arg, delimiters, 4);
+	hostp->hostname = g_strdup(strv[stridx++]);
+	hostp->basepath = g_strdup(strv[stridx++]);
+		
+	if (g_strrstr(arg, "=")) {
+		char *perm_str = strv[stridx++];
+		if (g_strrstr(perm_str, "r")) {
+			hostp->perm &= 0x00;
+			hostp->perm |= SRC_R;
+		}
+		if (g_strrstr(perm_str, "w"))
+			hostp->perm |= SRC_W;
+		if (g_strrstr(perm_str, "i"))
+			hostp->perm |= SRC_I;
+	}
+
+	if (g_strrstr(arg, "#") && strcmp(strv[stridx], "") != 0)
+		hostp->rank = atoi(strv[stridx]);
+
+	DEBUG("add sshfsm.hosts[%d]: %s:%s=%x#%d\n", sshfsm.hosts_num,
+			hostp->hostname, hostp->basepath, hostp->perm, hostp->rank);
+	sshfsm.hosts_num ++;
+	g_strfreev(strv);
+	return 0;
 }
 
 static int parse_op_args(const char *arg)
@@ -4568,11 +4564,6 @@ static int op_client_on_where(struct opclient *clnt)
 		return 0;
 }
 
-static int op_client_on_wherer(struct opclient *clnt)
-{
-	return 0;
-}
-
 static int op_client_process(struct opclient *clnt)
 {
 	struct sockaddr_in serv_addr;
@@ -4596,11 +4587,8 @@ static int op_client_process(struct opclient *clnt)
 	}
 
 	switch (clnt->opcode) {
-		case OP_WHERE:	
+		case OP_WHERE || OP_WHERER:	
 			err = op_client_on_where(clnt);
-			break;
-		case OP_WHERER:	
-			err = op_client_on_wherer(clnt);
 			break;
 		default:
 			return 1;
@@ -4613,25 +4601,22 @@ struct op_server_process_data {
 	int sockfd;
 };
 
-static int op_do_where(const char *path)
+static int op_server_do_where(const char *path)
 {
 	struct stat stbuf;
+	int err = 0;
 
-	/* fakelink workaround 
-	 * check link cache first */
-	if (sshfsm.fakelink_workaround) {
-		fakelink_t alias = fakelink_lookup(path);
-		if (alias)
-			return host_getattr(alias->idx, alias->name, &stbuf);
+	if (sshfsm.hosts_num == 1) {
+		err = host_getattr(sshfsm.idx_0, path, &stbuf);
+		if (!err)
+			return sshfsm.idx_0;
+		else
+			return err;
 	}
-		
-	if (sshfsm.hosts_num == 1)
-		return host_getattr(sshfsm.idx_0, path, &stbuf);
 	
 	int r_flag = 0;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
-	int err = 0;
 	while (list) {
 		item = (struct idx_item *) list->data;
 		err = host_getattr(item->idx, path, &stbuf);
@@ -4650,7 +4635,7 @@ static int op_server_on_where(int sockfd, gchar **strv)
 	
 	DEBUG("opserver: now process WHERE:%s\n", path);
 	
-	int idx = op_do_where(path);
+	int idx = op_server_do_where(path);
 	memset(sendbuf, 0, OP_SERVER_MAX_BUF);
 	if (idx >= 0)
 		snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d|%s:%s", OP_SUCCESS,
@@ -4666,8 +4651,57 @@ static int op_server_on_where(int sockfd, gchar **strv)
 	return 0;
 }
 
+static char * op_server_do_wherer(const char *path)
+{
+	struct stat stbuf;
+	int idx, err;
+
+	if (sshfsm.hosts_num == 1) {
+		err = host_getattr(sshfsm.idx_0, path, &stbuf);
+		if (!err) {
+			idx = sshfsm.idx_0;
+			goto out;
+		} else
+			return NULL;
+	}
+		
+	
+	int r_flag = 0;
+	idx_list_t list = table_lookup_r(path, &r_flag);
+	struct idx_item *item = NULL;
+	int err = 0;
+	while (list) {
+		item = (struct idx_item *) list->data;
+		err = host_getattr(item->idx, path, &stbuf);
+		if (!err)
+			return item->idx;
+		list = list->next;
+	}
+
+  out:
+	return -ENOENT;
+}
+
 static int op_server_on_wherer(int sockfd, gchar **strv)
 {
+	char sendbuf[OP_SERVER_MAX_BUF];
+	int res;
+	gchar *path = strv[1];
+	
+	DEBUG("opserver: now process WHERER:%s\n", path);
+	
+	char *hoststr = op_server_do_wherer(path);
+	memset(sendbuf, 0, OP_SERVER_MAX_BUF);
+	if (hoststr)
+		snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d|%s", OP_SUCCESS, hoststr);
+	else
+		snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d|%d", OP_ERROR, ENOENT);
+
+	res = send(sockfd, sendbuf, strlen(sendbuf), 0);
+	if (res < 0) {
+		fprintf(stderr, "send failed, %s\n", strerror(errno));
+		return 1;
+	}
 	return 0;
 }
 
