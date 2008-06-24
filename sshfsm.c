@@ -4518,6 +4518,7 @@ static int op_client_on_where(struct opclient *clnt)
 	memset(sendbuf, 0, OP_SERVER_MAX_BUF);
 	snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d|%s", clnt->opcode,
 			 clnt->path);
+	DEBUG("opclient: ready to send %s\n", sendbuf);
 	res = send(clnt->sockfd, sendbuf, strlen(sendbuf), 0);
 	if (res < 0) {
 		fprintf(stderr, "send failed, %s\n", strerror(errno));
@@ -4587,9 +4588,14 @@ static int op_client_process(struct opclient *clnt)
 	}
 
 	switch (clnt->opcode) {
-		case OP_WHERE || OP_WHERER:	
+		case OP_WHERE:	
 			err = op_client_on_where(clnt);
 			break;
+
+		case OP_WHERER:
+			err = op_client_on_where(clnt);
+			break;
+
 		default:
 			return 1;
 	}
@@ -4631,15 +4637,22 @@ static int op_server_on_where(int sockfd, gchar **strv)
 {
 	char sendbuf[OP_SERVER_MAX_BUF];
 	int res;
+	char *hostname;
 	gchar *path = strv[1];
 	
 	DEBUG("opserver: now process WHERE:%s\n", path);
 	
 	int idx = op_server_do_where(path);
+	struct hostent *entry = gethostbyname(sshfsm.hosts[idx]->hostname);
+	if (entry)
+		hostname = entry->h_name;
+	else
+		hostname = sshfsm.hosts[idx]->hostname;
+	
 	memset(sendbuf, 0, OP_SERVER_MAX_BUF);
 	if (idx >= 0)
 		snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d|%s:%s", OP_SUCCESS,
-				 sshfsm.hosts[idx]->hostname, sshfsm.hosts[idx]->basepath);
+				 hostname, sshfsm.hosts[idx]->basepath);
 	else
 		snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d|%d", OP_ERROR, -idx);
 
@@ -4669,7 +4682,6 @@ static char * op_server_do_wherer(const char *path)
 	int r_flag = 0;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
-	int err = 0;
 	while (list) {
 		item = (struct idx_item *) list->data;
 		err = host_getattr(item->idx, path, &stbuf);
@@ -4793,7 +4805,13 @@ static int op_server_init(void)
 		return -1;
 	}
 
-	/* setsockopt */
+	int opt = 1;
+	if (setsockopt(serv->sockfd, SOL_SOCKET, SO_REUSEADDR, 
+				   &opt, sizeof(opt)) == -1) {
+		fprintf(stderr, "set socket option failed, %s\n",
+				strerror(errno));
+		return -1;
+	}
 	
 	memset(&addr, 0, sizeof(struct sockaddr_in));
 	addr.sin_family = AF_INET;
