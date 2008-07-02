@@ -39,6 +39,7 @@
 
 #include "cache.h"
 #include "table.h"
+#include "oper.h"
 
 #if FUSE_VERSION >= 23
 #define SSHFSM_USE_INIT
@@ -125,7 +126,6 @@
 #define DEFAULT_RANK_INTERVAL 32
 #define DEFAULT_TEMP_DIRECTORY "/tmp/sshfsm"
 
-#define OP_SERVER_DEFAULT_HOST "localhost"
 #define OP_SERVER_DEFAULT_PORT "10000"
 #define OP_SERVER_MAX_CONN 32
 #define OP_SERVER_MAX_BUF 512
@@ -219,6 +219,11 @@ enum operation_t {
 	OP_UNKNOWN	= 128,
 };
 
+struct opbuffer {
+	size_t len;
+	char *buf;
+};
+
 struct opserver {
 	int sockfd;
 	char *hostname;
@@ -227,13 +232,16 @@ struct opserver {
 	pthread_t thread_id;
 };
 
-struct opclient {
-	int sockfd;
-	char *hostname;
+struct oprequest {
+	char *host;
 	int port;
 	int opcode;
-	char *path;
+	int sock;
+	struct opbuffer *sendbuf;
+	struct opbuffer *recvbuf;
 };
+
+static struct oprequest creq;
 
 struct sshfsm {
 	/* Basic configuration */
@@ -300,7 +308,6 @@ struct sshfsm {
 
 	/* operation server */
 	struct opserver op_serv;
-	struct opclient op_clnt;
 	char *op_server;
 	char *op_port;
 	int op_flag;
@@ -470,16 +477,6 @@ static const char *type_name(uint8_t type)
 	case SSH_FXP_EXTENDED_REPLY: return "EXTENDED_REPLY";
 	default:                     return "???";
 	}
-}
-
-static int oper_code(const char *oper)
-{
-	if (strcasecmp(oper, "where") == 0)
-		return OP_WHERE;
-	if (strcasecmp(oper, "wherer") == 0)
-		return OP_WHERER;
-
-	return OP_UNKNOWN;
 }
 
 #define DEBUG(format, args...)						\
@@ -2136,7 +2133,7 @@ static int start_processing_thread_all(void)
 	return 0;
 }
 
-static int op_server_init(void);
+static void op_server_start_processing(void);
 static void op_server_destroy(void);
 
 #ifdef SSHFSM_USE_INIT
@@ -2156,7 +2153,7 @@ static void *sshfsm_init(struct fuse_conn_info *conn)
 		sftp_detect_uid_all();
 	
 	if (sshfsm.oper)
-		op_server_init();
+		op_server_start_processing();
 
 	start_processing_thread_all();
 	
@@ -4280,14 +4277,17 @@ static int parse_host_args(const char *arg)
 	return 0;
 }
 
+static int op_get_opcode(const char *oper);
+static struct opbuffer * op_buffer_init(const int opcode, const char *msg);
+
 static int parse_op_args(const char *arg)
 {
 	static int parse_stage = 0;
 	
 	switch (parse_stage) {
 	case 0:
-		sshfsm.op_clnt.opcode = oper_code(arg);
-		if (sshfsm.op_clnt.opcode < 0) {
+		creq.opcode = op_get_opcode(arg);
+		if (creq.opcode < 0) {
 			fprintf(stderr, "unknown operation %s\n", arg);
 			return 1;
 		}
@@ -4295,26 +4295,31 @@ static int parse_op_args(const char *arg)
 		break;
 	
 	case 1:
-		if (arg[0] != '/') {
-			fprintf(stderr, "path %s should be abosolute\n", arg);
-			return 1;
-		}
-		sshfsm.op_clnt.path = g_strdup(arg);
-		int len = strlen(arg);
-		if (len == 1) 
-			return 0;
-		/* tailing '/'s  */
-		int i = len - 1;
-		while (i > 0 && arg[i] == '/') {
-			sshfsm.op_clnt.path[i] = '\0';
-			i --;
+		if (creq.opcode == OP_WHERE || creq.opcode == OP_WHERER) {
+			/* arg is path */
+			if (arg[0] != '/') {
+				fprintf(stderr, "path %s should be absolute\n", arg);
+				return -1;
+			}
+			if (strlen(arg) != 1) {
+				/* tailing '/'s  */
+				char *path = g_strdup(arg);
+				int i = strlen(arg) - 1;
+				while (i > 0 && arg[i] == '/') {
+					path[i] = '\0';
+					i --;
+				}
+				creq.sendbuf = op_buffer_init(creq.opcode, path);
+				g_free(path);
+			} else 
+				creq.sendbuf = op_buffer_init(creq.opcode, arg);
 		}
 		parse_stage ++;
 		break;
 
 	default:
 		fprintf(stderr, "unknown operation argument %s\n", arg);
-		return 1;
+		return -1;
 	}	
 	return 0;
 }
@@ -4336,10 +4341,7 @@ static int sshfsm_opt_proc(void *data, const char *arg, int key,
 		return 1;
 
 	case FUSE_OPT_KEY_NONOPT:
-		if (sshfsm.op_flag)
-			return parse_op_args(arg);
-		else
-			return parse_host_args(arg);
+		return sshfsm.op_flag ? parse_op_args(arg) : parse_host_args(arg);
 
 	case KEY_PORT:
 		tmp = g_strdup_printf("-oPort=%s", arg + 2);
@@ -4515,38 +4517,135 @@ static void set_ssh_command(void)
  * operation server and client 
  */
 
-static int op_common_connect(const char *hostname, int port)
+static int op_get_opcode(const char *oper)
+{
+	if (strcasecmp(oper, "where") == 0)
+		return OP_WHERE;
+	if (strcasecmp(oper, "wherer") == 0)
+		return OP_WHERER;
+
+	return OP_UNKNOWN;
+}
+
+/*
+static const char *op_get_opstring(const int opcode)
+{
+	switch(opcode) {
+		case OP_ERROR:		return "OP_ERROR";
+		case OP_SUCCESS:	return "OP_SUCCESS";
+		case OP_WHERE:		return "OP_WHERE";
+		case OP_WHERER:		return "OP_WHERER";
+		default:	return "???";
+	}
+}
+*/
+
+static int op_is_same_host(const char *host1, const char *host2)
+{
+	struct addrinfo *ai1, *ai2, hint1, hint2;
+	int err;
+
+	memset(&hint1, 0, sizeof(hint1));
+	memset(&hint2, 0, sizeof(hint2));
+	hint1.ai_family = hint2.ai_family = PF_UNSPEC;
+	hint1.ai_socktype = hint2.ai_socktype = SOCK_STREAM;
+	hint1.ai_flags = hint2.ai_flags = AI_CANONNAME;
+	err = getaddrinfo(host1, NULL, &hint1, &ai1);
+	if (err) {
+		fprintf(stderr, "failed to resolve %s, %s\n", host1, 
+				gai_strerror(err));
+		return -1;
+	}
+	err = getaddrinfo(host2, NULL, &hint2, &ai2);
+	if (err) {
+		fprintf(stderr, "failed to resolve %s, %s\n", host2, 
+				gai_strerror(err));
+		return -1;
+	}
+	err = strcmp(ai1->ai_canonname, ai2->ai_canonname);
+	freeaddrinfo(ai1);
+	freeaddrinfo(ai2);
+	return err ? 0 : 1;
+
+}
+
+static struct opbuffer * op_buffer_calloc(size_t size)
+{
+	struct opbuffer *buf = g_new0(struct opbuffer, 1);
+	buf->buf = g_new0(char, size);
+	buf->len = size;
+	return buf;
+}
+
+static struct opbuffer * op_buffer_init(const int opcode, const char *msg)
+{
+	struct opbuffer *sendbuf = g_new(struct opbuffer, 1);
+	sendbuf->buf = g_strdup_printf("%d|%s", opcode, msg);
+	sendbuf->len = strlen(sendbuf->buf);
+	return sendbuf;
+}
+
+static void op_buffer_free(struct opbuffer *buf)
+{
+	g_free(buf->buf);
+	g_free(buf);
+}
+
+static struct oprequest * op_request_init(struct oprequest *req, 
+						   const char *host, int port, 
+						   int opcode, struct opbuffer *sendbuf,
+						   struct opbuffer *recvbuf)
+{
+	if (!req)
+		req = g_new(struct oprequest, 1);
+	req->host = g_strdup(host);
+	req->port = port;
+	req->opcode = opcode;
+	req->sendbuf = sendbuf;
+	req->recvbuf = recvbuf;
+	return req;
+}
+
+static void op_request_free(struct oprequest *rp)
+{
+	op_buffer_free(rp->sendbuf);
+	op_buffer_free(rp->recvbuf);
+	g_free(rp->host);
+	g_free(rp);
+}
+
+static int op_request_connect(struct oprequest *rp)
 {
 	struct addrinfo *ai, hint;
-	int sock, err;
+	int err;
 
 	memset(&hint, 0, sizeof(hint));
 	hint.ai_family = PF_INET;
 	hint.ai_socktype = SOCK_STREAM;
 	hint.ai_flags = AI_CANONNAME;
 	
-	char *portstr = g_strdup_printf("%d", port);
-	err = getaddrinfo(hostname, portstr, &hint, &ai);
+	char *portstr = g_strdup_printf("%d", rp->port);
+	err = getaddrinfo(rp->host, portstr, &hint, &ai);
 	if (err) {
-		fprintf(stderr, "failed to resolve %s:%s, %s\n", hostname, portstr,
-				gai_strerror(err));
+		fprintf(stderr, "failed to resolve %s:%d, %s\n", rp->host, 
+				rp->port, gai_strerror(err));
 		return -1;
 	}
 	
-	sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-	if (sock == -1) {
+	rp->sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+	if (rp->sock == -1) {
 		fprintf(stderr, "failed to create socket, %s\n", strerror(errno));
 		return -1;
 	}
-	err = connect(sock, ai->ai_addr, ai->ai_addrlen);
+	err = connect(rp->sock, ai->ai_addr, ai->ai_addrlen);
 	if (err == -1) {
-		fprintf(stderr, "failed to connect to %s:%s, %s\n", hostname,
-				portstr, strerror(errno));
+		fprintf(stderr, "failed to connect to %s:%d, %s\n", rp->host,
+				rp->port, strerror(errno));
 		return -1;
 	}
 
 	int opt = 1;
-	err = setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+	err = setsockopt(rp->sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 	if (err == -1)
 		fprintf(stderr, "failed to set TCP_NODELAY, %s\n", strerror(errno));
 	
@@ -4554,9 +4653,81 @@ static int op_common_connect(const char *hostname, int port)
 
 	freeaddrinfo(ai);
 	g_free(portstr);
-	return sock;
+	return 0;
 }
 
+static int op_request_sendrecv(struct oprequest *rp)
+{
+	int res;
+	
+	DEBUG("oprequest send %s\n",rp->sendbuf->buf);
+	res = send(rp->sock, rp->sendbuf->buf, rp->sendbuf->len, 0);
+	if (res < 0) {
+		fprintf(stderr, "send failed, %s\n", strerror(errno));
+		return -1;
+	}
+	
+	if (!rp->recvbuf)
+		rp->recvbuf = op_buffer_calloc(OP_SERVER_MAX_BUF);
+	res = recv(rp->sock, rp->recvbuf->buf, rp->recvbuf->len, 0);
+	if (res <= 0) {
+		fprintf(stderr, "recv failed, %s\n", strerror(errno));
+		return 1;
+	}
+	
+	assert(res < OP_SERVER_MAX_BUF);
+	/* TODO: message limited to 512, dynamically change it */
+	
+	DEBUG("opclient: received %s\n", rp->recvbuf->buf);
+	
+	char *finish = g_strdup_printf("%d", OP_FINISH);
+	res = send(rp->sock, finish, strlen(finish), 0);
+	if (res < 0) {
+		fprintf(stderr, "send failed, %s\n", strerror(errno));
+		return 1;
+	}
+	g_free(finish);
+	return 0;
+}
+
+static int op_request_fprint_reply_where(FILE *stream, struct oprequest *rp)
+{
+	const char delimiters[] = "|";
+	gchar **strv = NULL;
+	int err, err2;
+	
+	strv = g_strsplit_set(rp->recvbuf->buf, delimiters, OP_MAX_FIELDS);
+	err = atoi(strv[0]);
+	switch(err) {
+		case OP_SUCCESS:
+			fprintf(stream, "%s\n", strv[1]);
+			break;
+		
+		case OP_ERROR:
+			err2 = atoi(strv[1]);
+			fprintf(stream, "sshfsm: %s\n", strerror(err2));
+			return err2;
+
+		default:
+			fprintf(stream, "unknown return value from server\n");
+			return -1;
+	}
+	return 0;
+}
+
+static int op_request_fprint_reply(FILE *stream, struct oprequest *rp)
+{
+	switch(rp->opcode) {
+		case OP_WHERE:	return op_request_fprint_reply_where(stream, rp);
+		case OP_WHERER: return op_request_fprint_reply_where(stream, rp);
+		default:
+			fprintf(stderr, "unknown opcode %d\n", rp->opcode);
+			return -1;
+	}
+	return 0;
+}
+
+/*
 static int op_client_on_where(struct opclient *clnt)
 {
 	char sendbuf[OP_SERVER_MAX_BUF];
@@ -4614,7 +4785,6 @@ static int op_client_on_where(struct opclient *clnt)
 	else
 		return 0;
 }
-
 static int op_client_process(struct opclient *clnt)
 {
 	int err = 0;
@@ -4641,6 +4811,7 @@ static int op_client_process(struct opclient *clnt)
 	close(clnt->sockfd);
 	return err;
 }
+*/
 
 struct op_server_process_data {
 	int sockfd;
@@ -4653,10 +4824,7 @@ static int op_server_do_where(const char *path)
 
 	if (sshfsm.hosts_num == 1) {
 		err = host_getattr(sshfsm.idx_0, path, &stbuf);
-		if (!err)
-			return sshfsm.idx_0;
-		else
-			return err;
+		return err ? err : sshfsm.idx_0;
 	}
 	
 	int r_flag = 0;
@@ -4681,21 +4849,21 @@ static int op_server_on_where(int sockfd, gchar **strv)
 	
 	idx = op_server_do_where(path);
 	
-	memset(&hint, 0, sizeof(hint));
-	hint.ai_family = PF_UNSPEC;
-	hint.ai_socktype = SOCK_STREAM;
-	hint.ai_flags = AI_CANONNAME;
-	err = getaddrinfo(sshfsm.hosts[idx]->hostname, NULL, &hint, &ai);
-	if (err) {
-		fprintf(stderr, "failed to resolve %s, %s\n", 
-				sshfsm.hosts[idx]->hostname, gai_strerror(err));
-		return -1;
-	}
-	
 	memset(sendbuf, 0, OP_SERVER_MAX_BUF);
 	if (idx >= 0) {
+		memset(&hint, 0, sizeof(hint));
+		hint.ai_family = PF_UNSPEC;
+		hint.ai_socktype = SOCK_STREAM;
+		hint.ai_flags = AI_CANONNAME;
+		err = getaddrinfo(sshfsm.hosts[idx]->hostname, NULL, &hint, &ai);
+		if (err) {
+			fprintf(stderr, "failed to resolve %s, %s\n", 
+					sshfsm.hosts[idx]->hostname, gai_strerror(err));
+			return -1;
+		}
 		snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d|%s:%s", OP_SUCCESS,
 				 ai->ai_canonname, sshfsm.hosts[idx]->basepath);
+		freeaddrinfo(ai);
 	} else {
 		snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d|%d", OP_ERROR, -idx);
 	}
@@ -4706,70 +4874,25 @@ static int op_server_on_where(int sockfd, gchar **strv)
 		return 1;
 	}
 	
-	freeaddrinfo(ai);
 	return 0;
 }
 
 static int op_server_request_wherer(int idx, const char *path, char **hoststr)
 {
-	char sendbuf[OP_SERVER_MAX_BUF];
-	char recvbuf[OP_SERVER_MAX_BUF];
-	const char delimiters[] = "|";
-	gchar **strv = NULL;
-	int sock, res, err;
-	
-	sock = op_common_connect(sshfsm.hosts[idx]->hostname, sshfsm.op_serv.port);
-	if (sock == -1) {
-		fprintf(stderr, "failed to connect %s:%d\n", 
-				sshfsm.hosts[idx]->hostname, sshfsm.op_serv.port);
-		return 1;
-	}
-	
-	memset(sendbuf, 0, OP_SERVER_MAX_BUF);
-	snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d|%s", OP_WHERER, path);
-	DEBUG("opserver: ready to send %s\n", sendbuf);
-	res = send(sock, sendbuf, strlen(sendbuf), 0);
-	if (res < 0) {
-		fprintf(stderr, "opserver: send failed, %s\n", strerror(errno));
-		return 1;
-	}
-	
-	memset(recvbuf, 0, OP_SERVER_MAX_BUF);
-	res = recv(sock, recvbuf, OP_SERVER_MAX_BUF, 0);
-	if (res <= 0) {
-		fprintf(stderr, "opserver: recv failed, %s\n", strerror(errno));
-		return 1;
-	}
-	
-	DEBUG("opserver: received %s\n", recvbuf);
-	strv = g_strsplit_set(recvbuf, delimiters, OP_MAX_FIELDS);
-	err = atoi(strv[0]);
-	switch(err) {
-		case OP_SUCCESS:
-			*hoststr = g_strdup_printf("%s", strv[1]);
-			break;
-		
-		case OP_ERROR:
-			break;
+	struct oprequest *rp;
+	int err = 0;
 
-		default:
-			fprintf(stderr, "unknown return value from server\n");
-			break;
-	}
-	g_strfreev(strv);
-	
-	memset(sendbuf, 0, OP_SERVER_MAX_BUF);
-	snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d", OP_FINISH);
-	res = send(sock, sendbuf, strlen(sendbuf), 0);
-	if (res < 0) {
-		fprintf(stderr, "send failed, %s\n", strerror(errno));
-		return 1;
-	}
-
-	if (err)
+	rp = op_request_init(NULL, sshfsm.hosts[idx]->hostname,
+			atoi(sshfsm.op_port), OP_WHERER, NULL, NULL);
+	err = op_request_connect(rp);
+	if (err == -1)
 		return err;
-	else
-		return 0;
+	
+	err = op_request_sendrecv(rp);
+	if (err == -1)
+		return err;
+
+	return err ? err : 0;
 }
 
 static int op_server_do_wherer(const char *path, char **hoststr)
@@ -4869,7 +4992,7 @@ static void * op_server_process_func(void *data)
 		}
 		
 		DEBUG("opserver: received %s (%d)\n", recvbuf, res);
-	
+		
 		strv = g_strsplit_set(recvbuf, delimiters, OP_MAX_FIELDS);
 		opcode = atoi(strv[0]);
 		switch(opcode) {
@@ -4926,7 +5049,6 @@ static int op_server_init(void)
 {
 	struct opserver *serv = &sshfsm.op_serv;
 	struct addrinfo *ai, hint;
-	pthread_t thread_id;
 	int err;
 
 	/* setup socket */
@@ -4960,7 +5082,10 @@ static int op_server_init(void)
 	
 	err = bind(serv->sockfd, ai->ai_addr, ai->ai_addrlen);
 	if (err == -1) {
-		fprintf(stderr, "failed to bind %d, %s\n", serv->port, strerror(errno));
+		if (errno == EADDRINUSE)
+			fprintf(stderr, "port %d in use, try \"-o op_port=PORT\"\n", serv->port);
+		else
+			fprintf(stderr, "failed to bind, %s\n", strerror(errno));
 		return -1;
 	}
 	
@@ -4991,7 +5116,7 @@ static int op_server_init(void)
 				sshfsm.op_vardir, strerror(errno));
 		return -1;
 	}
-	char *portfile = g_strdup_printf("%s/%s", sshfsm.op_vardir,
+	char *portfile = g_strdup_printf("%s/%s", sshfsm.op_vardir, 
 						OP_VARFILE_PORT);
 	int fd = open(portfile, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
 	if (fd == -1) {
@@ -5001,24 +5126,28 @@ static int op_server_init(void)
 	}
 	write(fd, sshfsm.op_port, strlen(sshfsm.op_port));
 	close(fd);
+	
+	freeaddrinfo(ai);
 	g_free(portfile);
+	g_free(portstr);
+	return 0;
+}
 
-	/* start processing thread */
+static void op_server_start_processing(void)
+{
+	pthread_t thread_id;
+	int err;
+
 	err = pthread_create(&thread_id, NULL, op_server_process, NULL); 
 	if (err != 0) {
 		fprintf(stderr, "failed to create thread, %s\n", strerror(err));
-		return -1;
+		return;
 	};
 	pthread_detach(thread_id);
-	serv->thread_id = thread_id;
-	serv->processing_thread_started = 1;
-	
-	DEBUG("op_server_init(): opserver started on %s:%d\n", 
-		  ai->ai_canonname, serv->port);
-	
-	freeaddrinfo(ai);
-	g_free(portstr);
-	return 0;
+	sshfsm.op_serv.thread_id = thread_id;
+	sshfsm.op_serv.processing_thread_started = 1;
+	DEBUG("opserver started on %s:%d\n", 
+		  sshfsm.op_serv.hostname, sshfsm.op_serv.port);
 }
 
 static void op_server_destroy(void)
@@ -5033,7 +5162,7 @@ static void op_server_destroy(void)
 	close(sshfsm.op_serv.sockfd);
 	g_free(sshfsm.op_serv.hostname);
 	g_free(sshfsm.op_vardir);
-	free(sshfsm.op_server);
+	g_free(sshfsm.op_server);
 }
 
 /*
@@ -5068,7 +5197,6 @@ int main(int argc, char *argv[])
 	sshfsm.hosts = g_new0(struct host *, sshfsm.hosts_num_max);
 	sshfsm.rank_interval = DEFAULT_RANK_INTERVAL;
 	sshfsm.oper = 1;
-	sshfsm.op_server = OP_SERVER_DEFAULT_HOST;
 	sshfsm.op_port = OP_SERVER_DEFAULT_PORT;
 	ssh_add_arg("ssh");
 	ssh_add_arg("-x");
@@ -5079,24 +5207,54 @@ int main(int argc, char *argv[])
 	    parse_workarounds() == -1)
 		exit(1);
 	
+	DEBUG("SSHFSM version %s\n", PACKAGE_VERSION);
+	
 	/* operation handling */
+	if (!sshfsm.op_server)
+		sshfsm.op_server = g_strdup(g_get_host_name());
+	
 	if (sshfsm.op_flag) {
-		sshfsm.op_clnt.hostname = g_strdup(sshfsm.op_server);
-		sshfsm.op_clnt.port =  atoi(sshfsm.op_port);
-		int err = op_client_process(&sshfsm.op_clnt);	
+		struct oprequest *rp = op_request_init(&creq, sshfsm.op_server, 
+				atoi(sshfsm.op_port), creq.opcode, creq.sendbuf, NULL);
+		if (op_request_connect(rp) == -1)
+			exit(EIO);
+
+		if (op_request_sendrecv(rp) == -1)
+			exit(EIO);
+		
+		if ((res = op_request_fprint_reply(stdout, rp)) == -1)
+			exit(EIO);
+		
+		op_buffer_free(rp->sendbuf);
+		op_buffer_free(rp->recvbuf);
+		g_free(rp->host);
 		g_free(sshfsm.hosts);
 		fuse_opt_free_args(&args);
 		fuse_opt_free_args(&sshfsm.ssh_args);
 		free(sshfsm.directport);
-
-		exit(err);
+		g_free(sshfsm.op_server);
+		exit(res);
+	}
+	
+	/* hacking mount point */
+	if (fuse_parse_cmdline(&args, &(sshfsm.mountpoint), NULL, NULL) == -1)
+		exit(1);
+	if (!sshfsm.mountpoint) {
+		fprintf(stderr, "sshfsm: missing mount point\n");
+		fuse_opt_free_args(&args);
+		exit(1);
 	}
 
-	DEBUG("SSHFSM version %s\n", PACKAGE_VERSION);
+	fuse_opt_insert_arg(&args, 1, sshfsm.mountpoint);
+	
+	
+	if (sshfsm.oper) {
+		if (op_server_init() == -1)
+			exit(1);
+	}
 
 	if (sshfsm.password_stdin) {
-		res = read_password();
-		if (res == -1)
+		if (read_password() == -1)
 			exit(1);
 	}
 	
@@ -5120,16 +5278,6 @@ int main(int argc, char *argv[])
 
 	if (sshfsm.ssh_command)
 		set_ssh_command();
-	
-	/* hacking mount point */
-	if (fuse_parse_cmdline(&args, &(sshfsm.mountpoint), NULL, NULL) == -1)
-		exit(1);
-	if (!sshfsm.mountpoint) {
-		fprintf(stderr, "sshfsm: missing mount point\n");
-		fuse_opt_free_args(&args);
-		exit(1);
-	}
-	fuse_opt_insert_arg(&args, 1, sshfsm.mountpoint);
 
 	tmp = g_strdup_printf("-%i", sshfsm.ssh_ver);
 	ssh_add_arg(tmp);

@@ -4249,7 +4249,8 @@ done
 
 
 
-for ac_header in fcntl.h netdb.h netinet/in.h stdint.h \
+
+for ac_header in fcntl.h netdb.h arpa/inet.h netinet/in.h stdint.h \
 stdlib.h string.h sys/socket.h sys/time.h unistd.h malloc.h
 do
 as_ac_Header=`echo "ac_cv_header_$ac_header" | $as_tr_sh`
@@ -7383,9 +7384,10 @@ rm -f conftest.data
 
 
 
+
 for ac_func in dup2 ftruncate getpagesize gettimeofday \
 memmove memset mkdir munmap realpath rmdir setenv socket \
-strchr strdup strerror strncasecmp strrchr uname utime
+strchr strdup strerror strcasecmp strncasecmp strrchr uname utime
 do
 as_ac_var=`echo "ac_cv_func_$ac_func" | $as_tr_sh`
 { echo "$as_me:$LINENO: checking for $ac_func" >&5

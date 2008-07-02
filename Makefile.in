@@ -50,10 +50,10 @@ am__installdirs = "$(DESTDIR)$(bindir)" "$(DESTDIR)$(man1dir)"
 binPROGRAMS_INSTALL = $(INSTALL_PROGRAM)
 PROGRAMS = $(bin_PROGRAMS)
 am__sshfsm_SOURCES_DIST = sshfsm.c cache.c cache.h table.c table.h \
-	compat/fuse_opt.c compat/fuse_opt.h
+	oper.c oper.h compat/fuse_opt.c compat/fuse_opt.h
 @FUSE_OPT_COMPAT_TRUE@am__objects_1 = sshfsm-fuse_opt.$(OBJEXT)
 am_sshfsm_OBJECTS = sshfsm-sshfsm.$(OBJEXT) sshfsm-cache.$(OBJEXT) \
-	sshfsm-table.$(OBJEXT) $(am__objects_1)
+	sshfsm-table.$(OBJEXT) sshfsm-oper.$(OBJEXT) $(am__objects_1)
 sshfsm_OBJECTS = $(am_sshfsm_OBJECTS)
 am__DEPENDENCIES_1 =
 sshfsm_DEPENDENCIES = $(am__DEPENDENCIES_1)
@@ -172,8 +172,8 @@ sysconfdir = @sysconfdir@
 target_alias = @target_alias@
 top_builddir = @top_builddir@
 top_srcdir = @top_srcdir@
-sshfsm_SOURCES = sshfsm.c cache.c cache.h table.c table.h \
-	$(am__append_1)
+sshfsm_SOURCES = sshfsm.c cache.c cache.h table.c table.h oper.c \
+	oper.h $(am__append_1)
 sshfsm_LDADD = $(SSHFSM_LIBS)
 sshfsm_CFLAGS = $(SSHFSM_CFLAGS)
 sshfsm_CPPFLAGS = -D_REENTRANT -DFUSE_USE_VERSION=26 -DLIBDIR=\"$(libdir)\"
@@ -270,6 +270,7 @@ distclean-compile:
 
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/sshfsm-cache.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/sshfsm-fuse_opt.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/sshfsm-oper.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/sshfsm-sshfsm.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/sshfsm-table.Po@am__quote@
 
@@ -328,6 +329,20 @@ sshfsm-table.obj: table.c
 @AMDEP_TRUE@@am__fastdepCC_FALSE@	source='table.c' object='sshfsm-table.obj' libtool=no @AMDEPBACKSLASH@
 @AMDEP_TRUE@@am__fastdepCC_FALSE@	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) @AMDEPBACKSLASH@
 @am__fastdepCC_FALSE@	$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(sshfsm_CPPFLAGS) $(CPPFLAGS) $(sshfsm_CFLAGS) $(CFLAGS) -c -o sshfsm-table.obj `if test -f 'table.c'; then $(CYGPATH_W) 'table.c'; else $(CYGPATH_W) '$(srcdir)/table.c'; fi`
+
+sshfsm-oper.o: oper.c
+@am__fastdepCC_TRUE@	$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(sshfsm_CPPFLAGS) $(CPPFLAGS) $(sshfsm_CFLAGS) $(CFLAGS) -MT sshfsm-oper.o -MD -MP -MF $(DEPDIR)/sshfsm-oper.Tpo -c -o sshfsm-oper.o `test -f 'oper.c' || echo '$(srcdir)/'`oper.c
+@am__fastdepCC_TRUE@	mv -f $(DEPDIR)/sshfsm-oper.Tpo $(DEPDIR)/sshfsm-oper.Po
+@AMDEP_TRUE@@am__fastdepCC_FALSE@	source='oper.c' object='sshfsm-oper.o' libtool=no @AMDEPBACKSLASH@
+@AMDEP_TRUE@@am__fastdepCC_FALSE@	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) @AMDEPBACKSLASH@
+@am__fastdepCC_FALSE@	$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(sshfsm_CPPFLAGS) $(CPPFLAGS) $(sshfsm_CFLAGS) $(CFLAGS) -c -o sshfsm-oper.o `test -f 'oper.c' || echo '$(srcdir)/'`oper.c
+
+sshfsm-oper.obj: oper.c
+@am__fastdepCC_TRUE@	$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(sshfsm_CPPFLAGS) $(CPPFLAGS) $(sshfsm_CFLAGS) $(CFLAGS) -MT sshfsm-oper.obj -MD -MP -MF $(DEPDIR)/sshfsm-oper.Tpo -c -o sshfsm-oper.obj `if test -f 'oper.c'; then $(CYGPATH_W) 'oper.c'; else $(CYGPATH_W) '$(srcdir)/oper.c'; fi`
+@am__fastdepCC_TRUE@	mv -f $(DEPDIR)/sshfsm-oper.Tpo $(DEPDIR)/sshfsm-oper.Po
+@AMDEP_TRUE@@am__fastdepCC_FALSE@	source='oper.c' object='sshfsm-oper.obj' libtool=no @AMDEPBACKSLASH@
+@AMDEP_TRUE@@am__fastdepCC_FALSE@	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) @AMDEPBACKSLASH@
+@am__fastdepCC_FALSE@	$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(sshfsm_CPPFLAGS) $(CPPFLAGS) $(sshfsm_CFLAGS) $(CFLAGS) -c -o sshfsm-oper.obj `if test -f 'oper.c'; then $(CYGPATH_W) 'oper.c'; else $(CYGPATH_W) '$(srcdir)/oper.c'; fi`
 
 sshfsm-fuse_opt.o: compat/fuse_opt.c
 @am__fastdepCC_TRUE@	$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(sshfsm_CPPFLAGS) $(CPPFLAGS) $(sshfsm_CFLAGS) $(CFLAGS) -MT sshfsm-fuse_opt.o -MD -MP -MF $(DEPDIR)/sshfsm-fuse_opt.Tpo -c -o sshfsm-fuse_opt.o `test -f 'compat/fuse_opt.c' || echo '$(srcdir)/'`compat/fuse_opt.c

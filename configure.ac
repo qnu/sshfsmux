@@ -15,7 +15,7 @@ LIBS=
 # Checks for header files.
 AC_HEADER_STDC
 AC_HEADER_SYS_WAIT
-AC_CHECK_HEADERS([fcntl.h netdb.h netinet/in.h stdint.h \
+AC_CHECK_HEADERS([fcntl.h netdb.h arpa/inet.h netinet/in.h stdint.h \
 stdlib.h string.h sys/socket.h sys/time.h unistd.h malloc.h])
 
 # Checks for typedefs, structures, and compiler characteristics.
@@ -43,7 +43,7 @@ AC_TYPE_SIGNAL
 AC_FUNC_UTIME_NULL
 AC_CHECK_FUNCS([dup2 ftruncate getpagesize gettimeofday \
 memmove memset mkdir munmap realpath rmdir setenv socket \
-strchr strdup strerror strncasecmp strrchr uname utime])
+strchr strdup strerror strcasecmp strncasecmp strrchr uname utime])
 
 # Checking sshnodelay
 AC_ARG_ENABLE(sshnodelay,
