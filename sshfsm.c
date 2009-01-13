@@ -3659,7 +3659,6 @@ static int table_init()
 	struct serv *servp;
 	for (i = 0; i < sshfsm.serv_arr->len; i++) {
 		servp = serv_arr_index(i);
-		fprintf(stderr, "servp->fd: %d\n", servp->fd);
 		if (servp->fd != -1) {
 			table_insert("/", i, servp->rank);
 		}
