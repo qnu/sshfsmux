@@ -1,6 +1,6 @@
 /*
     Directory Table
-    Copyright (C) 2008  Nan Dun <sshfsm@gmail.com>
+    Copyright (C) 2008, 2009  Nan Dun <dunnan@yl.is.s.u-tokyo.ac.jp>
 
     This program can be distributed under the terms of the GNU GPL.
     See the file COPYING.

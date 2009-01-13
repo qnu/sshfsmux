@@ -1,6 +1,6 @@
 /*
     SSHFS Mutiplex Filesystem
-    Copyright (C) 2008  Nan Dun <sshfsm@gmail.com>
+    Copyright (C) 2008, 2009  Nan Dun <dunnan@yl.is.s.u-tokyo.ac.jp>
 
     This program can be distributed under the terms of the GNU GPL.
     See the file COPYING.
@@ -24,6 +24,7 @@
 #include <netdb.h>
 #include <signal.h>
 #include <sys/uio.h>
+#include <sys/types.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
@@ -32,14 +33,20 @@
 #include <sys/poll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <arpa/inet.h>
 #include <glib.h>
-#include <libgen.h>	/* basename and dirname */
-#include <pwd.h>
 
+/* sshfsm extented */
 #include "cache.h"
 #include "table.h"
-#include "oper.h"
+
+#ifndef MAP_LOCKED
+#define MAP_LOCKED 0
+#endif
+
+#if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
 
 #if FUSE_VERSION >= 23
 #define SSHFSM_USE_INIT
@@ -116,24 +123,9 @@
 
 #define SSHNODELAY_SO "sshnodelay.so"
 
-/* permission and type of hosts */
-#define SRC_R	0x01
-#define	SRC_W	0x02
-#define SRC_RW	0x03
-#define SRC_I	0x10
-
-#define DEFAULT_MAX_HOSTS_NUM 32
-#define DEFAULT_RANK_INTERVAL 32
-#define DEFAULT_TEMP_DIRECTORY "/tmp/sshfsm"
-
-#define OP_SERVER_DEFAULT_PORT "10000"
-#define OP_SERVER_MAX_CONN 32
-#define OP_SERVER_MAX_BUF 512
-#define OP_MAX_FIELDS 2
-#define OP_VARFILE_PORT	"port"
-
+/* sshfsm extented */
 #if GLIB_CHECK_VERSION(2, 16, 0)
-#define HASH_TABLE_HAVE_ITER
+#define G_HASH_TABLE_HAS_ITER
 #endif
 
 struct buffer {
@@ -185,80 +177,55 @@ struct sshfsm_file {
 	int connver;
 	int modifver;
 	int refs;
-	int host_idx;
+	/* sshfsm extended */
+	int serv_idx;
 };
 
-struct host {
+/* sshfsm extended */
+struct serv {
 	char *hostname;
-	char *basepath;
+	char *base_path;
 	int rank;
-	char perm;
 	int server_version;
 	int connver;
 	int modifver;
 	int fd;
 	int ptyfd;
 	int ptyslavefd;
-	unsigned uid;
-	int uid_detected;
+	unsigned remote_uid;
+	int remote_uid_detected;
 	GHashTable *reqtab;
+	pthread_t thread_id;
 	pthread_mutex_t lock;
 	pthread_mutex_t	lock_write;
 	int processing_thread_started;
 	unsigned outstanding_len;
 	pthread_cond_t outstanding_cond;
 	uint32_t idctr;
-};
+	
+	/* statistics */
+	uint64_t bytes_sent;
+	uint64_t bytes_received;
+	uint64_t num_sent;
+	uint64_t num_received;
+	unsigned int min_rtt;
+	unsigned int max_rtt;
+	uint64_t total_rtt;
+	unsigned int num_connect;
 
-enum operation_t {
-	OP_ERROR	= -1,
-	OP_SUCCESS	= 0,
-	OP_FINISH	= 1,
-	OP_WHERE 	= 2,
-	OP_WHERER	= 3,
-	OP_UNKNOWN	= 128,
 };
-
-struct opbuffer {
-	size_t len;
-	char *buf;
-};
-
-struct opserver {
-	int sockfd;
-	char *hostname;
-	int port;
-	int processing_thread_started;
-	pthread_t thread_id;
-};
-
-struct oprequest {
-	char *host;
-	int port;
-	int opcode;
-	int sock;
-	struct opbuffer *sendbuf;
-	struct opbuffer *recvbuf;
-};
-
-static struct oprequest creq;
 
 struct sshfsm {
-	/* Basic configuration */
 	char *directport;
 	char *ssh_command;
 	char *sftp_server;
-	char *mountpoint;
 	struct fuse_args ssh_args;
-
-	/* options and workarounds */
 	char *workarounds;
 	int rename_workaround;
 	int nodelay_workaround;
 	int nodelaysrv_workaround;
 	int truncate_workaround;
 	int buflimit_workaround;
-	int fakelink_workaround;
 	int transform_symlinks;
 	int follow_symlinks;
 	int no_check_root;
@@ -271,9 +238,6 @@ struct sshfsm {
 	int debug;
 	int foreground;
 	int reconnect;
-	int oper;
-
-	/* misc */
 	unsigned int randseed;
 	unsigned local_uid;
 	unsigned blksize;
@@ -284,34 +248,10 @@ struct sshfsm {
 	int ext_posix_rename;
 	int ext_statvfs;
 
-	/* statistics */ /* TODO: add to individual host? */
-	uint64_t bytes_sent;
-	uint64_t bytes_received;
-	uint64_t num_sent;
-	uint64_t num_received;
-	unsigned int min_rtt;
-	unsigned int max_rtt;
-	uint64_t total_rtt;
-	unsigned int num_connect;
-
-	/* hosts*/
-	struct host **hosts;
-	int hosts_num;
-	int hosts_num_max;
-	int rank_interval;
-	pthread_mutex_t lock_hosts;
-	int idx_0;	/* index of the only one host */
-
-	/* fake link cache */
-	GHashTable *fakelink_cache;
-	pthread_mutex_t lock_fakelink;
-
-	/* operation server */
-	struct opserver op_serv;
-	char *op_server;
-	char *op_port;
-	int op_flag;
-	char *op_vardir;
+	/* sshfsm extended */
+	char *mountpoint;
+	GArray *serv_arr;
+	pthread_mutex_t lock_serv_arr;
 };
 
 static struct sshfsm sshfsm;
@@ -375,7 +315,7 @@ enum {
 	KEY_HELP,
 	KEY_VERSION,
 	KEY_FOREGROUND,
-	KEY_OPERATION,
+	KEY_CONFIGFILE,
 };
 
 #define SSHFSM_OPT(t, p, v) { t, offsetof(struct sshfsm, p), v }
@@ -399,10 +339,6 @@ static struct fuse_opt sshfsm_opts[] = {
 	SSHFSM_OPT("follow_symlinks",   follow_symlinks, 1),
 	SSHFSM_OPT("no_check_root",     no_check_root, 1),
 	SSHFSM_OPT("password_stdin",    password_stdin, 1),
-	SSHFSM_OPT("oper=yes",			oper, 1),
-	SSHFSM_OPT("oper=no",			oper, 0),
-	SSHFSM_OPT("op_server=%s",      op_server, 0), 
-	SSHFSM_OPT("op_port=%s",        op_port, 0),
 
 	FUSE_OPT_KEY("-p ",            KEY_PORT),
 	FUSE_OPT_KEY("-C",             KEY_COMPRESS),
@@ -413,7 +349,7 @@ static struct fuse_opt sshfsm_opts[] = {
 	FUSE_OPT_KEY("debug",          KEY_FOREGROUND),
 	FUSE_OPT_KEY("-d",             KEY_FOREGROUND),
 	FUSE_OPT_KEY("-f",             KEY_FOREGROUND),
-	FUSE_OPT_KEY("-c",			   KEY_OPERATION),
+	FUSE_OPT_KEY("-F ",            KEY_CONFIGFILE),
 	FUSE_OPT_END
 };
 
@@ -423,13 +359,11 @@ static struct fuse_opt workaround_opts[] = {
 	SSHFSM_OPT("none",       nodelaysrv_workaround, 0),
 	SSHFSM_OPT("none",       truncate_workaround, 0),
 	SSHFSM_OPT("none",       buflimit_workaround, 0),
-	SSHFSM_OPT("none",		 fakelink_workaround, 0),
 	SSHFSM_OPT("all",        rename_workaround, 1),
 	SSHFSM_OPT("all",        nodelay_workaround, 1),
 	SSHFSM_OPT("all",        nodelaysrv_workaround, 1),
 	SSHFSM_OPT("all",        truncate_workaround, 1),
 	SSHFSM_OPT("all",        buflimit_workaround, 1),
-	SSHFSM_OPT("all",		 fakelink_workaround, 1),
 	SSHFSM_OPT("rename",     rename_workaround, 1),
 	SSHFSM_OPT("norename",   rename_workaround, 0),
 	SSHFSM_OPT("nodelay",    nodelay_workaround, 1),
@@ -440,10 +374,11 @@ static struct fuse_opt workaround_opts[] = {
 	SSHFSM_OPT("notruncate", truncate_workaround, 0),
 	SSHFSM_OPT("buflimit",   buflimit_workaround, 1),
 	SSHFSM_OPT("nobuflimit", buflimit_workaround, 0),
-	SSHFSM_OPT("fakelink",   fakelink_workaround, 1),
-	SSHFSM_OPT("nofakelink", fakelink_workaround, 0),
 	FUSE_OPT_END
 };
+
+#define DEBUG(format, args...)						\
+	do { if (sshfsm.debug) fprintf(stderr, format, args); } while(0)
 
 static const char *type_name(uint8_t type)
 {
@@ -479,20 +414,15 @@ static const char *type_name(uint8_t type)
 	}
 }
 
-#define DEBUG(format, args...)						\
-	do { if (sshfsm.debug) fprintf(stderr, format, args); } while(0)
-
-#define IS_SRC_R(m)		(m & SRC_R)
-#define IS_SRC_W(m)		(m & SRC_W)
-#define IS_SRC_RW(m)	((m & SRC_R) && (m & SRC_W))
-#define IS_SRC_I(m)		(m & SRC_I)
-
 #define container_of(ptr, type, member) ({				\
 			const typeof( ((type *)0)->member ) *__mptr = (ptr); \
 			(type *)( (char *)__mptr - offsetof(type,member) );})
 
 #define list_entry(ptr, type, member)		\
 	container_of(ptr, type, member)
+
+#define serv_arr_index(index) \
+	&g_array_index(sshfsm.serv_arr, struct serv, index)
 
 static void list_init(struct list_head *head)
 {
@@ -531,184 +461,6 @@ static inline char * concate_path(const char *path, const char *name)
 	return g_strdup_printf("%s/%s", path, name);
 }
 
-/* fakelink workaround routines */
-struct fakelink {
-	char *name;
-	struct stat stbuf;
-	int idx;
-	int count;
-};
-typedef struct fakelink *fakelink_t;
-
-static inline void fakelink_free(void *fakelinkp)
-{
-	fakelink_t p = (fakelink_t) fakelinkp;
-	g_free(p->name);
-	g_free(p);
-}
-
-static int fakelink_cache_init(void)
-{
-	sshfsm.fakelink_cache = g_hash_table_new_full(g_str_hash, g_str_equal,
-									g_free, fakelink_free);
-	if (!sshfsm.fakelink_cache) {
-		fprintf(stderr, "failed to create hash table\n");
-		return -1;
-	}
-	pthread_mutex_init(&sshfsm.lock_fakelink, NULL);
-	return 0;
-}
-
-static void fakelink_cache_destroy()
-{
-	g_hash_table_destroy(sshfsm.fakelink_cache);
-	pthread_mutex_destroy(&sshfsm.lock_fakelink);
-}
-
-static inline void fakelink_insert(const char *from, const char *to, 
-								   const int idx, struct stat *stbuf)
-{	
-	char *orig_key;
-	fakelink_t orig_data;
-	int found = g_hash_table_lookup_extended(sshfsm.fakelink_cache, from,
-					(void *) &orig_key, (void *) &orig_data);
-	if (found) {		/* insert duplicate */
-		orig_data->count ++;
-		assert(orig_data->idx == idx);
-		pthread_mutex_lock(&sshfsm.lock_fakelink);
-		g_hash_table_insert(sshfsm.fakelink_cache, g_strdup(to), orig_data);
-		pthread_mutex_unlock(&sshfsm.lock_fakelink);
-	} else {				/* insert original and duplicate */
-		char *orig_key = g_strdup(from);
-		orig_data = g_new(struct fakelink, 1);
-		orig_data->name = orig_key;
-		orig_data->stbuf = *stbuf;
-		orig_data->idx = idx;
-		orig_data->count = 1;
-		pthread_mutex_lock(&sshfsm.lock_fakelink);
-		g_hash_table_insert(sshfsm.fakelink_cache, orig_key, orig_data);
-		g_hash_table_insert(sshfsm.fakelink_cache, g_strdup(to), orig_data);
-		pthread_mutex_unlock(&sshfsm.lock_fakelink);
-	}
-}
-
-static inline fakelink_t fakelink_lookup(const char *path)
-{
-	return g_hash_table_lookup(sshfsm.fakelink_cache, path);
-}
-
-static int host_rename(const int idx, const char *from, const char *to);
-
-#ifndef HASH_TABLE_HAVE_ITER
-struct fakelink_hash_find_data {
-	gpointer key;
-	gpointer data;
-};
-
-static gboolean fakelink_hash_find_func(gpointer key, gpointer data,
-										gpointer user_data)
-{
-	struct fakelink_hash_find_data *p = 
-		(struct fakelink_hash_find_data *) user_data;
-	
-	gboolean found = g_direct_equal(data, p->data);
-	if (found)
-		p->key = key;
-	return found;
-}
-
-struct fakelink_filldir_data {
-	char *path;
-	fuse_cache_dirh_t h;
-	fuse_cache_dirfil_t filler;
-	GHashTable *filter;
-};
-
-static void fakelink_filldir_func(gpointer key, gpointer data, 
-								  gpointer user_data)
-{
-	char *k = (char *) key;
-	struct fakelink *d = (struct fakelink *) data;
-	struct fakelink_filldir_data *ud = 
-		(struct fakelink_filldir_data *) user_data;
-	char *p = strdup(k);
-	char *n = strdup(k);
-	char *parent_dir = dirname(p);
-	char *name = basename(n);
-	if (strcmp(parent_dir, ud->path) == 0 && 
-		!g_hash_table_lookup(ud->filter, name)) {
-		ud->filler(ud->h, name, &d->stbuf);
-		g_hash_table_insert(ud->filter, g_strdup(name),
-			g_strdup(""));
-	}
-	free(p);
-	free(n);
-}
-#endif
-
-static inline int fakelink_remove(const char *path)
-{
-	char *orig_key;
-	fakelink_t orig_data;
-	int found = g_hash_table_lookup_extended(sshfsm.fakelink_cache, path,
-					(void *) &orig_key, (void *) &orig_data);
-	if (!found)
-		return -ENOENT;
-	
-	int err = 0;
-	if (orig_key == orig_data->name) {
-		char *key;
-		fakelink_t data;
-		pthread_mutex_lock(&sshfsm.lock_fakelink);
-		g_hash_table_steal(sshfsm.fakelink_cache, orig_key);
-#ifdef HASH_TABLE_HAVE_ITER
-#error "Not checked yet"
-		GHashTableIter iter;
-		g_hash_table_iter_init(&iter, sshfsm.fakelink_cache);
-		while (g_hash_table_iter_next(&iter, (void *) &key, (void *) &data)) {
-			if (data == orig_data)
-				break;
-		}
-#else
-		struct fakelink_hash_find_data find_data;
-		find_data.key = NULL;
-		find_data.data = orig_data;
-		g_hash_table_find(sshfsm.fakelink_cache, fakelink_hash_find_func,
-				&find_data);
-		key = find_data.key;
-		data = find_data.data;
-#endif
-		err = host_rename(data->idx, orig_key, key);
-		if (!err) {	
-			data->count --;
-			if (data->count == 0) {
-				g_hash_table_steal(sshfsm.fakelink_cache, key);
-				g_free(orig_data);
-			}
-			else
-				data->name = key;
-		}
-		pthread_mutex_unlock(&sshfsm.lock_fakelink);
-	} else {
-		pthread_mutex_lock(&sshfsm.lock_fakelink);
-		g_hash_table_steal(sshfsm.fakelink_cache, orig_key);
-		orig_data->count --;
-		if (orig_data->count == 0) {
-			g_hash_table_steal(sshfsm.fakelink_cache, orig_data->name);
-			g_free(orig_data);
-		}
-		pthread_mutex_unlock(&sshfsm.lock_fakelink);
-	}
-	g_free(orig_key);
-	return err;
-}
-
-static inline void fakelink_empty(void)
-{
-	g_hash_table_remove_all(sshfsm.fakelink_cache);
-}
-
-/* buffer handling */
 static inline void buf_init(struct buffer *buf, size_t size)
 {
 	if (size) {
@@ -807,8 +559,9 @@ static inline void buf_add_path(const int idx, struct buffer *buf,
 								const char *path)
 {
 	char *realpath;
+	struct serv *servp = serv_arr_index(idx);
 
-	realpath = g_strdup_printf("%s%s", sshfsm.hosts[idx]->basepath,
+	realpath = g_strdup_printf("%s%s", servp->base_path,
 				   path[1] ? path+1 : ".");
 	buf_add_string(buf, realpath);
 	g_free(realpath);
@@ -892,8 +645,7 @@ static int buf_get_attrs(const int idx, struct buffer *buf,
 	uint32_t atime = 0;
 	uint32_t mtime = 0;
 	uint32_t mode = S_IFREG | 0777;
-
-	struct host *hostp = sshfsm.hosts[idx];
+	struct serv *servp = serv_arr_index(idx);
 
 	if (buf_get_uint32(buf, &flags) == -1)
 		return -1;
@@ -916,7 +668,7 @@ static int buf_get_attrs(const int idx, struct buffer *buf,
 	}
 	if ((flags & SSH_FILEXFER_ATTR_EXTENDED)) {
 		uint32_t extcount;
-		unsigned i;
+		unsigned int i;
 		if (buf_get_uint32(buf, &extcount) == -1)
 			return -1;
 		for (i = 0; i < extcount; i++) {
@@ -931,7 +683,7 @@ static int buf_get_attrs(const int idx, struct buffer *buf,
 	}
 
 	/* TODO: properly set local uid */
-	if (hostp->uid_detected && uid == hostp->uid)
+	if (servp->remote_uid_detected && uid == servp->remote_uid)
 		uid = sshfsm.local_uid;
 
 	memset(stbuf, 0, sizeof(struct stat));
@@ -952,29 +704,29 @@ static int buf_get_attrs(const int idx, struct buffer *buf,
 
 static int buf_get_statvfs(struct buffer *buf, struct statvfs *stbuf)
 {
-	uint32_t bsize;
-	uint32_t frsize;
+	uint64_t bsize;
+	uint64_t frsize;
 	uint64_t blocks;
 	uint64_t bfree;
 	uint64_t bavail;
 	uint64_t files;
 	uint64_t ffree;
 	uint64_t favail;
-	uint32_t fsid;
-	uint32_t flag;
-	uint32_t namemax;
+	uint64_t fsid;
+	uint64_t flag;
+	uint64_t namemax;
 
-	if (buf_get_uint32(buf, &bsize) == -1 ||
-	    buf_get_uint32(buf, &frsize) == -1 ||
+	if (buf_get_uint64(buf, &bsize) == -1 ||
+	    buf_get_uint64(buf, &frsize) == -1 ||
 	    buf_get_uint64(buf, &blocks) == -1 ||
 	    buf_get_uint64(buf, &bfree) == -1 ||
 	    buf_get_uint64(buf, &bavail) == -1 ||
 	    buf_get_uint64(buf, &files) == -1 ||
 	    buf_get_uint64(buf, &ffree) == -1 ||
 	    buf_get_uint64(buf, &favail) == -1 ||
-	    buf_get_uint32(buf, &fsid) == -1 ||
-	    buf_get_uint32(buf, &flag) == -1 ||
-	    buf_get_uint32(buf, &namemax) == -1) {
+	    buf_get_uint64(buf, &fsid) == -1 ||
+	    buf_get_uint64(buf, &flag) == -1 ||
+	    buf_get_uint64(buf, &namemax) == -1) {
 		return -1;
 	}
 
@@ -993,10 +745,10 @@ static int buf_get_statvfs(struct buffer *buf, struct statvfs *stbuf)
 }
 
 static int buf_get_entries_1(const int idx, struct buffer *buf, 
-						fuse_cache_dirh_t h, fuse_cache_dirfil_t filler)
+						  fuse_cache_dirh_t h, fuse_cache_dirfil_t filler)
 {
 	uint32_t count;
-	unsigned i;
+	unsigned int i;
 
 	if (buf_get_uint32(buf, &count) == -1)
 		return -1;
@@ -1055,7 +807,8 @@ static int buf_get_entries(const int idx, const char *path,
 				if (strcmp(name, ".") != 0 && strcmp(name, "..") != 0
 					 && S_ISDIR(stbuf.st_mode)) {
 					char *fullpath = concate_path(path, name);
-					table_insert(fullpath, idx, sshfsm.hosts[idx]->rank);
+					struct serv *servp = serv_arr_index(idx);
+					table_insert(fullpath, idx, servp->rank);
 					g_free(fullpath);
 				}
 			
@@ -1075,20 +828,21 @@ static int buf_get_entries(const int idx, const char *path,
 	return 0;
 }
 
-static int get_empty_host_slot()
+static void serv_arr_destroy(void)
 {
-	
-	if (sshfsm.hosts_num >= sshfsm.hosts_num_max)
-		return -1;
-	
-	static int idx = 0;
-	if (sshfsm.hosts_num == 1)
-		sshfsm.idx_0 = idx;
-
-	while (sshfsm.hosts[idx] != NULL)
-		idx = (idx + 1) % sshfsm.hosts_num_max;
-
-	return idx;
+	unsigned int i;
+	struct serv *servp;
+	for (i = 0; i < sshfsm.serv_arr->len; i++) {
+		servp = serv_arr_index(i);	
+		g_free(servp->hostname);
+		g_free(servp->base_path);
+		g_hash_table_destroy(servp->reqtab);
+		pthread_cancel(servp->thread_id);
+		pthread_mutex_destroy(&servp->lock);
+		pthread_mutex_destroy(&servp->lock_write);
+	}
+	/* must be FALSE, see g_free(servp) above */
+	g_array_free(sshfsm.serv_arr, TRUE);	
 }
 
 static void ssh_add_arg(const char *arg)
@@ -1153,15 +907,14 @@ static int pty_expect_loop(const int idx)
 	int passwd_len = strlen(passwd_str);
 	int len = 0;
 	char c;
-
-	struct host *hostp = sshfsm.hosts[idx];
+	struct serv *servp = serv_arr_index(idx);
 
 	while (1) {
 		struct pollfd fds[2];
 
-		fds[0].fd = hostp->fd;
+		fds[0].fd = servp->fd;
 		fds[0].events = POLLIN;
-		fds[1].fd = hostp->ptyfd;
+		fds[1].fd = servp->ptyfd;
 		fds[1].events = POLLIN;
 		res = poll(fds, 2, timeout);
 		if (res == -1) {
@@ -1182,7 +935,7 @@ static int pty_expect_loop(const int idx)
 			break;
 		}
 
-		res = read(hostp->ptyfd, &c, 1);
+		res = read(servp->ptyfd, &c, 1);
 		if (res == -1) {
 			perror("read");
 			return -1;
@@ -1195,7 +948,7 @@ static int pty_expect_loop(const int idx)
 		len++;
 		if (len == passwd_len) {
 			if (memcmp(buf, passwd_str, passwd_len) == 0) {
-				write(hostp->ptyfd, sshfsm.password,
+				write(servp->ptyfd, sshfsm.password,
 				      strlen(sshfsm.password));
 			}
 			memmove(buf, buf + 1, passwd_len - 1);
@@ -1252,24 +1005,24 @@ static int start_ssh(const int idx)
 	int sockpair[2];
 	int pid, i;
 	struct fuse_args ssh_args = FUSE_ARGS_INIT(0, NULL);
-	struct host *hostp = sshfsm.hosts[idx];
+	struct serv *servp = serv_arr_index(idx);
 
 	/* since we threading start_ssh, 
-	 * we have to make ssh_args local */
+	 * we must make ssh_args local */
 	for (i = 0; i < sshfsm.ssh_args.argc; i++) {
 		if (fuse_opt_add_arg(&ssh_args, sshfsm.ssh_args.argv[i]) == -1)
 			return -1;
 	}
-	if (fuse_opt_insert_arg(&ssh_args, 1, hostp->hostname) == -1)
+	if (fuse_opt_insert_arg(&ssh_args, 1, servp->hostname) == -1)
 		return -1;
 
 	if (sshfsm.password_stdin) {
-		hostp->ptyfd = pty_master(&ptyname);
-		if (hostp->ptyfd == -1)
+		servp->ptyfd = pty_master(&ptyname);
+		if (servp->ptyfd == -1)
 			return -1;
 
-		hostp->ptyslavefd = open(ptyname, O_RDWR | O_NOCTTY);
-		if (hostp->ptyslavefd == -1)
+		servp->ptyslavefd = open(ptyname, O_RDWR | O_NOCTTY);
+		if (servp->ptyslavefd == -1)
 			return -1;
 	}
 
@@ -1277,7 +1030,7 @@ static int start_ssh(const int idx)
 		perror("failed to create socket pair");
 		return -1;
 	}
-	hostp->fd = sockpair[0];
+	servp->fd = sockpair[0];
 
 	pid = fork();
 	if (pid == -1) {
@@ -1296,6 +1049,7 @@ static int start_ssh(const int idx)
 #endif
 
 		if (sshfsm.nodelaysrv_workaround) {
+			int i;
 			/*
 			 * Hack to work around missing TCP_NODELAY
 			 * setting in sshd
@@ -1342,11 +1096,13 @@ static int start_ssh(const int idx)
 				_exit(1);
 			}
 			close(sfd);
-			close(hostp->ptyslavefd);
-			close(hostp->ptyfd);
+			close(servp->ptyslavefd);
+			close(servp->ptyfd);
 		}
 
 		if (sshfsm.debug) {
+			int i;
+
 			fprintf(stderr, "executing");
 			for (i = 0; i < ssh_args.argc; i++)
 				fprintf(stderr, " <%s>", ssh_args.argv[i]);
@@ -1355,7 +1111,7 @@ static int start_ssh(const int idx)
 
 		execvp(ssh_args.argv[0], ssh_args.argv);
 		fprintf(stderr, "failed to execute '%s' to %s : %s\n",
-			ssh_args.argv[0], hostp->hostname, strerror(errno));
+			   ssh_args.argv[0], servp->hostname, strerror(errno));
 		_exit(1);
 	}
 	waitpid(pid, NULL, 0);
@@ -1366,17 +1122,20 @@ static int start_ssh(const int idx)
 
 static int connect_to(const int idx, char *port)
 {
-	struct addrinfo *ai, hint;
-	struct host *hostp = sshfsm.hosts[idx];
-	int sock, err;
+	int err;
+	int sock;
+	int opt;
+	struct addrinfo *ai;
+	struct addrinfo hint;
+	struct serv *servp = serv_arr_index(idx);
 
 	memset(&hint, 0, sizeof(hint));
 	hint.ai_family = PF_INET;
 	hint.ai_socktype = SOCK_STREAM;
-	err = getaddrinfo(hostp->hostname, port, &hint, &ai);
+	err = getaddrinfo(servp->hostname, port, &hint, &ai);
 	if (err) {
-		fprintf(stderr, "failed to resolve %s:%s: %s\n", hostp->hostname, 
-			port, gai_strerror(err));
+		fprintf(stderr, "failed to resolve %s:%s: %s\n", servp->hostname, port,
+			gai_strerror(err));
 		return -1;
 	}
 	sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
@@ -1389,24 +1148,24 @@ static int connect_to(const int idx, char *port)
 		fprintf(stderr, "failed to connect, %s\n", strerror(errno));
 		return -1;
 	}
-	int opt = 1;
+	opt = 1;
 	err = setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 	if (err == -1)
 		fprintf(stderr, "warning: failed to set TCP_NODELAY, %s\n",
 				strerror(errno));
 
-	hostp->fd = sock;
+	servp->fd = sock;
 	freeaddrinfo(ai);
-	
+
 	return 0;
 }
 
 static int do_write(const int idx, struct iovec *iov, size_t count)
 {
 	int res;
-	struct host *hostp = sshfsm.hosts[idx];
+	struct serv *servp = serv_arr_index(idx);
 	while (count) {
-		res = writev(hostp->fd, iov, count);
+		res = writev(servp->fd, iov, count);
 		if (res == -1) {
 			perror("write");
 			return -1;
@@ -1454,14 +1213,14 @@ static size_t iov_length(const struct iovec *iov, unsigned long nr_segs)
 #define SFTP_MAX_IOV 3
 
 static int sftp_send_iov(const int idx, uint8_t type, uint32_t id, 
-						 struct iovec iov[], size_t count)
+						struct iovec iov[], size_t count)
 {
 	int res;
 	struct buffer buf;
 	struct iovec iovout[SFTP_MAX_IOV];
-	unsigned i;
+	unsigned int i;
 	unsigned nout = 0;
-	struct host *hostp = sshfsm.hosts[idx];
+	struct serv *servp = serv_arr_index(idx);
 
 	assert(count <= SFTP_MAX_IOV - 1);
 	buf_init(&buf, 9);
@@ -1471,9 +1230,9 @@ static int sftp_send_iov(const int idx, uint8_t type, uint32_t id,
 	buf_to_iov(&buf, &iovout[nout++]);
 	for (i = 0; i < count; i++)
 		iovout[nout++] = iov[i];
-	pthread_mutex_lock(&hostp->lock_write);
+	pthread_mutex_lock(&servp->lock_write);
 	res = do_write(idx, iovout, nout);
-	pthread_mutex_unlock(&hostp->lock_write);
+	pthread_mutex_unlock(&servp->lock_write);
 	buf_free(&buf);
 	return res;
 }
@@ -1483,15 +1242,15 @@ static int do_read(const int idx, struct buffer *buf)
 	int res;
 	uint8_t *p = buf->p;
 	size_t size = buf->size;
-	struct host *hostp = sshfsm.hosts[idx];
+	struct serv *servp = serv_arr_index(idx);
 	while (size) {
-		res = read(hostp->fd, p, size);
+		res = read(servp->fd, p, size);
 		if (res == -1) {
 			perror("read");
 			return -1;
 		} else if (res == 0) {
 			fprintf(stderr, "remote host %s has disconnected\n",
-					hostp->hostname);
+					servp->hostname);
 			return -1;
 		}
 		size -= res;
@@ -1548,10 +1307,10 @@ static void chunk_put(struct read_chunk *chunk)
 
 static void chunk_put_locked(const int idx, struct read_chunk *chunk)
 {
-	struct host *hostp = sshfsm.hosts[idx];
-	pthread_mutex_lock(&hostp->lock);
+	struct serv *servp = serv_arr_index(idx);
+	pthread_mutex_lock(&servp->lock);
 	chunk_put(chunk);
-	pthread_mutex_unlock(&hostp->lock);
+	pthread_mutex_unlock(&servp->lock);
 }
 
 static int clean_req(void *key_, struct request *req)
@@ -1576,8 +1335,7 @@ static int process_one_request(const int idx)
 	uint8_t type;
 	struct request *req;
 	uint32_t id;
-
-	struct host *hostp = sshfsm.hosts[idx];
+	struct serv *servp = serv_arr_index(idx);
 
 	buf_init(&buf, 0);
 	res = sftp_read(idx, &type, &buf);
@@ -1586,23 +1344,23 @@ static int process_one_request(const int idx)
 	if (buf_get_uint32(&buf, &id) == -1)
 		return -1;
 
-	pthread_mutex_lock(&hostp->lock);
+	pthread_mutex_lock(&servp->lock);
 	req = (struct request *)
-		g_hash_table_lookup(hostp->reqtab, GUINT_TO_POINTER(id));
+		g_hash_table_lookup(servp->reqtab, GUINT_TO_POINTER(id));
 	if (req == NULL)
 		fprintf(stderr, "request %i not found\n", id);
 	else {
 		int was_over;
 
-		was_over = hostp->outstanding_len > sshfsm.max_outstanding_len;
-		hostp->outstanding_len -= req->len;
+		was_over = servp->outstanding_len > sshfsm.max_outstanding_len;
+		servp->outstanding_len -= req->len;
 		if (was_over &&
-		    hostp->outstanding_len <= sshfsm.max_outstanding_len) {
-			pthread_cond_broadcast(&hostp->outstanding_cond);
+		    servp->outstanding_len <= sshfsm.max_outstanding_len) {
+			pthread_cond_broadcast(&servp->outstanding_cond);
 		}
-		g_hash_table_remove(hostp->reqtab, GUINT_TO_POINTER(id));
+		g_hash_table_remove(servp->reqtab, GUINT_TO_POINTER(id));
 	}
-	pthread_mutex_unlock(&hostp->lock);
+	pthread_mutex_unlock(&servp->lock);
 	if (req != NULL) {
 		if (sshfsm.debug) {
 			struct timeval now;
@@ -1615,13 +1373,13 @@ static int process_one_request(const int idx)
 			DEBUG("  [%05i] %14s %8ubytes (%ims)\n", id,
 			      type_name(type), msgsize, difftime);
 
-			if (difftime < sshfsm.min_rtt || !sshfsm.num_received)
-				sshfsm.min_rtt = difftime;
-			if (difftime > sshfsm.max_rtt)
-				sshfsm.max_rtt = difftime;
-			sshfsm.total_rtt += difftime;
-			sshfsm.num_received++;
-			sshfsm.bytes_received += msgsize;
+			if (difftime < servp->min_rtt || !servp->num_received)
+				servp->min_rtt = difftime;
+			if (difftime > servp->max_rtt)
+				servp->max_rtt = difftime;
+			servp->total_rtt += difftime;
+			servp->num_received++;
+			servp->bytes_received += msgsize;
 		}
 		req->reply = buf;
 		req->reply_type = type;
@@ -1630,9 +1388,9 @@ static int process_one_request(const int idx)
 			sem_post(&req->ready);
 		else {
 			if (req->end_func) {
-				pthread_mutex_lock(&hostp->lock);
+				pthread_mutex_lock(&servp->lock);
 				req->end_func(req);
-				pthread_mutex_unlock(&hostp->lock);
+				pthread_mutex_unlock(&servp->lock);
 			}
 			request_free(req);
 		}
@@ -1644,16 +1402,16 @@ static int process_one_request(const int idx)
 
 static void close_conn(const int idx)
 {
-	struct host *hostp = sshfsm.hosts[idx];
-	close(hostp->fd);
-	hostp->fd = -1;
-	if (hostp->ptyfd != -1) {
-		close(hostp->ptyfd);
-		hostp->ptyfd = -1;
+	struct serv *servp = serv_arr_index(idx);
+	close(servp->fd);
+	servp->fd = -1;
+	if (servp->ptyfd != -1) {
+		close(servp->ptyfd);
+		servp->ptyfd = -1;
 	}
-	if (hostp->ptyslavefd != -1) {
-		close(hostp->ptyslavefd);
-		hostp->ptyslavefd = -1;
+	if (servp->ptyslavefd != -1) {
+		close(servp->ptyslavefd);
+		servp->ptyslavefd = -1;
 	}
 }
 
@@ -1661,7 +1419,7 @@ static void *process_requests(void *data)
 {
 	int *idxp = (int *) data;
 	int idx = *idxp;
-	struct host *hostp = sshfsm.hosts[idx];
+	struct serv *servp = serv_arr_index(idx);
 
 	while (1) {
 		if (process_one_request(idx) == -1)
@@ -1672,20 +1430,20 @@ static void *process_requests(void *data)
 		/* harakiri */
 		kill(getpid(), SIGTERM);
 	} else {
-		pthread_mutex_lock(&hostp->lock);
-		hostp->processing_thread_started = 0;
+		pthread_mutex_lock(&servp->lock);
+		servp->processing_thread_started = 0;
 		close_conn(idx);
-		g_hash_table_foreach_remove(hostp->reqtab, (GHRFunc) clean_req,
+		g_hash_table_foreach_remove(servp->reqtab, (GHRFunc) clean_req,
 					    NULL);
-		hostp->connver ++;
-		pthread_mutex_unlock(&hostp->lock);
+		servp->connver ++;
+		pthread_mutex_unlock(&servp->lock);
 	}
 	g_free(data);
 	return NULL;
 }
 
 static int sftp_init_reply_ok(const int idx, struct buffer *buf, 
-							  uint32_t *version)
+							 uint32_t *version)
 {
 	uint32_t len;
 	uint8_t type;
@@ -1724,11 +1482,13 @@ static int sftp_init_reply_ok(const int idx, struct buffer *buf,
 
 			DEBUG("Extension: %s <%s>\n", ext, extdata);
 
-			if (strcmp(ext, SFTP_EXT_POSIX_RENAME) == 0) {
+			if (strcmp(ext, SFTP_EXT_POSIX_RENAME) == 0 &&
+			    strcmp(extdata, "1") == 0) {
 				sshfsm.ext_posix_rename = 1;
 				sshfsm.rename_workaround = 0;
 			}
-			if (strcmp(ext, SFTP_EXT_STATVFS) == 0)
+			if (strcmp(ext, SFTP_EXT_STATVFS) == 0 &&
+			    strcmp(extdata, "2") == 0)
 				sshfsm.ext_statvfs = 1;
 		} while (buf2.len < buf2.size);
 	}
@@ -1766,8 +1526,7 @@ static int sftp_init(const int idx)
 	int res = -1;
 	uint32_t version = 0;
 	struct buffer buf;
-	struct host *hostp = sshfsm.hosts[idx];
-
+	struct serv *servp = serv_arr_index(idx);
 	buf_init(&buf, 0);
 	if (sftp_send_iov(idx, SSH_FXP_INIT, PROTO_VERSION, NULL, 0) == -1)
 		goto out;
@@ -1778,11 +1537,11 @@ static int sftp_init(const int idx)
 	if (sftp_find_init_reply(idx, &version) == -1)
 		goto out;
 
-	hostp->server_version = version;
+	servp->server_version = version;
 	if (version > PROTO_VERSION) {
 		fprintf(stderr,
 			"Warning: server %s uses version: %i, we support: %i\n",
-			hostp->hostname, version, PROTO_VERSION);
+			servp->hostname, version, PROTO_VERSION);
 	}
 	res = 0;
 
@@ -1815,8 +1574,7 @@ static void sftp_detect_uid(const int idx)
 	struct buffer buf;
 	struct stat stbuf;
 	struct iovec iov[1];
-	
-	struct host *hostp = sshfsm.hosts[idx];
+	struct serv *servp = serv_arr_index(idx);
 
 	buf_init(&buf, 5);
 	buf_add_string(&buf, ".");
@@ -1850,63 +1608,17 @@ static void sftp_detect_uid(const int idx)
 	if (!(flags & SSH_FILEXFER_ATTR_UIDGID))
 		goto out;
 
-	hostp->uid = stbuf.st_uid;
+	servp->remote_uid = stbuf.st_uid;
 	sshfsm.local_uid = getuid();
-	hostp->uid_detected = 1;
-	DEBUG("host %s uid = %i\n", hostp->hostname, hostp->uid);
+	servp->remote_uid_detected = 1;
+	DEBUG("server %s remote_uid = %i\n", servp->hostname, servp->remote_uid);
 
 out:
-	if (!hostp->uid_detected)
-		fprintf(stderr, "failed to detect remote user ID\n");
+	if (!servp->remote_uid_detected)
+		fprintf(stderr, "failed to detect server %s remote user ID\n",
+				servp->hostname);
 
 	buf_free(&buf);
-}
-
-static void * sftp_detect_uid_thread_func(void *data)
-{
-	int *idxp = (int *) data;
-	sftp_detect_uid(*idxp); 
-	pthread_exit((void *) 0);
-}
-
-static void sftp_detect_uid_all()
-{
-	pthread_t *threads;
-	pthread_attr_t attr;
-	
-	int *idxs = g_new(int, sshfsm.hosts_num);
-	threads = g_new(pthread_t, sshfsm.hosts_num);
-	
-	pthread_attr_init(&attr);
-	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-	int err, i;
-	for (i = 0; i < sshfsm.hosts_num; i++) {
-		idxs[i] = i;
-		err = pthread_create(&threads[i], &attr, 
-				sftp_detect_uid_thread_func, &idxs[i]);
-		if (err) {
-			fprintf(stderr, "sshfsm: create thread failed: %s\n", 
-					strerror(err));
-			return;
-		}
-	}
-
-	int retval;
-	for (i = 0; i < sshfsm.hosts_num; i++) {
-		err = pthread_join(threads[i], (void *) &retval);
-		if (err) {
-			fprintf(stderr, "sshfsm: join thread failed: %s\n", 
-					strerror(err));
-			return;
-		}
-		if (retval != 0)
-			DEBUG("debug: detect uid of %s failed\n", 
-				 sshfsm.hosts[i]->hostname);
-	}
-	pthread_attr_destroy(&attr);
-	g_free(idxs);
-	g_free(threads);
-	return;
 }
 
 static int sftp_check_root(const int idx)
@@ -1919,8 +1631,8 @@ static int sftp_check_root(const int idx)
 	struct stat stbuf;
 	struct iovec iov[1];
 	int err = -1;
-	struct host *hostp = sshfsm.hosts[idx];
-	const char *remote_dir = hostp->basepath[0] ? hostp->basepath : ".";
+	struct serv *servp = serv_arr_index(idx);
+	const char *remote_dir = servp->base_path[0] ? servp->base_path : ".";
 
 	buf_init(&buf, 0);
 	buf_add_string(&buf, remote_dir);
@@ -1945,7 +1657,7 @@ static int sftp_check_root(const int idx)
 		if (buf_get_uint32(&buf, &serr) == -1)
 			goto out;
 
-		fprintf(stderr, "%s:%s: %s\n", hostp->hostname, remote_dir,
+		fprintf(stderr, "%s:%s: %s\n", servp->hostname, remote_dir,
 			strerror(sftp_error_to_errno(serr)));
 
 		goto out;
@@ -1957,7 +1669,7 @@ static int sftp_check_root(const int idx)
 		goto out;
 
 	if (!S_ISDIR(stbuf.st_mode)) {
-		fprintf(stderr, "%s:%s: Not a directory\n", hostp->hostname,
+		fprintf(stderr, "%s:%s: Not a directory\n", servp->hostname,
 			remote_dir);
 		goto out;
 	}
@@ -1969,58 +1681,10 @@ out:
 	return err;
 }
 
-static void * sftp_check_root_thread_func(void *data)
-{
-	int *idxp = (int *) data;
-	sftp_check_root(*idxp) ? 
-	pthread_exit((void *) -1) : pthread_exit((void *) 0);
-}
-
-static int sftp_check_root_all()
-{
-	pthread_t *threads;
-	pthread_attr_t attr;
-	
-	int *idxs = g_new(int, sshfsm.hosts_num);
-	threads = g_new(pthread_t, sshfsm.hosts_num);
-	
-	pthread_attr_init(&attr);
-	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-
-	int err, i;
-	for (i = 0; i < sshfsm.hosts_num; i++) {
-		idxs[i] = i;
-		err = pthread_create(&threads[i], &attr, 
-				sftp_check_root_thread_func, &idxs[i]);
-		if (err) {
-			fprintf(stderr, "sshfsm: create thread failed: %s\n", 
-					strerror(err));
-			return -EIO;
-		}
-	}
-
-	int retval;
-	for (i = 0; i < sshfsm.hosts_num; i++) {
-		err = pthread_join(threads[i], (void *) &retval);
-		if (err) {
-			fprintf(stderr, "sshfsm: join thread failed: %s\n", 
-					strerror(err));
-			return -EIO;
-		}
-		if (retval != 0)
-			DEBUG("debug: check root of %s failed\n", 
-				 sshfsm.hosts[i]->hostname);
-	}
-	pthread_attr_destroy(&attr);
-	g_free(idxs);
-	g_free(threads);
-	return 0;
-}
-
 static int connect_remote(const int idx)
 {
 	int err;
-	//struct host *hostp = sshfsm.hosts[idx];
+	struct serv *servp = serv_arr_index(idx);
 
 	if (sshfsm.directport)
 		err = connect_to(idx, sshfsm.directport);
@@ -2032,56 +1696,9 @@ static int connect_remote(const int idx)
 	if (err)
 		close_conn(idx);
 	else
-		sshfsm.num_connect++; /* TODO: put this for each host */
+		servp->num_connect++; /* TODO: put this for each host */
 
 	return err;
-}
-
-static void * connect_remote_thread_func(void *data)
-{
-	int *idxp = (int *) data;
-	connect_remote(*idxp) ? 
-	pthread_exit((void *) -1) : pthread_exit((void *) 0);
-}
-
-static int connect_remote_all()
-{
-	pthread_t *threads;
-	pthread_attr_t attr;
-	
-	int *idxs = g_new(int, sshfsm.hosts_num);
-	threads = g_new(pthread_t, sshfsm.hosts_num);
-	
-	pthread_attr_init(&attr);
-	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-
-	int err, i;
-	for (i = 0; i < sshfsm.hosts_num; i++) {
-		idxs[i] = i;
-		err = pthread_create(&threads[i], &attr, 
-				connect_remote_thread_func, &idxs[i]);
-		if (err) {
-			fprintf(stderr, "sshfsm: create thread failed: %s\n", 
-					strerror(err));
-			return -EIO;
-		}
-	}
-
-	int retval;
-	for (i = 0; i < sshfsm.hosts_num; i++) {
-		err = pthread_join(threads[i], (void *) &retval);
-		if (err) {
-			fprintf(stderr, "sshfsm: join thread failed: %s\n", 
-					strerror(err));
-			return -EIO;
-		}
-		if (retval != 0)
-			DEBUG("debug: connect to %s failed\n", sshfsm.hosts[i]->hostname);
-	}
-	pthread_attr_destroy(&attr);
-	g_free(idxs);
-	g_free(threads);
-	return 0;
 }
 
 static int start_processing_thread(const int idx)
@@ -2090,13 +1707,12 @@ static int start_processing_thread(const int idx)
 	pthread_t thread_id;
 	sigset_t oldset;
 	sigset_t newset;
+	struct serv *servp = serv_arr_index(idx);
 
-	struct host *hostp = sshfsm.hosts[idx];
-
-	if (hostp->processing_thread_started)
+	if (servp->processing_thread_started)
 		return 0;
 
-	if (hostp->fd == -1) {
+	if (servp->fd == -1) {
 		err = connect_remote(idx);
 		if (err)
 			return -EIO;
@@ -2117,24 +1733,25 @@ static int start_processing_thread(const int idx)
 	}
 	pthread_detach(thread_id);
 	pthread_sigmask(SIG_SETMASK, &oldset, NULL);
-	hostp->processing_thread_started = 1;
+	servp->thread_id = thread_id;
+	servp->processing_thread_started = 1;
 	return 0;
 }
 
 static int start_processing_thread_all(void)
 {
-	int err, i;
-	for (i = 0; i < sshfsm.hosts_num; i++)
+	int err;
+	unsigned int i;
+	struct serv *servp;
+	for (i = 0; i < sshfsm.serv_arr->len; i++)
 		if ((err = start_processing_thread(i)) != 0) {
+			servp = serv_arr_index(i);
 			fprintf(stderr, "%s: starting processing thread failed: %s\n", 
-					sshfsm.hosts[i]->hostname, strerror(err));
+					servp->hostname, strerror(err));
 			return -EIO;
 		}
 	return 0;
 }
-
-static void op_server_start_processing(void);
-static void op_server_destroy(void);
 
 #ifdef SSHFSM_USE_INIT
 #if FUSE_VERSION >= 26
@@ -2149,14 +1766,7 @@ static void *sshfsm_init(struct fuse_conn_info *conn)
 		sshfsm.sync_read = 1;
 #endif
 
-	if (sshfsm.detect_uid)
-		sftp_detect_uid_all();
-	
-	if (sshfsm.oper)
-		op_server_start_processing();
-
 	start_processing_thread_all();
-	
 	return NULL;
 }
 #endif
@@ -2164,37 +1774,20 @@ static void *sshfsm_init(struct fuse_conn_info *conn)
 #ifdef SSHFSM_USE_DESTROY
 static void sshfsm_destroy(void *data_)
 {
-	struct host *hostp;
-	int i;
 	(void) data_;
 	cache_destroy();
 	table_destroy();
-	for (i = 0; i < sshfsm.hosts_num; i++) {
-		hostp = sshfsm.hosts[i];	
-		g_free(hostp->hostname);
-		g_free(hostp->basepath);
-		g_hash_table_destroy(hostp->reqtab);
-		pthread_mutex_destroy(&hostp->lock);
-		pthread_mutex_destroy(&hostp->lock_write);
-		g_free(hostp);
-	}
-	g_free(sshfsm.hosts);
+	if (!sshfsm.debug)
+		serv_arr_destroy();
 	g_free(sshfsm.mountpoint);
-
-	if (sshfsm.fakelink_workaround)
-		fakelink_cache_destroy();
-	
-	if (sshfsm.oper)
-		op_server_destroy();
 }
 #endif
 
-/* SFTP primitives */
 static int sftp_request_wait(const int idx, struct request *req, uint8_t type,
-                             uint8_t expect_type, struct buffer *outbuf)
+                            uint8_t expect_type, struct buffer *outbuf)
 {
 	int err;
-	struct host *hostp = sshfsm.hosts[idx];
+	struct serv *servp = serv_arr_index(idx);
 
 	if (req->error) {
 		err = req->error;
@@ -2242,57 +1835,57 @@ static int sftp_request_wait(const int idx, struct request *req, uint8_t type,
 
 out:
 	if (req->end_func) {
-		pthread_mutex_lock(&hostp->lock);
+		pthread_mutex_lock(&servp->lock);
 		req->end_func(req);
-		pthread_mutex_unlock(&hostp->lock);
+		pthread_mutex_unlock(&servp->lock);
 	}
 	request_free(req);
 	return err;
 }
 
 static int sftp_request_send(const int idx, uint8_t type, struct iovec *iov, 
-							 size_t count, request_func begin_func, 
-							 request_func end_func, int want_reply, 
-							 void *data, struct request **reqp)
+							size_t count, request_func begin_func, 
+							request_func end_func, int want_reply, 
+							void *data, struct request **reqp)
 {
 	int err;
 	uint32_t id;
 	struct request *req = g_new0(struct request, 1);
-	struct host *hostp = sshfsm.hosts[idx];
+	struct serv *servp = serv_arr_index(idx);
 
 	req->want_reply = want_reply;
 	req->end_func = end_func;
 	req->data = data;
 	sem_init(&req->ready, 0, 0);
 	buf_init(&req->reply, 0);
-	pthread_mutex_lock(&hostp->lock);
+	pthread_mutex_lock(&servp->lock);
 	if (begin_func)
 		begin_func(req);
 	id = sftp_get_id();
 	err = start_processing_thread(idx);
 	if (err) {
-		pthread_mutex_unlock(&hostp->lock);
+		pthread_mutex_unlock(&servp->lock);
 		goto out;
 	}
 	req->len = iov_length(iov, count) + 9;
-	hostp->outstanding_len += req->len;
-	while (hostp->outstanding_len > sshfsm.max_outstanding_len)
-		pthread_cond_wait(&hostp->outstanding_cond, &hostp->lock);
+	servp->outstanding_len += req->len;
+	while (servp->outstanding_len > sshfsm.max_outstanding_len)
+		pthread_cond_wait(&servp->outstanding_cond, &servp->lock);
 
-	g_hash_table_insert(hostp->reqtab, GUINT_TO_POINTER(id), req);
+	g_hash_table_insert(servp->reqtab, GUINT_TO_POINTER(id), req);
 	if (sshfsm.debug) {
 		gettimeofday(&req->start, NULL);
-		sshfsm.num_sent++;
-		sshfsm.bytes_sent += req->len;
+		servp->num_sent++;
+		servp->bytes_sent += req->len;
 	}
 	DEBUG("[%05i] %s\n", id, type_name(type));
-	pthread_mutex_unlock(&hostp->lock);
+	pthread_mutex_unlock(&servp->lock);
 
 	err = -EIO;
 	if (sftp_send_iov(idx, type, id, iov, count) == -1) {
-		pthread_mutex_lock(&hostp->lock);
-		g_hash_table_remove(hostp->reqtab, GUINT_TO_POINTER(id));
-		pthread_mutex_unlock(&hostp->lock);
+		pthread_mutex_lock(&servp->lock);
+		g_hash_table_remove(servp->reqtab, GUINT_TO_POINTER(id));
+		pthread_mutex_unlock(&servp->lock);
 		goto out;
 	}
 	if (want_reply)
@@ -2311,8 +1904,8 @@ out:
 
 
 static int sftp_request_iov(const int idx, uint8_t type, struct iovec *iov, 
-							size_t count, uint8_t expect_type, 
-							struct buffer *outbuf)
+						   size_t count, uint8_t expect_type, 
+						   struct buffer *outbuf)
 {
 	struct request *req;
 
@@ -2325,7 +1918,7 @@ static int sftp_request_iov(const int idx, uint8_t type, struct iovec *iov,
 }
 
 static int sftp_request(const int idx, uint8_t type, const struct buffer *buf,
-                        uint8_t expect_type, struct buffer *outbuf)
+					   uint8_t expect_type, struct buffer *outbuf)
 {
 	struct iovec iov;
 
@@ -2396,8 +1989,7 @@ static int processing_by_threads(idx_list_t list,
 	return err;
 }
 
-/* FUSE primitives */
-static int host_getattr(const int idx, const char *path, struct stat *stbuf)
+static int serv_getattr(const int idx, const char *path, struct stat *stbuf)
 {
 	int err;
 	struct buffer buf;
@@ -2405,8 +1997,9 @@ static int host_getattr(const int idx, const char *path, struct stat *stbuf)
 	buf_init(&buf, 0);
 	buf_add_path(idx, &buf, path);
 	err = sftp_request(idx, sshfsm.follow_symlinks ? 
-				SSH_FXP_STAT : SSH_FXP_LSTAT,
-				&buf, SSH_FXP_ATTRS, &outbuf);
+					  SSH_FXP_STAT : SSH_FXP_LSTAT,
+			 		  &buf, SSH_FXP_ATTRS, &outbuf);
+	fprintf(stderr, "reach here\n");
 	if (!err) {
 		if (buf_get_attrs(idx, &outbuf, stbuf, NULL) == -1)
 			err = -EIO;
@@ -2417,29 +2010,21 @@ static int host_getattr(const int idx, const char *path, struct stat *stbuf)
 }
 
 static int sshfsm_getattr(const char *path, struct stat *stbuf)
-{	
-	/* fakelink workaround 
-	 * check link cache first */
-	if (sshfsm.fakelink_workaround) {
-		fakelink_t alias = fakelink_lookup(path);
-		if (alias)
-			return host_getattr(alias->idx, alias->name, stbuf);
-	}
-		
-	if (sshfsm.hosts_num == 1)
-		return host_getattr(sshfsm.idx_0, path, stbuf);
+{
+	if (sshfsm.serv_arr->len == 1)
+		return serv_getattr(0, path, stbuf);
 	
 	int r_flag = 0;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
+	struct serv *servp;
 	int err = 0;
 	while (list) {
 		item = (struct idx_item *) list->data;
-		err = host_getattr(item->idx, path, stbuf);
+		servp = serv_arr_index(item->idx);
+		err = serv_getattr(item->idx, path, stbuf);
 		DEBUG("  op:getattr(err: %d, path: %s, host: %s:%s)\n", 
-			  err, path, 
-			  sshfsm.hosts[item->idx]->hostname,
-			  sshfsm.hosts[item->idx]->basepath);
+			  err, path, servp->hostname, servp->base_path);
 		if (!err) {
 			if (S_ISDIR(stbuf->st_mode))
 				table_insert(path, item->idx, item->rank);
@@ -2483,8 +2068,9 @@ static void strip_common(const char **sp, const char **tp)
 
 static void transform_symlink(const int idx, const char *path, char **linkp)
 {
+	struct serv *servp = serv_arr_index(idx);
 	const char *l = *linkp;
-	const char *b = sshfsm.hosts[idx]->basepath;
+	const char *b = servp->base_path;
 	char *newlink;
 	char *s;
 	int dotdots;
@@ -2521,15 +2107,18 @@ static void transform_symlink(const int idx, const char *path, char **linkp)
 	free(*linkp);
 	*linkp = newlink;
 }
-static int host_readlink(const int idx, const char *path, char *linkbuf, size_t size)
+
+static int serv_readlink(const int idx, const char *path, char *linkbuf,
+						size_t size)
 {
 	int err;
 	struct buffer buf;
 	struct buffer name;
+	struct serv *servp = serv_arr_index(idx);
 
 	assert(size > 0);
 
-	if (sshfsm.hosts[idx]->server_version < 3)
+	if (servp->server_version < 3)
 		return -EPERM;
 
 	buf_init(&buf, 0);
@@ -2556,20 +2145,20 @@ static int host_readlink(const int idx, const char *path, char *linkbuf, size_t 
 
 static int sshfsm_readlink(const char *path, char *linkbuf, size_t size)
 {
-	if (sshfsm.hosts_num == 1)
-		return host_readlink(sshfsm.idx_0, path, linkbuf, size);
+	if (sshfsm.serv_arr->len == 1)
+		return serv_readlink(0, path, linkbuf, size);
 	
 	int r_flag = 0;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
+	struct serv *servp;
 	int err = 0;
 	while (list) {
 		item = (struct idx_item *) list->data;
-		err = host_readlink(item->idx, path, linkbuf, size);
+		servp = serv_arr_index(item->idx);
+		err = serv_readlink(item->idx, path, linkbuf, size);
 		DEBUG("  op:readlink(err: %d, path: %s, host: %s:%s)\n", 
-			  err, path, 
-			  sshfsm.hosts[item->idx]->hostname,
-			  sshfsm.hosts[item->idx]->basepath);
+			  err, path, servp->hostname, servp->base_path);
 		if (!err)
 			break;
 		list = list->next;
@@ -2577,8 +2166,8 @@ static int sshfsm_readlink(const char *path, char *linkbuf, size_t size)
 	return err;
 }
 
-static int host_getdir_1(const int idx, const char *path, 
-					fuse_cache_dirh_t h, fuse_cache_dirfil_t filler)
+static int serv_getdir_1(const int idx, const char *path, fuse_cache_dirh_t h,
+                      	fuse_cache_dirfil_t filler)
 {
 	int err;
 	struct buffer buf;
@@ -2591,8 +2180,7 @@ static int host_getdir_1(const int idx, const char *path,
 		buf_finish(&handle);
 		do {
 			struct buffer name;
-			err = sftp_request(idx, SSH_FXP_READDIR, &handle, SSH_FXP_NAME, 
-							   &name);
+			err = sftp_request(idx, SSH_FXP_READDIR, &handle, SSH_FXP_NAME, &name);
 			if (!err) {
 				if (buf_get_entries_1(idx, &name, h, filler) == -1)
 					err = -EIO;
@@ -2610,7 +2198,8 @@ static int host_getdir_1(const int idx, const char *path,
 	buf_free(&buf);
 	return err;
 }
-static int host_getdir(const int idx, const char *path, GSList **entry_list)
+
+static int serv_getdir(const int idx, const char *path, GSList **entry_list)
 {
 	int err;
 	struct buffer buf;
@@ -2651,7 +2240,7 @@ static void * getdir_thread_func(void *data)
 {
 	struct getdir_thread_data *datap
 		= (struct getdir_thread_data *) data;
-	datap->err = host_getdir(datap->idx, datap->path, &datap->entry_list);
+	datap->err = serv_getdir(datap->idx, datap->path, &datap->entry_list);
 	datap->err ? pthread_exit((void *) -1) : pthread_exit((void *) 0);
 }
 
@@ -2678,10 +2267,10 @@ static int entry_list_get_entries(const int idx, const char *path,
 
 static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
                         fuse_cache_dirfil_t filler)
-{	
-	if (sshfsm.hosts_num == 1 && !sshfsm.fakelink_workaround)
-		return host_getdir_1(sshfsm.idx_0, path, h, filler);
-
+{
+	if (sshfsm.serv_arr->len == 1)
+		return serv_getdir_1(0, path, h, filler);
+	
 	pthread_t *threads;
 	pthread_attr_t attr;
 	
@@ -2708,7 +2297,7 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 		err = pthread_create(&threads[i], &attr,
 				getdir_thread_func, &thread_dat[i]);
 		if (err) {
-			fprintf(stderr, "sshfsm: create thread failed: %s\n", 
+			fprintf(stderr, "create thread failed: %s\n", 
 					strerror(err));
 			return -EIO;
 		}
@@ -2723,35 +2312,20 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 		return -EIO;
 	}
 
-	/* fakelink workaround */
-#ifdef HASH_TABLE_HAVE_ITER
-#error "fakelink in sshfsm_getdir not implemented yet"
-#else
-	struct fakelink_filldir_data fill_data;
-	fill_data.path = g_strdup(path);
-	fill_data.h = h;
-	fill_data.filler = filler;
-	fill_data.filter = entry_filter;
-	g_hash_table_foreach(sshfsm.fakelink_cache, fakelink_filldir_func, 
-			&fill_data);
-	g_free(fill_data.path);
-#endif
-
 	int err2;
 	curr = idx_list;
 	for (i = 0; i < idx_list_len; i++) {
 		item = (struct idx_item *) curr->data;
 		err = pthread_join(threads[i], (void *) &err2);
 		if (err) {
-			fprintf(stderr, "sshfsm: join thread failed: %s\n", 
-					strerror(err));
+			fprintf(stderr, "join thread failed: %s\n", strerror(err));
 			return -EIO;
 		}
-		if (err2)
-			DEBUG("debug: getdir from %s:%s failed with %d\n", 
-				 sshfsm.hosts[item->idx]->hostname,
-				 sshfsm.hosts[item->idx]->basepath, err2);
-		else {
+		if (err2) {
+			struct serv *servp = serv_arr_index(item->idx);
+			DEBUG("getdir from %s:%s failed with %d\n", 
+				 servp->hostname, servp->base_path, err2);
+		} else {
 			/* merge entries */
 			err = entry_list_get_entries(item->idx, path, 
 					&(thread_dat[i].entry_list), entry_filter, h, filler);
@@ -2768,7 +2342,7 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 	return err;
 }
 
-static int host_mkdir(const int idx, const char *path, mode_t mode)
+static int serv_mkdir(const int idx, const char *path, mode_t mode)
 {
 	int err;
 	struct buffer buf;
@@ -2783,20 +2357,20 @@ static int host_mkdir(const int idx, const char *path, mode_t mode)
 
 static int sshfsm_mkdir(const char *path, mode_t mode)
 {
-	if (sshfsm.hosts_num == 1)
-		return host_mkdir(sshfsm.idx_0, path, mode);
+	if (sshfsm.serv_arr->len == 1)
+		return serv_mkdir(0, path, mode);
 	
 	int r_flag = 1;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
+	struct serv *servp;
 	int err = 0;
 	while (list) {
 		item = (struct idx_item *) list->data;
-		err = host_mkdir(item->idx, path, mode);
+		servp = serv_arr_index(item->idx);
+		err = serv_mkdir(item->idx, path, mode);
 		DEBUG("  op:mkdir(err: %d, path: %s, host: %s:%s)\n", 
-			  err, path, 
-			  sshfsm.hosts[item->idx]->hostname,
-			  sshfsm.hosts[item->idx]->basepath);
+			  err, path, servp->hostname, servp->base_path);
 		if (!err) 
 			break;
 		list = list->next;
@@ -2807,7 +2381,7 @@ static int sshfsm_mkdir(const char *path, mode_t mode)
 	return err;
 }
 
-static int host_mknod(const int idx, const char *path, mode_t mode, dev_t rdev)
+static int serv_mknod(const int idx, const char *path, mode_t mode, dev_t rdev)
 {
 	int err;
 	struct buffer buf;
@@ -2826,8 +2400,7 @@ static int host_mknod(const int idx, const char *path, mode_t mode, dev_t rdev)
 	if (!err) {
 		int err2;
 		buf_finish(&handle);
-		err2 = sftp_request(idx, SSH_FXP_CLOSE, &handle, SSH_FXP_STATUS,
-				    NULL);
+		err2 = sftp_request(idx, SSH_FXP_CLOSE, &handle, SSH_FXP_STATUS, NULL);
 		if (!err)
 			err = err2;
 		buf_free(&handle);
@@ -2838,20 +2411,20 @@ static int host_mknod(const int idx, const char *path, mode_t mode, dev_t rdev)
 
 static int sshfsm_mknod(const char *path, mode_t mode, dev_t rdev)
 {
-	if (sshfsm.hosts_num == 1)
-		return host_mknod(sshfsm.idx_0, path, mode,rdev);
+	if (sshfsm.serv_arr->len == 1)
+		return serv_mknod(0, path, mode, rdev);
 	
 	int r_flag = 1;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
+	struct serv *servp;
 	int err = 0;
 	while (list) {
 		item = (struct idx_item *) list->data;
-		err = host_mknod(item->idx, path, mode, rdev);
+		servp = serv_arr_index(item->idx);
+		err = serv_mknod(item->idx, path, mode, rdev);
 		DEBUG("  op:mknod(err: %d, path: %s, host: %s:%s)\n", 
-			  err, path, 
-			  sshfsm.hosts[item->idx]->hostname,
-			  sshfsm.hosts[item->idx]->basepath);
+			  err, path, servp->hostname, servp->base_path);
 		if (!err)
 			break;
 		list = list->next;
@@ -2862,12 +2435,13 @@ static int sshfsm_mknod(const char *path, mode_t mode, dev_t rdev)
 	return err;
 }
 
-static int host_symlink(const int idx, const char *from, const char *to)
+static int serv_symlink(const int idx, const char *from, const char *to)
 {
 	int err;
 	struct buffer buf;
+	struct serv *servp = serv_arr_index(idx);
 
-	if (sshfsm.hosts[idx]->server_version < 3)
+	if (servp->server_version < 3)
 		return -EPERM;
 
 	/* openssh sftp server doesn't follow standard: link target and
@@ -2882,20 +2456,20 @@ static int host_symlink(const int idx, const char *from, const char *to)
 
 static int sshfsm_symlink(const char *from, const char *to)
 {
-	if (sshfsm.hosts_num == 1)
-		return host_symlink(sshfsm.idx_0, from, to);
+	if (sshfsm.serv_arr->len == 1)
+		return serv_symlink(0, from, to);
 	
 	int r_flag = 0;
 	idx_list_t list = table_lookup_r(from, &r_flag);
 	struct idx_item *item = NULL;
+	struct serv *servp;
 	int err = 0;
 	while (list) {
 		item = (struct idx_item *) list->data;
-		err = host_symlink(item->idx, from, to);
+		servp = serv_arr_index(item->idx);
+		err = serv_symlink(item->idx, from, to);
 		DEBUG("  op:symlink(err: %d, from: %s, to: %s, host: %s:%s)\n", 
-			  err, from, to, 
-			  sshfsm.hosts[item->idx]->hostname,
-			  sshfsm.hosts[item->idx]->basepath);
+			  err, from, to, servp->hostname, servp->base_path);
 		if (!err)
 			break;
 		list = list->next;
@@ -2903,42 +2477,7 @@ static int sshfsm_symlink(const char *from, const char *to)
 	return err;
 }
 
-/* cache a alias as link, not hard link */
-static int sshfsm_fakelink(const char *from, const char *to)
-{
-	if (!sshfsm.fakelink_workaround)
-		return -38;	/* Not implemented as original */
-		
-	int r_flag = 1;
-	idx_list_t list = table_lookup_r(from, &r_flag);
-	struct idx_item *item = NULL;
-	struct stat stbuf;
-	int err = 0;
-	while (list) {
-		item = (struct idx_item *) list->data;
-		err = host_getattr(item->idx, from, &stbuf);
-		DEBUG("  op:fakelink_getattr(err: %d, path: %s, host: %s:%s)\n", 
-			  err, from, 
-			  sshfsm.hosts[item->idx]->hostname,
-			  sshfsm.hosts[item->idx]->basepath);
-		if (!err)
-			break;
-		list = list->next;
-	}
-
-	if (!err) {	/* add a alias to cache */
-		/* TODO: to investigate and remove 
-		 * check if there is a file first 
-		 * this may not necessary since we getattr() first */
-		fakelink_t alias = fakelink_lookup(to);
-		if (alias)
-			return -EEXIST;
-		fakelink_insert(from, to, item->idx, &stbuf);
-	}
-	return err;
-}
-
-static int host_unlink(const int idx, const char *path)
+static int serv_unlink(const int idx, const char *path)
 {
 	int err;
 	struct buffer buf;
@@ -2957,9 +2496,8 @@ struct unlink_thread_data {
 
 static void * unlink_thread_func(void *data)
 {
-	struct unlink_thread_data *datap
-		= (struct unlink_thread_data *) data;
-	datap->err = host_unlink(datap->idx, datap->path);
+	struct unlink_thread_data *datap = (struct unlink_thread_data *) data;
+	datap->err = serv_unlink(datap->idx, datap->path);
 	datap->err ? pthread_exit((void *) -1) : pthread_exit((void *) 0);
 }
 
@@ -2970,10 +2508,8 @@ struct unlink_pre_data {
 static void unlink_pre_func(void *t_dat, void *p_dat,
 							idx_item_t item)
 {
-	struct unlink_thread_data *tp
-		= (struct unlink_thread_data *) t_dat;
-	struct unlink_pre_data *pp
-		= (struct unlink_pre_data *) p_dat;
+	struct unlink_thread_data *tp = (struct unlink_thread_data *) t_dat;
+	struct unlink_pre_data *pp = (struct unlink_pre_data *) p_dat;
 	tp->idx = item->idx,
 	tp->path = pp->path,
 	tp->err = 0;
@@ -2981,31 +2517,23 @@ static void unlink_pre_func(void *t_dat, void *p_dat,
 
 static int sshfsm_unlink(const char *path)
 {
-	/* fakelink workaround */
-	if (sshfsm.fakelink_workaround) {
-		if (!fakelink_remove(path))
-			return 0;
-	}
-
-	if (sshfsm.hosts_num == 1)
-		return host_unlink(sshfsm.idx_0, path);
+	if (sshfsm.serv_arr->len == 1)
+		return serv_unlink(0, path);
 	
 	int r_flag = 0;
 	idx_list_t idx_list = table_lookup_r(path, &r_flag);
 	struct unlink_pre_data pre_data;
 	pre_data.path = path;
-	int err = processing_by_threads(idx_list, 
-				unlink_thread_func,
+	int err = processing_by_threads(idx_list, unlink_thread_func,
 				sizeof(struct unlink_thread_data),
-				unlink_pre_func, &pre_data,
-				NULL, NULL);
+				unlink_pre_func, &pre_data, NULL, NULL);
 	if (err)
 		return err;
 	table_remove(path);
 	return 0;
 }
 
-static int host_rmdir(const int idx, const char *path)
+static int serv_rmdir(const int idx, const char *path)
 {
 	int err;
 	struct buffer buf;
@@ -3024,9 +2552,8 @@ struct rmdir_thread_data {
 
 static void * rmdir_thread_func(void *data)
 {
-	struct rmdir_thread_data *datap
-		= (struct rmdir_thread_data *) data;
-	datap->err = host_rmdir(datap->idx, datap->path);
+	struct rmdir_thread_data *datap = (struct rmdir_thread_data *) data;
+	datap->err = serv_rmdir(datap->idx, datap->path);
 	datap->err ? pthread_exit((void *) -1) : pthread_exit((void *) 0);
 }
 
@@ -3037,10 +2564,8 @@ struct rmdir_pre_data {
 static void rmdir_pre_func(void *t_dat, void *p_dat,
 						   idx_item_t item)
 {
-	struct rmdir_thread_data *tp
-		= (struct rmdir_thread_data *) t_dat;
-	struct rmdir_pre_data *pp
-		= (struct rmdir_pre_data *) p_dat;
+	struct rmdir_thread_data *tp = (struct rmdir_thread_data *) t_dat;
+	struct rmdir_pre_data *pp = (struct rmdir_pre_data *) p_dat;
 	tp->idx = item->idx,
 	tp->path = pp->path,
 	tp->err = 0;
@@ -3048,25 +2573,23 @@ static void rmdir_pre_func(void *t_dat, void *p_dat,
 
 static int sshfsm_rmdir(const char *path)
 {
-	if (sshfsm.hosts_num == 1)
-		return host_rmdir(sshfsm.idx_0, path);
+	if (sshfsm.serv_arr->len == 1)
+		return serv_rmdir(0, path);
 	
 	int r_flag = 0;
 	idx_list_t idx_list = table_lookup_r(path, &r_flag);
 	struct rmdir_pre_data pre_data;
 	pre_data.path = path;
-	int err = processing_by_threads(idx_list, 
-				rmdir_thread_func,
+	int err = processing_by_threads(idx_list, rmdir_thread_func,
 				sizeof(struct rmdir_thread_data),
-				rmdir_pre_func, &pre_data,
-				NULL, NULL);
+				rmdir_pre_func, &pre_data, NULL, NULL);
 	if (err)
 		return err;
 	table_remove(path);
 	return 0;
 }
 
-static int host_do_rename(const int idx, const char *from, const char *to)
+static int serv_do_rename(const int idx, const char *from, const char *to)
 {
 	int err;
 	struct buffer buf;
@@ -3078,7 +2601,8 @@ static int host_do_rename(const int idx, const char *from, const char *to)
 	return err;
 }
 
-static int host_ext_posix_rename(const int idx, const char *from, const char *to)
+static int serv_ext_posix_rename(const int idx, const char *from, 
+								const char *to)
 {
 	int err;
 	struct buffer buf;
@@ -3099,13 +2623,13 @@ static void random_string(char *str, int length)
 	*str = '\0';
 }
 
-static int host_rename(const int idx, const char *from, const char *to)
+static int serv_rename(const int idx, const char *from, const char *to)
 {
 	int err;
 	if (sshfsm.ext_posix_rename)
-		err = host_ext_posix_rename(idx, from, to);
+		err = serv_ext_posix_rename(idx, from, to);
 	else
-		err = host_do_rename(idx, from, to);
+		err = serv_do_rename(idx, from, to);
 	if (err == -EPERM && sshfsm.rename_workaround) {
 		size_t tolen = strlen(to);
 		if (tolen + RENAME_TEMP_CHARS < PATH_MAX) {
@@ -3113,13 +2637,13 @@ static int host_rename(const int idx, const char *from, const char *to)
 			char totmp[PATH_MAX];
 			strcpy(totmp, to);
 			random_string(totmp + tolen, RENAME_TEMP_CHARS);
-			tmperr = host_do_rename(idx, to, totmp);
+			tmperr = serv_do_rename(idx, to, totmp);
 			if (!tmperr) {
-				err = host_do_rename(idx, from, to);
+				err = serv_do_rename(idx, from, to);
 				if (!err)
-					err = host_unlink(idx, totmp);
+					err = serv_unlink(idx, totmp);
 				else
-					host_do_rename(idx, totmp, to);
+					serv_do_rename(idx, totmp, to);
 			}
 		}
 	}
@@ -3128,21 +2652,21 @@ static int host_rename(const int idx, const char *from, const char *to)
 
 static int sshfsm_rename(const char *from, const char *to)
 {
-	if (sshfsm.hosts_num == 1)
-		return host_rename(sshfsm.idx_0, from, to);
+	if (sshfsm.serv_arr->len == 1)
+		return serv_rename(0, from, to);
 	
 	int r_flag = 0;
 	idx_list_t list = table_lookup_r(from, &r_flag);
 	struct idx_item *item = NULL;
+	struct serv *servp;
 	int err = 0;
 	int err2 = -INT_MAX;
 	while (list) {
 		item = (struct idx_item *) list->data;
-		err = host_rename(item->idx, from, to);
+		servp = serv_arr_index(item->idx);
+		err = serv_rename(item->idx, from, to);
 		DEBUG("  op:rename(err: %d, from: %s, to: %s, host: %s:%s)\n", 
-			  err, from, to, 
-			  sshfsm.hosts[item->idx]->hostname,
-			  sshfsm.hosts[item->idx]->basepath);
+			  err, from, to, servp->hostname, servp->base_path);
 		if (!err)
 			break;
 		err2 = err2 < err ? err : err2;
@@ -3153,7 +2677,7 @@ static int sshfsm_rename(const char *from, const char *to)
 	return err;
 }
 
-static int host_chmod(const int idx, const char *path, mode_t mode)
+static int serv_chmod(const int idx, const char *path, mode_t mode)
 {
 	int err;
 	struct buffer buf;
@@ -3161,34 +2685,27 @@ static int host_chmod(const int idx, const char *path, mode_t mode)
 	buf_add_path(idx, &buf, path);
 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_PERMISSIONS);
 	buf_add_uint32(&buf, mode);
-	err = sftp_request(idx,SSH_FXP_SETSTAT, &buf, SSH_FXP_STATUS, NULL);
+	err = sftp_request(idx, SSH_FXP_SETSTAT, &buf, SSH_FXP_STATUS, NULL);
 	buf_free(&buf);
 	return err;
 }
 
 static int sshfsm_chmod(const char *path, mode_t mode)
 {
-	/* fakelink workaround */
-	if (sshfsm.fakelink_workaround) {
-		fakelink_t alias = fakelink_lookup(path);
-		if (alias)
-			return host_chmod(alias->idx, alias->name, mode);
-	}
-
-	if (sshfsm.hosts_num == 1)
-		return host_chmod(sshfsm.idx_0, path, mode);
+	if (sshfsm.serv_arr->len == 1)
+		return serv_chmod(0, path, mode);
 	
 	int r_flag = 0;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
+	struct serv *servp;
 	int err = 0;
 	while (list) {
 		item = (struct idx_item *) list->data;
-		err = host_chmod(item->idx, path, mode);
+		servp = serv_arr_index(item->idx);
+		err = serv_chmod(item->idx, path, mode);
 		DEBUG("  op:chmod(err: %d, path: %s, host: %s:%s)\n", 
-			  err, path, 
-			  sshfsm.hosts[item->idx]->hostname,
-			  sshfsm.hosts[item->idx]->basepath);
+			  err, path, servp->hostname, servp->base_path);
 		if (!err)
 			break;
 		list = list->next;
@@ -3196,7 +2713,7 @@ static int sshfsm_chmod(const char *path, mode_t mode)
 	return err;
 }
 
-static int host_chown(const int idx, const char *path, uid_t uid, gid_t gid)
+static int serv_chown(const int idx, const char *path, uid_t uid, gid_t gid)
 {
 	int err;
 	struct buffer buf;
@@ -3209,30 +2726,24 @@ static int host_chown(const int idx, const char *path, uid_t uid, gid_t gid)
 	buf_free(&buf);
 	return err;
 }
+
 static int sshfsm_chown(const char *path, uid_t uid, gid_t gid)
 {
-	/* fakelink workaround */
-	if (sshfsm.fakelink_workaround) {
-		fakelink_t alias = fakelink_lookup(path);
-		if (alias)
-			return host_chown(alias->idx, alias->name, uid, gid);
-	}
-
-	if (sshfsm.hosts_num == 1)
-		return host_chown(sshfsm.idx_0, path, uid, gid);
+	if (sshfsm.serv_arr->len == 1)
+		return serv_chown(0, path, uid, gid);
 	
 	int r_flag = 0;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
+	struct serv *servp;
 	int err = 0;
 	int err2 = 0;
 	while (list) {
 		item = (struct idx_item *) list->data;
-		err = host_chown(item->idx, path, uid, gid);
+		servp = serv_arr_index(item->idx);
+		err = serv_chown(item->idx, path, uid, gid);
 		DEBUG("  op:chown(err: %d, path: %s, host: %s:%s)\n", 
-			  err, path, 
-			  sshfsm.hosts[item->idx]->hostname,
-			  sshfsm.hosts[item->idx]->basepath);
+			  err, path, servp->hostname, servp->base_path);
 		if (!err)
 			break;
 		err2 = err < err2 ? err : err2;
@@ -3242,17 +2753,18 @@ static int sshfsm_chown(const char *path, uid_t uid, gid_t gid)
 	return err;
 }
 
-static int host_truncate_workaround(const int idx, const char *path, off_t size,
-                                     struct fuse_file_info *fi);
+static int serv_truncate_workaround(const int idx, const char *path, 
+								   off_t size, struct fuse_file_info *fi);
 
-static int host_truncate(const int idx, const char *path, off_t size)
+static int serv_truncate(const int idx, const char *path, off_t size)
 {
 	int err;
 	struct buffer buf;
+	struct serv *servp = serv_arr_index(idx);
 
-	sshfsm.hosts[idx]->modifver ++;
+	servp->modifver ++;
 	if (size == 0 || sshfsm.truncate_workaround)
-		return host_truncate_workaround(idx, path, size, NULL);
+		return serv_truncate_workaround(idx, path, size, NULL);
 
 	buf_init(&buf, 0);
 	buf_add_path(idx, &buf, path);
@@ -3265,27 +2777,20 @@ static int host_truncate(const int idx, const char *path, off_t size)
 
 static int sshfsm_truncate(const char *path, off_t size)
 {
-	/* fakelink workaround */
-	if (sshfsm.fakelink_workaround) {
-		fakelink_t alias = fakelink_lookup(path);
-		if (alias)
-			return host_truncate(alias->idx, alias->name, size);
-	}
-
-	if (sshfsm.hosts_num == 1)
-		return host_truncate(sshfsm.idx_0, path, size);
+	if (sshfsm.serv_arr->len == 1)
+		return serv_truncate(0, path, size);
 	
 	int r_flag = 0;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
+	struct serv *servp;
 	int err = 0;
 	while (list) {
 		item = (struct idx_item *) list->data;
-		err = host_truncate(item->idx, path, size);
+		servp = serv_arr_index(item->idx);
+		err = serv_truncate(item->idx, path, size);
 		DEBUG("  op:truncate(err: %d, path: %s, host: %s:%s)\n", 
-			  err, path, 
-			  sshfsm.hosts[item->idx]->hostname,
-			  sshfsm.hosts[item->idx]->basepath);
+			  err, path, servp->hostname, servp->base_path);
 		if (!err)
 			break;
 		list = list->next;
@@ -3293,7 +2798,7 @@ static int sshfsm_truncate(const char *path, off_t size)
 	return err;
 }
 
-static int host_utime(const int idx, const char *path, struct utimbuf *ubuf)
+static int serv_utime(const int idx, const char *path, struct utimbuf *ubuf)
 {
 	int err;
 	struct buffer buf;
@@ -3309,27 +2814,20 @@ static int host_utime(const int idx, const char *path, struct utimbuf *ubuf)
 
 static int sshfsm_utime(const char *path, struct utimbuf *ubuf)
 {
-	/* fakelink workaround */
-	if (sshfsm.fakelink_workaround) {
-		fakelink_t alias = fakelink_lookup(path);
-		if (alias)
-			return host_utime(alias->idx, alias->name, ubuf);
-	}
-
-	if (sshfsm.hosts_num == 1)
-		return host_utime(sshfsm.idx_0, path, ubuf);
+	if (sshfsm.serv_arr->len == 1)
+		return serv_utime(0, path, ubuf);
 	
 	int r_flag = 0;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
+	struct serv *servp;
 	int err = 0;
 	while (list) {
 		item = (struct idx_item *) list->data;
-		err = host_utime(item->idx, path, ubuf);
+		servp = serv_arr_index(item->idx);
+		err = serv_utime(item->idx, path, ubuf);
 		DEBUG("  op:utime(err: %d, path: %s, host: %s:%s)\n", 
-			  err, path, 
-			  sshfsm.hosts[item->idx]->hostname,
-			  sshfsm.hosts[item->idx]->basepath);
+			  err, path, servp->hostname, servp->base_path);
 		if (!err)
 			break;
 		list = list->next;
@@ -3337,13 +2835,14 @@ static int sshfsm_utime(const char *path, struct utimbuf *ubuf)
 	return err;
 }
 
-static inline int sshfsm_file_is_conn(const int idx, struct sshfsm_file *sf)
+static inline int serv_file_is_conn(struct sshfsm_file *sf)
 {
-	return sf->connver == sshfsm.hosts[idx]->connver;
+	struct serv *servp = serv_arr_index(sf->serv_idx);
+	return sf->connver == servp->connver;
 }
 
-static int host_open_common(const int idx, const char *path, mode_t mode,
-                             struct fuse_file_info *fi)
+static int serv_open_common(const int idx, const char *path, mode_t mode,
+                           struct fuse_file_info *fi)
 {
 	int err;
 	int err2;
@@ -3355,7 +2854,8 @@ static int host_open_common(const int idx, const char *path, mode_t mode,
 	uint32_t pflags = 0;
 	struct iovec iov;
 	uint8_t type;
-	struct host *hostp = sshfsm.hosts[idx];
+	uint64_t wrctr = cache_get_write_ctr(); /* TODO: figure out what */
+	struct serv *servp = serv_arr_index(idx);
 
 	if ((fi->flags & O_ACCMODE) == O_RDONLY)
 		pflags = SSH_FXF_READ;
@@ -3382,9 +2882,9 @@ static int host_open_common(const int idx, const char *path, mode_t mode,
 	sf->is_seq = 0;
 	sf->refs = 1;
 	sf->next_pos = 0;
-	sf->host_idx = idx;
-	sf->modifver= hostp->modifver;
-	sf->connver = hostp->connver;
+	sf->serv_idx = idx;
+	sf->modifver= servp->modifver;
+	sf->connver = servp->connver;
 	buf_init(&buf, 0);
 	buf_add_path(idx, &buf, path);
 	buf_add_uint32(&buf, pflags);
@@ -3411,7 +2911,7 @@ static int host_open_common(const int idx, const char *path, mode_t mode,
 	}
 
 	if (!err) {
-		cache_add_attr(path, &stbuf);
+		cache_add_attr(path, &stbuf, wrctr);
 		buf_finish(&sf->handle);
 		fi->fh = (unsigned long) sf;
 	} else {
@@ -3424,27 +2924,20 @@ static int host_open_common(const int idx, const char *path, mode_t mode,
 
 static int sshfsm_open(const char *path, struct fuse_file_info *fi)
 {
-	/* fakelink workaround */
-	if (sshfsm.fakelink_workaround) {
-		fakelink_t alias = fakelink_lookup(path);
-		if (alias)
-			return host_open_common(alias->idx, alias->name, 0, fi);
-	}
-
-	if (sshfsm.hosts_num == 1)
-		return host_open_common(sshfsm.idx_0, path, 0, fi);
+	if (sshfsm.serv_arr->len == 1)
+		return serv_open_common(0, path, 0, fi);
 	
 	int r_flag = 1;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
+	struct serv *servp;
 	int err = 0;
 	while (list) {
 		item = (struct idx_item *) list->data;
-		err = host_open_common(item->idx, path, 0, fi);
+		servp = serv_arr_index(item->idx);
+		err = serv_open_common(item->idx, path, 0, fi);
 		DEBUG("  op:open(err: %d, path: %s, host: %s:%s)\n", 
-			  err, path, 
-			  sshfsm.hosts[item->idx]->hostname,
-			  sshfsm.hosts[item->idx]->basepath);
+			  err, path, servp->hostname, servp->base_path);
 		if (!err)
 			break;
 		list = list->next;
@@ -3463,28 +2956,27 @@ static int sshfsm_flush(const char *path, struct fuse_file_info *fi)
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
 	struct list_head write_reqs;
 	struct list_head *curr_list;
-	int idx = sf->host_idx;
-	struct host *hostp = sshfsm.hosts[idx];
+	struct serv *servp = serv_arr_index(sf->serv_idx);
 
-	if (!sshfsm_file_is_conn(idx, sf))
+	if (!serv_file_is_conn(sf))
 		return -EIO;
 
 	if (sshfsm.sync_write)
 		return 0;
 
 	(void) path;
-	pthread_mutex_lock(&hostp->lock);
+	pthread_mutex_lock(&servp->lock);
 	if (!list_empty(&sf->write_reqs)) {
 		curr_list = sf->write_reqs.prev;
 		list_del(&sf->write_reqs);
 		list_init(&sf->write_reqs);
 		list_add(&write_reqs, curr_list);
 		while (!list_empty(&write_reqs))
-			pthread_cond_wait(&sf->write_finished, &hostp->lock);
+			pthread_cond_wait(&sf->write_finished, &servp->lock);
 	}
 	err = sf->write_error;
 	sf->write_error = 0;
-	pthread_mutex_unlock(&hostp->lock);
+	pthread_mutex_unlock(&servp->lock);
 	return err;
 }
 
@@ -3511,8 +3003,8 @@ static int sshfsm_release(const char *path, struct fuse_file_info *fi)
 {
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
 	struct buffer *handle = &sf->handle;
-	int idx = sf->host_idx;
-	if (sshfsm_file_is_conn(idx, sf)) {
+	int idx = sf->serv_idx;
+	if (serv_file_is_conn(sf)) {
 		sshfsm_flush(path, fi);
 		sftp_request(idx, SSH_FXP_CLOSE, handle, 0, NULL);
 	}
@@ -3529,7 +3021,7 @@ static int sshfsm_sync_read(struct sshfsm_file *sf, char *rbuf, size_t size,
 	struct buffer buf;
 	struct buffer data;
 	struct buffer *handle = &sf->handle;
-	int idx = sf->host_idx;
+	int idx = sf->serv_idx;
 	buf_init(&buf, 0);
 	buf_add_buf(&buf, handle);
 	buf_add_uint64(&buf, offset);
@@ -3599,7 +3091,7 @@ static void sshfsm_send_async_read(struct sshfsm_file *sf,
 	struct buffer buf;
 	struct buffer *handle = &sf->handle;
 	struct iovec iov;
-	int idx = sf->host_idx;
+	int idx = sf->serv_idx;
 
 	buf_init(&buf, 0);
 	buf_add_buf(&buf, handle);
@@ -3607,7 +3099,7 @@ static void sshfsm_send_async_read(struct sshfsm_file *sf,
 	buf_add_uint32(&buf, chunk->size);
 	buf_to_iov(&buf, &iov);
 	sftp_request_send(idx, SSH_FXP_READ, &iov, 1, sshfsm_read_begin,
-			  		  sshfsm_read_end, 0, chunk, NULL);
+			  		 sshfsm_read_end, 0, chunk, NULL);
 	buf_free(&buf);
 }
 
@@ -3615,23 +3107,23 @@ static void submit_read(struct sshfsm_file *sf, size_t size, off_t offset,
                         struct read_chunk **chunkp)
 {
 	struct read_chunk *chunk = g_new0(struct read_chunk, 1);
-	struct host *hostp = sshfsm.hosts[sf->host_idx];
+	struct serv *servp = serv_arr_index(sf->serv_idx);
 
 	sem_init(&chunk->ready, 0, 0);
 	buf_init(&chunk->data, 0);
 	chunk->offset = offset;
 	chunk->size = size;
 	chunk->refs = 1;
-	chunk->modifver = hostp->modifver;
+	chunk->modifver = servp->modifver;
 	sshfsm_send_async_read(sf, chunk);
-	pthread_mutex_lock(&hostp->lock);
+	pthread_mutex_lock(&servp->lock);
 	chunk_put(*chunkp);
 	*chunkp = chunk;
-	pthread_mutex_unlock(&hostp->lock);
+	pthread_mutex_unlock(&servp->lock);
 }
 
-static int wait_chunk(const int idx, struct read_chunk *chunk, 
-					  char *buf, size_t size)
+static int wait_chunk(const int idx, struct read_chunk *chunk, char *buf,
+					 size_t size)
 {
 	int res;
 	while (sem_wait(&chunk->ready));
@@ -3652,8 +3144,8 @@ static int wait_chunk(const int idx, struct read_chunk *chunk,
 static struct read_chunk *search_read_chunk(struct sshfsm_file *sf, off_t offset)
 {
 	struct read_chunk *ch = sf->readahead;
-	if (ch && ch->offset == offset && 
-		ch->modifver == sshfsm.hosts[sf->host_idx]->modifver) {
+	struct serv *servp = serv_arr_index(sf->serv_idx);
+	if (ch && ch->offset == offset && ch->modifver == servp->modifver) {
 		ch->refs++;
 		return ch;
 	} else
@@ -3669,16 +3161,16 @@ static int sshfsm_async_read(struct sshfsm_file *sf, char *rbuf, size_t size,
 	struct read_chunk *chunk_prev = NULL;
 	size_t origsize = size;
 	int curr_is_seq;
-	int idx = sf->host_idx;
-	struct host *hostp = sshfsm.hosts[idx];
+	int idx = sf->serv_idx;
+	struct serv *servp = serv_arr_index(idx);
 
-	pthread_mutex_lock(&hostp->lock);
+	pthread_mutex_lock(&servp->lock);
 	curr_is_seq = sf->is_seq;
-	sf->is_seq = (sf->next_pos == offset && sf->modifver == hostp->modifver);
+	sf->is_seq = (sf->next_pos == offset && sf->modifver == servp->modifver);
 	sf->next_pos = offset + size;
-	sf->modifver = hostp->modifver;
+	sf->modifver = servp->modifver;
 	chunk = search_read_chunk(sf, offset);
-	pthread_mutex_unlock(&hostp->lock);
+	pthread_mutex_unlock(&servp->lock);
 
 	if (chunk && chunk->size < size) {
 		chunk_prev = chunk;
@@ -3708,17 +3200,17 @@ static int sshfsm_async_read(struct sshfsm_file *sf, char *rbuf, size_t size,
 		total += res;
 	if (res < 0)
 		return res;
+
 	return total;
 }
 
-static int sshfsm_read(const char *path, char *rbuf, size_t size, 
-					   off_t offset, struct fuse_file_info *fi)
+static int sshfsm_read(const char *path, char *rbuf, size_t size, off_t offset,
+                      struct fuse_file_info *fi)
 {
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
-	int idx = sf->host_idx;
 	(void) path;
 
-	if (!sshfsm_file_is_conn(idx, sf))
+	if (!serv_file_is_conn(sf))
 		return -EIO;
 
 	if (sshfsm.sync_read)
@@ -3763,15 +3255,15 @@ static int sshfsm_write(const char *path, const char *wbuf, size_t size,
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
 	struct buffer *handle = &sf->handle;
 	struct iovec iov[2];
-	int idx = sf->host_idx;
-	struct host *hostp = sshfsm.hosts[idx];
+	int idx = sf->serv_idx;
+	struct serv *servp = serv_arr_index(idx);
 
 	(void) path;
 
-	if (!sshfsm_file_is_conn(idx, sf))
+	if (!serv_file_is_conn(sf))
 		return -EIO;
 
-	hostp->modifver ++;
+	servp->modifver ++;
 	buf_init(&buf, 0);
 	buf_add_buf(&buf, handle);
 	buf_add_uint64(&buf, offset);
@@ -3791,7 +3283,8 @@ static int sshfsm_write(const char *path, const char *wbuf, size_t size,
 	return err ? err : (int) size;
 }
 
-static int host_ext_statvfs(const int idx, const char *path, struct statvfs *stbuf)
+static int serv_ext_statvfs(const int idx, const char *path, 
+						   struct statvfs *stbuf)
 {
 	int err;
 	struct buffer buf;
@@ -3812,10 +3305,11 @@ static int host_ext_statvfs(const int idx, const char *path, struct statvfs *stb
 
 static int sshfsm_ext_statvfs(const char *path, struct statvfs *stbuf)
 {
+	if (sshfsm.serv_arr->len == 1)
+		return serv_ext_statvfs(0, path, stbuf);
 	/* TODO: add up all vfs info */
-	return host_ext_statvfs(sshfsm.idx_0, path, stbuf);
+	return 0;
 }
-
 
 #if FUSE_VERSION >= 25
 static int sshfsm_statfs(const char *path, struct statvfs *buf)
@@ -3868,17 +3362,20 @@ static int sshfsm_statfs(const char *path, struct statfs *buf)
 static int sshfsm_create(const char *path, mode_t mode,
                         struct fuse_file_info *fi)
 {
+	if (sshfsm.serv_arr->len == 1)
+		return serv_open_common(0, path, mode, fi);
+	
 	int r_flag = 1;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
+	struct serv *servp;
 	int err = 0;
 	while (list) {
 		item = (struct idx_item *) list->data;
-		err = host_open_common(item->idx, path, mode, fi);
+		servp = serv_arr_index(item->idx);
+		err = serv_open_common(item->idx, path, mode, fi);
 		DEBUG("  op:create(err: %d, path: %s, host: %s:%s)\n", 
-			  err, path, 
-			  sshfsm.hosts[item->idx]->hostname,
-			  sshfsm.hosts[item->idx]->basepath);
+			  err, path, servp->hostname, servp->base_path);
 		if (!err)
 			break;
 		list = list->next;
@@ -3895,17 +3392,17 @@ static int sshfsm_ftruncate(const char *path, off_t size,
 	int err;
 	struct buffer buf;
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
-	int idx = sf->host_idx;
-	struct host *hostp = sshfsm.hosts[idx];
+	int idx = sf->serv_idx;
+	struct serv *servp = serv_arr_index(idx);
 
 	(void) path;
 
-	if (!sshfsm_file_is_conn(idx, sf))
+	if (!serv_file_is_conn(sf))
 		return -EIO;
 
-	hostp->modifver ++;
+	servp->modifver ++;
 	if (sshfsm.truncate_workaround)
-		return host_truncate_workaround(idx, path, size, fi);
+		return serv_truncate_workaround(idx, path, size, fi);
 
 	buf_init(&buf, 0);
 	buf_add_buf(&buf, &sf->handle);
@@ -3919,17 +3416,17 @@ static int sshfsm_ftruncate(const char *path, off_t size,
 #endif
 
 static int sshfsm_fgetattr(const char *path, struct stat *stbuf,
-			  struct fuse_file_info *fi)
+			  			  struct fuse_file_info *fi)
 {
 	int err;
 	struct buffer buf;
 	struct buffer outbuf;
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
-	int idx = sf->host_idx;
+	int idx = sf->serv_idx;
 
 	(void) path;
 
-	if (!sshfsm_file_is_conn(idx, sf))
+	if (!serv_file_is_conn(sf))
 		return -EIO;
 
 	buf_init(&buf, 0);
@@ -3944,13 +3441,13 @@ static int sshfsm_fgetattr(const char *path, struct stat *stbuf,
 	return err;
 }
 
-static int host_truncate_zero(const int idx, const char *path)
+static int serv_truncate_zero(const int idx, const char *path)
 {
 	int err;
 	struct fuse_file_info fi;
 
 	fi.flags = O_WRONLY | O_TRUNC;
-	err = host_open_common(idx, path, 0, &fi);
+	err = serv_open_common(idx, path, 0, &fi);
 	if (!err)
 		sshfsm_release(path, &fi);
 
@@ -3962,7 +3459,7 @@ static size_t calc_buf_size(off_t size, off_t offset)
 	return offset + sshfsm.max_read < size ? sshfsm.max_read : size - offset;
 }
 
-static int host_truncate_shrink(const int idx, const char *path, off_t size)
+static int serv_truncate_shrink(const int idx, const char *path, off_t size)
 {
 	int res;
 	char *data;
@@ -3974,7 +3471,7 @@ static int host_truncate_shrink(const int idx, const char *path, off_t size)
 		return -ENOMEM;
 
 	fi.flags = O_RDONLY;
-	res = host_open_common(idx, path, 0, &fi);
+	res = serv_open_common(idx, path, 0, &fi);
 	if (res)
 		goto out;
 
@@ -3989,7 +3486,7 @@ static int host_truncate_shrink(const int idx, const char *path, off_t size)
 		goto out;
 
 	fi.flags = O_WRONLY | O_TRUNC;
-	res = host_open_common(idx, path, 0, &fi);
+	res = serv_open_common(idx, path, 0, &fi);
 	if (res)
 		goto out;
 
@@ -4008,8 +3505,8 @@ out:
 	return res;
 }
 
-static int host_truncate_extend(const int idx, const char *path, off_t size,
-                                struct fuse_file_info *fi)
+static int serv_truncate_extend(const int idx, const char *path, off_t size,
+                               struct fuse_file_info *fi)
 {
 	int res;
 	char c = 0;
@@ -4018,7 +3515,7 @@ static int host_truncate_extend(const int idx, const char *path, off_t size,
 	if (!fi) {
 		openfi = &tmpfi;
 		openfi->flags = O_WRONLY;
-		res = host_open_common(idx, path, 0, openfi);
+		res = serv_open_common(idx, path, 0, openfi);
 		if (res)
 			return res;
 	}
@@ -4043,62 +3540,113 @@ static int host_truncate_extend(const int idx, const char *path, off_t size,
  * If new size is greater than current size, then write a zero byte to
  * the new end of the file.
  */
-static int host_truncate_workaround(const int idx, const char *path, 
-									off_t size, struct fuse_file_info *fi)
+static int serv_truncate_workaround(const int idx, const char *path,
+								   off_t size, struct fuse_file_info *fi)
 {
 	if (size == 0)
-		return host_truncate_zero(idx, path);
+		return serv_truncate_zero(idx, path);
 	else {
 		struct stat stbuf;
 		int err;
 		if (fi)
 			err = sshfsm_fgetattr(path, &stbuf, fi);
 		else
-			err = host_getattr(idx, path, &stbuf);
+			err = serv_getattr(idx, path, &stbuf);
 		if (err)
 			return err;
 		if (stbuf.st_size == size)
 			return 0;
 		else if (stbuf.st_size > size)
-			return host_truncate_shrink(idx, path, size);
+			return serv_truncate_shrink(idx, path, size);
 		else
-			return host_truncate_extend(idx, path, size, fi);
+			return serv_truncate_extend(idx, path, size, fi);
 	}
 }
 
-static int processing_init(void)
+static int processing_init(void)	/* TODO */
 {
-	struct host *hostp;
-	int i;
-	signal(SIGPIPE, SIG_IGN); /* TOASK */
-
-	for (i = 0; i < sshfsm.hosts_num; i++) {	/* TODO: thread? */
-		hostp = sshfsm.hosts[i];
-		pthread_mutex_init(&hostp->lock, NULL);
-		pthread_mutex_init(&hostp->lock_write, NULL);
-		pthread_cond_init(&hostp->outstanding_cond, NULL);
-		hostp->connver = 0;
-		hostp->processing_thread_started = 0;
-		if (hostp->rank == -1)
-			hostp->rank = i * sshfsm.rank_interval;
-		hostp->fd = -1;
-		hostp->ptyfd = -1;
-		hostp->ptyslavefd = -1;
-		hostp->reqtab = g_hash_table_new(NULL, NULL);
-		if (!hostp->reqtab) {
+	struct serv *servp;
+	signal(SIGPIPE, SIG_IGN);
+	
+	unsigned int i;
+	for (i = 0; i < sshfsm.serv_arr->len; i++) {
+		servp = serv_arr_index(i);
+		pthread_mutex_init(&servp->lock, NULL);
+		pthread_mutex_init(&servp->lock_write, NULL);
+		pthread_cond_init(&servp->outstanding_cond, NULL);
+		servp->reqtab = g_hash_table_new(NULL, NULL);
+		if (!servp->reqtab) {
 			fprintf(stderr, "failed to create hash table\n");
 			return -1;
 		}
+		servp->connver = 0;
+		servp->processing_thread_started = 0;
+		servp->fd = -1;
+		servp->ptyfd = -1;
+		servp->ptyslavefd = -1;
 	}
-	pthread_mutex_init(&sshfsm.lock_hosts, NULL);
+	pthread_mutex_init(&sshfsm.lock_serv_arr, NULL);
+	return 0;
+}
 
-	/* fake link workaround init */
-	if (sshfsm.fakelink_workaround) {
-		int err = fakelink_cache_init();
-		if (err)
-			return err;
+static void * sftp_server_thread_func(void *data)
+{
+	int *idxp = (int *) data;
+	if (connect_remote(*idxp) == -1)
+		pthread_exit((void *) -1);
+	sftp_detect_uid(*idxp);
+	if (!sshfsm.no_check_root && sftp_check_root(*idxp) == -1)
+		pthread_exit((void *) -1);
+	pthread_exit((void *) 0);
+}
+
+static int sftp_servers_init()
+{
+	if (sshfsm.serv_arr->len == 1) {
+		if (connect_remote(0) == -1)
+			return -1;
+		if (sshfsm.detect_uid)
+			sftp_detect_uid(0);
+		if (!sshfsm.no_check_root && sftp_check_root(0) == -1)
+			return -1;
+		return 0;
+	}
+	
+	pthread_t *threads;
+	pthread_attr_t attr;
+	int thread_num = sshfsm.serv_arr->len;
+	
+	int *idxs = g_new(int, thread_num);
+	threads = g_new(pthread_t, thread_num);
+	
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+	int err, i;
+	for (i = 0; i < thread_num; i++) {
+		idxs[i] = i;
+		err = pthread_create(&threads[i], &attr, 
+				sftp_server_thread_func, &idxs[i]);
+		if (err) {
+			fprintf(stderr, "create thread failed: %s\n", strerror(err));
+			return -1;
+		}
 	}
 
+	int retval;
+	for (i = 0; i < thread_num; i++) {
+		err = pthread_join(threads[i], (void *) &retval);
+		if (err) {
+			fprintf(stderr, "join thread failed: %s\n", strerror(err));
+			return -1;
+		}
+		if (retval != 0) {
+			struct serv *servp = serv_arr_index(i);
+			DEBUG("start server %s failed\n", servp->hostname);
+		}
+	}
+	pthread_attr_destroy(&attr);
+	g_free(idxs);
+	g_free(threads);
 	return 0;
 }
 
@@ -4107,11 +3655,14 @@ static int table_init()
 	if (table_create(sshfsm.debug) == -1)
 		return -1;
 	
-	int i;
-	for (i = 0; i < sshfsm.hosts_num; i++) {
-		struct host *hostp = sshfsm.hosts[i];
-		if (hostp->fd != -1)
-			table_insert("/", i, hostp->rank);
+	unsigned int i;
+	struct serv *servp;
+	for (i = 0; i < sshfsm.serv_arr->len; i++) {
+		servp = serv_arr_index(i);
+		fprintf(stderr, "servp->fd: %d\n", servp->fd);
+		if (servp->fd != -1) {
+			table_insert("/", i, servp->rank);
+		}
 	}
 	return 0;
 }
@@ -4129,7 +3680,6 @@ static struct fuse_cache_operations sshfsm_oper = {
 		.mknod      = sshfsm_mknod,
 		.mkdir      = sshfsm_mkdir,
 		.symlink    = sshfsm_symlink,
-		.link		= sshfsm_fakelink,  /* wait for SFTP-6 */
 		.unlink     = sshfsm_unlink,
 		.rmdir      = sshfsm_rmdir,
 		.rename     = sshfsm_rename,
@@ -4166,6 +3716,7 @@ static void usage(const char *progname)
 "SSHFSM options:\n"
 "    -p PORT                equivalent to '-o port=PORT'\n"
 "    -C                     equivalent to '-o compression=yes'\n"
+"    -F ssh_configfile      specifies alternative ssh configuration file\n"
 "    -1                     equivalent to '-o ssh_protocol=1'\n"
 "    -o reconnect           reconnect to server\n"
 "    -o sshfsm_sync         synchronous writes\n"
@@ -4184,7 +3735,6 @@ static void usage(const char *progname)
 "             [no]nodelaysrv   set nodelay tcp flag in sshd (default: off)\n"
 "             [no]truncate     fix truncate for old servers (default: off)\n"
 "             [no]buflimit     fix buffer fillup bug in server (default: on)\n"
-"             [no]fakelink     implement link as symbol link (default: off)\n"
 "    -o idmap=TYPE          user/group ID mapping, possible types are:\n"
 "             none             no translation of the ID space (default)\n"
 "             user             only translate UID of connecting user\n"
@@ -4197,12 +3747,6 @@ static void usage(const char *progname)
 "    -o no_check_root       don't check for existence of 'dir' on server\n"
 "    -o password_stdin      read password from stdin (only for pam_mount!)\n"
 "    -o SSHOPT=VAL          ssh options (see man ssh_config)\n"
-"\n"
-"SSHFSM operation options and commands:\n"
-"    -o oper=YESNO          enable operation {yes,no} (default: yes)\n"
-"    -o op_server=SERV      operation server (default: localhost)\n"
-"    -o op_port=PORT        operation server port (default: 10000)\n"
-"    -c where PATH          query real file location\n"
 "\n", progname);
 }
 
@@ -4230,97 +3774,56 @@ static int sshfsm_fuse_main(struct fuse_args *args)
 #endif
 }
 
-static int parse_host_args(const char *arg)
+static char *find_base_path(char *s)
+{
+	char *d = s;
+
+	for (; *s && *s != ':'; s++) {
+		if (*s == '[') {
+			/*
+			 * Handle IPv6 numerical address enclosed in square
+			 * brackets
+			 */
+			s++;
+			for (; *s != ']'; s++) {
+				if (!*s) {
+					fprintf(stderr,	"missing ']' in hostname\n");
+					exit(1);
+				}
+				*d++ = *s;
+			}
+		} else {
+			*d++ = *s;
+		}
+
+	}
+	*d++ = '\0';
+	s++;
+
+	return s;
+}
+
+static int parse_serv_args(const char *arg)
 {
 	if (!strchr(arg, ':'))
 		return 1;
 
-	assert(sshfsm.hosts);
-	int idx = get_empty_host_slot();
-	if (idx == -1) {
-		fprintf(stderr, "sshfsm: too many hosts, ignore");
-		return 1;
-	}
-	struct host *hostp = sshfsm.hosts[idx] = g_new0(struct host, 1);
-	const char delimiters[] = ":=#";
-	int stridx = 0;
-	
-	hostp->rank = -1;
-	hostp->perm |= SRC_RW;
+	assert(sshfsm.serv_arr);
 
-	gchar **strv = g_strsplit_set(arg, delimiters, 4);
-	hostp->hostname = g_strdup(strv[stridx++]);
-	if (strv[stridx][0] && strv[stridx][strlen(strv[stridx])-1] != '/')
-		hostp->basepath = g_strdup_printf("%s/", strv[stridx++]);
+	struct serv *servp = g_new0(struct serv, 1);
+	char *base_path, *tmp;
+	tmp = g_strdup(arg);
+	base_path = find_base_path(tmp);
+	if (base_path[0] && base_path[strlen(base_path)-1] != '/')
+		servp->base_path = g_strdup_printf("%s/", base_path);
 	else
-		hostp->basepath = g_strdup(strv[stridx++]);
-		
-	if (g_strrstr(arg, "=")) {
-		char *perm_str = strv[stridx++];
-		if (g_strrstr(perm_str, "r")) {
-			hostp->perm &= 0x00;
-			hostp->perm |= SRC_R;
-		}
-		if (g_strrstr(perm_str, "w"))
-			hostp->perm |= SRC_W;
-		if (g_strrstr(perm_str, "i"))
-			hostp->perm |= SRC_I;
-	}
-
-	if (g_strrstr(arg, "#") && strcmp(strv[stridx], "") != 0)
-		hostp->rank = atoi(strv[stridx]);
-
-	DEBUG("add sshfsm.hosts[%d]: %s:%s=%x#%d\n", sshfsm.hosts_num,
-			hostp->hostname, hostp->basepath, hostp->perm, hostp->rank);
-	sshfsm.hosts_num ++;
-	g_strfreev(strv);
-	return 0;
-}
-
-static int op_get_opcode(const char *oper);
-static struct opbuffer * op_buffer_init(const int opcode, const char *msg);
-
-static int parse_op_args(const char *arg)
-{
-	static int parse_stage = 0;
-	
-	switch (parse_stage) {
-	case 0:
-		creq.opcode = op_get_opcode(arg);
-		if (creq.opcode < 0) {
-			fprintf(stderr, "unknown operation %s\n", arg);
-			return 1;
-		}
-		parse_stage ++;
-		break;
-	
-	case 1:
-		if (creq.opcode == OP_WHERE || creq.opcode == OP_WHERER) {
-			/* arg is path */
-			if (arg[0] != '/') {
-				fprintf(stderr, "path %s should be absolute\n", arg);
-				return -1;
-			}
-			if (strlen(arg) != 1) {
-				/* tailing '/'s  */
-				char *path = g_strdup(arg);
-				int i = strlen(arg) - 1;
-				while (i > 0 && arg[i] == '/') {
-					path[i] = '\0';
-					i --;
-				}
-				creq.sendbuf = op_buffer_init(creq.opcode, path);
-				g_free(path);
-			} else 
-				creq.sendbuf = op_buffer_init(creq.opcode, arg);
-		}
-		parse_stage ++;
-		break;
-
-	default:
-		fprintf(stderr, "unknown operation argument %s\n", arg);
-		return -1;
-	}	
+		servp->base_path = g_strdup(base_path);
+	servp->hostname = g_strdup(tmp);	
+	DEBUG("append sshfsm.serv_arr[%d]: %s:%s\n", sshfsm.serv_arr->len,
+		  servp->hostname, servp->base_path);
+	servp->rank = -1;
+	g_array_append_vals(sshfsm.serv_arr, servp, 1);
+	g_free(tmp);
 	return 0;
 }
 
@@ -4341,7 +3844,7 @@ static int sshfsm_opt_proc(void *data, const char *arg, int key,
 		return 1;
 
 	case FUSE_OPT_KEY_NONOPT:
-		return sshfsm.op_flag ? parse_op_args(arg) : parse_host_args(arg);
+		return parse_serv_args(arg);
 
 	case KEY_PORT:
 		tmp = g_strdup_printf("-oPort=%s", arg + 2);
@@ -4351,6 +3854,12 @@ static int sshfsm_opt_proc(void *data, const char *arg, int key,
 
 	case KEY_COMPRESS:
 		ssh_add_arg("-oCompression=yes");
+		return 0;
+
+	case KEY_CONFIGFILE:
+		tmp = g_strdup_printf("-F%s", arg + 2);
+		ssh_add_arg(tmp);
+		g_free(tmp);
 		return 0;
 
 	case KEY_HELP:
@@ -4370,10 +3879,6 @@ static int sshfsm_opt_proc(void *data, const char *arg, int key,
 	case KEY_FOREGROUND:
 		sshfsm.foreground = 1;
 		return 1;
-
-	case KEY_OPERATION:
-		sshfsm.op_flag = 1;
-		return 0;
 
 	default:
 		fprintf(stderr, "internal error\n");
@@ -4514,660 +4019,40 @@ static void set_ssh_command(void)
 }
 
 /*
- * operation server and client 
+ * Remove commas from fsname, as it confuses the fuse option parser.
  */
-
-static int op_get_opcode(const char *oper)
+static void fsname_remove_commas(char *fsname)
 {
-	if (strcasecmp(oper, "where") == 0)
-		return OP_WHERE;
-	if (strcasecmp(oper, "wherer") == 0)
-		return OP_WHERER;
+	if (strchr(fsname, ',') != NULL) {
+		char *s = fsname;
+		char *d = s;
 
-	return OP_UNKNOWN;
-}
-
-/*
-static const char *op_get_opstring(const int opcode)
-{
-	switch(opcode) {
-		case OP_ERROR:		return "OP_ERROR";
-		case OP_SUCCESS:	return "OP_SUCCESS";
-		case OP_WHERE:		return "OP_WHERE";
-		case OP_WHERER:		return "OP_WHERER";
-		default:	return "???";
-	}
-}
-*/
-
-static int op_is_same_host(const char *host1, const char *host2)
-{
-	struct addrinfo *ai1, *ai2, hint1, hint2;
-	int err;
-
-	memset(&hint1, 0, sizeof(hint1));
-	memset(&hint2, 0, sizeof(hint2));
-	hint1.ai_family = hint2.ai_family = PF_UNSPEC;
-	hint1.ai_socktype = hint2.ai_socktype = SOCK_STREAM;
-	hint1.ai_flags = hint2.ai_flags = AI_CANONNAME;
-	err = getaddrinfo(host1, NULL, &hint1, &ai1);
-	if (err) {
-		fprintf(stderr, "failed to resolve %s, %s\n", host1, 
-				gai_strerror(err));
-		return -1;
-	}
-	err = getaddrinfo(host2, NULL, &hint2, &ai2);
-	if (err) {
-		fprintf(stderr, "failed to resolve %s, %s\n", host2, 
-				gai_strerror(err));
-		return -1;
-	}
-	err = strcmp(ai1->ai_canonname, ai2->ai_canonname);
-	freeaddrinfo(ai1);
-	freeaddrinfo(ai2);
-	return err ? 0 : 1;
-
-}
-
-static struct opbuffer * op_buffer_calloc(size_t size)
-{
-	struct opbuffer *buf = g_new0(struct opbuffer, 1);
-	buf->buf = g_new0(char, size);
-	buf->len = size;
-	return buf;
-}
-
-static struct opbuffer * op_buffer_init(const int opcode, const char *msg)
-{
-	struct opbuffer *sendbuf = g_new(struct opbuffer, 1);
-	sendbuf->buf = g_strdup_printf("%d|%s", opcode, msg);
-	sendbuf->len = strlen(sendbuf->buf);
-	return sendbuf;
-}
-
-static void op_buffer_free(struct opbuffer *buf)
-{
-	g_free(buf->buf);
-	g_free(buf);
-}
-
-static struct oprequest * op_request_init(struct oprequest *req, 
-						   const char *host, int port, 
-						   int opcode, struct opbuffer *sendbuf,
-						   struct opbuffer *recvbuf)
-{
-	if (!req)
-		req = g_new(struct oprequest, 1);
-	req->host = g_strdup(host);
-	req->port = port;
-	req->opcode = opcode;
-	req->sendbuf = sendbuf;
-	req->recvbuf = recvbuf;
-	return req;
-}
-
-static void op_request_free(struct oprequest *rp)
-{
-	op_buffer_free(rp->sendbuf);
-	op_buffer_free(rp->recvbuf);
-	g_free(rp->host);
-	g_free(rp);
-}
-
-static int op_request_connect(struct oprequest *rp)
-{
-	struct addrinfo *ai, hint;
-	int err;
-
-	memset(&hint, 0, sizeof(hint));
-	hint.ai_family = PF_INET;
-	hint.ai_socktype = SOCK_STREAM;
-	hint.ai_flags = AI_CANONNAME;
-	
-	char *portstr = g_strdup_printf("%d", rp->port);
-	err = getaddrinfo(rp->host, portstr, &hint, &ai);
-	if (err) {
-		fprintf(stderr, "failed to resolve %s:%d, %s\n", rp->host, 
-				rp->port, gai_strerror(err));
-		return -1;
-	}
-	
-	rp->sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-	if (rp->sock == -1) {
-		fprintf(stderr, "failed to create socket, %s\n", strerror(errno));
-		return -1;
-	}
-	err = connect(rp->sock, ai->ai_addr, ai->ai_addrlen);
-	if (err == -1) {
-		fprintf(stderr, "failed to connect to %s:%d, %s\n", rp->host,
-				rp->port, strerror(errno));
-		return -1;
-	}
-
-	int opt = 1;
-	err = setsockopt(rp->sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-	if (err == -1)
-		fprintf(stderr, "failed to set TCP_NODELAY, %s\n", strerror(errno));
-	
-	DEBUG("connected to %s:%s\n", ai->ai_canonname, portstr);
-
-	freeaddrinfo(ai);
-	g_free(portstr);
-	return 0;
-}
-
-static int op_request_sendrecv(struct oprequest *rp)
-{
-	int res;
-	
-	DEBUG("oprequest send %s\n",rp->sendbuf->buf);
-	res = send(rp->sock, rp->sendbuf->buf, rp->sendbuf->len, 0);
-	if (res < 0) {
-		fprintf(stderr, "send failed, %s\n", strerror(errno));
-		return -1;
-	}
-	
-	if (!rp->recvbuf)
-		rp->recvbuf = op_buffer_calloc(OP_SERVER_MAX_BUF);
-	res = recv(rp->sock, rp->recvbuf->buf, rp->recvbuf->len, 0);
-	if (res <= 0) {
-		fprintf(stderr, "recv failed, %s\n", strerror(errno));
-		return 1;
-	}
-	
-	assert(res < OP_SERVER_MAX_BUF);
-	/* TODO: message limited to 512, dynamically change it */
-	
-	DEBUG("opclient: received %s\n", rp->recvbuf->buf);
-	
-	char *finish = g_strdup_printf("%d", OP_FINISH);
-	res = send(rp->sock, finish, strlen(finish), 0);
-	if (res < 0) {
-		fprintf(stderr, "send failed, %s\n", strerror(errno));
-		return 1;
-	}
-	g_free(finish);
-	return 0;
-}
-
-static int op_request_fprint_reply_where(FILE *stream, struct oprequest *rp)
-{
-	const char delimiters[] = "|";
-	gchar **strv = NULL;
-	int err, err2;
-	
-	strv = g_strsplit_set(rp->recvbuf->buf, delimiters, OP_MAX_FIELDS);
-	err = atoi(strv[0]);
-	switch(err) {
-		case OP_SUCCESS:
-			fprintf(stream, "%s\n", strv[1]);
-			break;
-		
-		case OP_ERROR:
-			err2 = atoi(strv[1]);
-			fprintf(stream, "sshfsm: %s\n", strerror(err2));
-			return err2;
-
-		default:
-			fprintf(stream, "unknown return value from server\n");
-			return -1;
-	}
-	return 0;
-}
-
-static int op_request_fprint_reply(FILE *stream, struct oprequest *rp)
-{
-	switch(rp->opcode) {
-		case OP_WHERE:	return op_request_fprint_reply_where(stream, rp);
-		case OP_WHERER: return op_request_fprint_reply_where(stream, rp);
-		default:
-			fprintf(stderr, "unknown opcode %d\n", rp->opcode);
-			return -1;
-	}
-	return 0;
-}
-
-/*
-static int op_client_on_where(struct opclient *clnt)
-{
-	char sendbuf[OP_SERVER_MAX_BUF];
-	char recvbuf[OP_SERVER_MAX_BUF];
-	const char delimiters[] = "|";
-	gchar **strv = NULL;
-	int res, err;
-	
-	memset(sendbuf, 0, OP_SERVER_MAX_BUF);
-	snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d|%s", clnt->opcode,
-			 clnt->path);
-	DEBUG("opclient: ready to send %s\n", sendbuf);
-	res = send(clnt->sockfd, sendbuf, strlen(sendbuf), 0);
-	if (res < 0) {
-		fprintf(stderr, "send failed, %s\n", strerror(errno));
-		return 1;
-	}
-	
-	memset(recvbuf, 0, OP_SERVER_MAX_BUF);
-	res = recv(clnt->sockfd, recvbuf, OP_SERVER_MAX_BUF, 0);
-	if (res <= 0) {
-		fprintf(stderr, "recv failed, %s\n", strerror(errno));
-		return 1;
-	}
-	
-	DEBUG("opclient: received %s\n", recvbuf);
-	
-	strv = g_strsplit_set(recvbuf, delimiters, OP_MAX_FIELDS);
-	err = atoi(strv[0]);
-	switch(err) {
-		case OP_SUCCESS:
-			fprintf(stdout, "%s\n", strv[1]);
-			break;
-		
-		case OP_ERROR:
-			fprintf(stderr, "error: %s\n", strerror(atoi(strv[1])));
-			break;
-
-		default:
-			fprintf(stderr, "unknown return value from server\n");
-			break;
-	}
-	
-	g_strfreev(strv);
-	memset(sendbuf, 0, OP_SERVER_MAX_BUF);
-	snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d", OP_FINISH);
-	res = send(clnt->sockfd, sendbuf, strlen(sendbuf), 0);
-	if (res < 0) {
-		fprintf(stderr, "send failed, %s\n", strerror(errno));
-		return 1;
-	}
-
-	if (err)
-		return 1;
-	else
-		return 0;
-}
-static int op_client_process(struct opclient *clnt)
-{
-	int err = 0;
-
-	clnt->sockfd = op_common_connect(clnt->hostname, clnt->port);
-	if (clnt->sockfd == -1) {
-		fprintf(stderr, "failed to connect %s:%d\n", clnt->hostname, 
-				clnt->port);
-		return 1;
-	};
-	
-	switch (clnt->opcode) {
-		case OP_WHERE:	
-			err = op_client_on_where(clnt);
-			break;
-
-		case OP_WHERER:
-			err = op_client_on_where(clnt);
-			break;
-
-		default:
-			return 1;
-	}
-	close(clnt->sockfd);
-	return err;
-}
-*/
-
-struct op_server_process_data {
-	int sockfd;
-};
-
-static int op_server_do_where(const char *path)
-{
-	struct stat stbuf;
-	int err = 0;
-
-	if (sshfsm.hosts_num == 1) {
-		err = host_getattr(sshfsm.idx_0, path, &stbuf);
-		return err ? err : sshfsm.idx_0;
-	}
-	
-	int r_flag = 0;
-	idx_list_t list = table_lookup_r(path, &r_flag);
-	struct idx_item *item = NULL;
-	while (list) {
-		item = (struct idx_item *) list->data;
-		err = host_getattr(item->idx, path, &stbuf);
-		if (!err)
-			return item->idx;
-		list = list->next;
-	}
-	return -ENOENT;
-}
-
-static int op_server_on_where(int sockfd, gchar **strv)
-{
-	struct addrinfo *ai, hint;
-	gchar *path = strv[1];
-	char sendbuf[OP_SERVER_MAX_BUF];
-	int idx, res, err;
-	
-	idx = op_server_do_where(path);
-	
-	memset(sendbuf, 0, OP_SERVER_MAX_BUF);
-	if (idx >= 0) {
-		memset(&hint, 0, sizeof(hint));
-		hint.ai_family = PF_UNSPEC;
-		hint.ai_socktype = SOCK_STREAM;
-		hint.ai_flags = AI_CANONNAME;
-		err = getaddrinfo(sshfsm.hosts[idx]->hostname, NULL, &hint, &ai);
-		if (err) {
-			fprintf(stderr, "failed to resolve %s, %s\n", 
-					sshfsm.hosts[idx]->hostname, gai_strerror(err));
-			return -1;
+		for (; *s; s++) {
+			if (*s != ',')
+				*d++ = *s;
 		}
-		snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d|%s:%s", OP_SUCCESS,
-				 ai->ai_canonname, sshfsm.hosts[idx]->basepath);
-		freeaddrinfo(ai);
-	} else {
-		snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d|%d", OP_ERROR, -idx);
+		*d = *s;
 	}
-
-	res = send(sockfd, sendbuf, strlen(sendbuf), 0);
-	if (res < 0) {
-		fprintf(stderr, "send failed, %s\n", strerror(errno));
-		return 1;
-	}
-	
-	return 0;
 }
 
-static int op_server_request_wherer(int idx, const char *path, char **hoststr)
+#if FUSE_VERSION >= 27
+static char *fsname_escape_commas(char *fsnameold)
 {
-	struct oprequest *rp;
-	int err = 0;
+	char *fsname = g_malloc(strlen(fsnameold) * 2 + 1);
+	char *d = fsname;
+	char *s;
 
-	rp = op_request_init(NULL, sshfsm.hosts[idx]->hostname,
-			atoi(sshfsm.op_port), OP_WHERER, NULL, NULL);
-	err = op_request_connect(rp);
-	if (err == -1)
-		return err;
-	
-	err = op_request_sendrecv(rp);
-	if (err == -1)
-		return err;
+	for (s = fsnameold; *s; s++) {
+		if (*s == '\\' || *s == ',')
+			*d++ = '\\';
+		*d++ = *s;
+	}
+	*d = '\0';
+	g_free(fsnameold);
 
-	return err ? err : 0;
+	return fsname;
 }
-
-static int op_server_do_wherer(const char *path, char **hoststr)
-{
-	struct stat stbuf;
-	int idx, err = 0;
-
-	if (sshfsm.hosts_num == 1) {
-		err = host_getattr(sshfsm.idx_0, path, &stbuf);
-		if (!err) {
-			idx = sshfsm.idx_0;
-			goto find;
-		} else
-			return err;
-	}
-	
-	int r_flag = 0;
-	idx_list_t list = table_lookup_r(path, &r_flag);
-	struct idx_item *item = NULL;
-	while (list) {
-		item = (struct idx_item *) list->data;
-		err = host_getattr(item->idx, path, &stbuf);
-		if (!err) {
-			idx = item->idx;
-			goto find;
-		}
-		list = list->next;
-	}
-	return err;
-
-  find:
-  	if (IS_SRC_I(sshfsm.hosts[idx]->perm)) {
-		return op_server_request_wherer(idx, path, hoststr);
-	} else {
-		struct addrinfo *ai, hint;
-		memset(&hint, 0, sizeof(hint));
-		hint.ai_family = PF_UNSPEC;
-		hint.ai_socktype = SOCK_STREAM;
-		hint.ai_flags = AI_CANONNAME;
-		err = getaddrinfo(sshfsm.hosts[idx]->hostname, NULL, &hint, &ai);
-		if (err) {
-			fprintf(stderr, "failed to resolve %s, %s\n", 
-					sshfsm.hosts[idx]->hostname, gai_strerror(err));
-			return err;
-		}
-		*hoststr = g_strdup_printf("%s:%s", ai->ai_canonname, 
-							sshfsm.hosts[idx]->basepath);
-		freeaddrinfo(ai);
-	}
-  	return 0;
-}
-
-static int op_server_on_wherer(int sockfd, gchar **strv)
-{
-	char sendbuf[OP_SERVER_MAX_BUF];
-	gchar *path = strv[1];
-	char *hoststr = NULL;
-	
-	DEBUG("opserver: now process WHERER:%s\n", path);
-	
-	int err = op_server_do_wherer(path, &hoststr);
-	memset(sendbuf, 0, OP_SERVER_MAX_BUF);
-	if (err) {
-		snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d|%d", OP_ERROR, -err);
-	} else {
-		snprintf(sendbuf, OP_SERVER_MAX_BUF, "%d|%s", OP_SUCCESS, hoststr);
-	}
-	g_free(hoststr);
-	
-	int res = send(sockfd, sendbuf, strlen(sendbuf), 0);
-	if (res < 0) {
-		fprintf(stderr, "send failed, %s\n", strerror(errno));
-		return 1;
-	}
-	return 0;
-}
-
-static void * op_server_process_func(void *data)
-{
-	struct op_server_process_data *p = 
-		(struct op_server_process_data *) data;
-	int sockfd = p->sockfd;
-	char recvbuf[OP_SERVER_MAX_BUF];
-	const char delimiters[] = "|";
-	gchar **strv = NULL;
-	int opcode, res, err;
-	g_free(p);
-	
-	err = 0;
-	do {
-		memset(recvbuf, 0, OP_SERVER_MAX_BUF);
-		res = recv(sockfd, recvbuf, OP_SERVER_MAX_BUF, 0);
-		if (res <= 0) {
-			fprintf(stderr, "receive failed, %s\n", strerror(errno));
-			err = 1;
-			goto out;
-		}
-		
-		DEBUG("opserver: received %s (%d)\n", recvbuf, res);
-		
-		strv = g_strsplit_set(recvbuf, delimiters, OP_MAX_FIELDS);
-		opcode = atoi(strv[0]);
-		switch(opcode) {
-			case OP_WHERE:
-				err = op_server_on_where(sockfd, strv);
-				goto out;
-			
-			case OP_WHERER:
-				err = op_server_on_wherer(sockfd, strv);
-				goto out;
-			
-			case OP_FINISH:
-				err = 0;
-				goto out;
-		}
-	} while (res >= 0);
-
- out:
- 	g_strfreev(strv);
-	err ? pthread_exit((void *) 1) : pthread_exit((void *) 0);
-}
-
-static void * op_server_process(void *data)
-{
-	struct sockaddr_in clnt_addr;
-	int sockfd, clnt_len;
-	struct opserver *serv = &sshfsm.op_serv;
-	(void) data;
-
-	clnt_len = sizeof(struct sockaddr_in);
-	do {
-		sockfd = accept(serv->sockfd, (struct sockaddr *) &clnt_addr,
-						(socklen_t *) &clnt_len);
-		if (sockfd == -1) {
-			fprintf(stderr, "socket accept failed, %s\n", strerror(errno));
-		} else {
-			pthread_t thread_id;
-			struct op_server_process_data *thread_dat =
-				g_new(struct op_server_process_data, 1);
-			thread_dat->sockfd = sockfd;
-			if (pthread_create(&thread_id, NULL, op_server_process_func, 
-							   thread_dat) != 0) {
-				fprintf(stderr, "create thread failed\n");
-				exit(1);
-			}
-			pthread_detach(thread_id);
-		}
-	} while(1);
-
-	return NULL;
-}
-
-static int op_server_init(void)
-{
-	struct opserver *serv = &sshfsm.op_serv;
-	struct addrinfo *ai, hint;
-	int err;
-
-	/* setup socket */
-	serv->hostname = g_strdup(sshfsm.op_server);
-	serv->port = atoi(sshfsm.op_port);
-	
-	memset(&hint, 0, sizeof(hint));
-	hint.ai_family = PF_INET;
-	hint.ai_socktype = SOCK_STREAM;
-	hint.ai_flags = AI_CANONNAME;
-	char *portstr = g_strdup_printf("%d", serv->port);
-	err = getaddrinfo(serv->hostname, portstr, &hint, &ai);
-	if (err) {
-		fprintf(stderr, "failed to resolve %s:%d, %s\n", 
-				serv->hostname, serv->port, gai_strerror(err));
-		return -1;
-	}
-
-	serv->sockfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-	if (serv->sockfd == -1) {
-		fprintf(stderr, "create socket failed, %s\n", strerror(errno));
-		return -1;
-	}
-
-	int opt = 1;
-	err = setsockopt(serv->sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-	if (err == -1) {
-		fprintf(stderr, "failed to set SO_REUSEADDR, %s\n", strerror(errno));
-		return -1;
-	}
-	
-	err = bind(serv->sockfd, ai->ai_addr, ai->ai_addrlen);
-	if (err == -1) {
-		if (errno == EADDRINUSE)
-			fprintf(stderr, "port %d in use, try \"-o op_port=PORT\"\n", serv->port);
-		else
-			fprintf(stderr, "failed to bind, %s\n", strerror(errno));
-		return -1;
-	}
-	
-	err = listen(serv->sockfd, OP_SERVER_MAX_CONN);
-	if (err == -1) {
-		fprintf(stderr, "failed to listen with connection %d, %s\n", 
-				OP_SERVER_MAX_CONN, strerror(errno));
-		return -1;
-	}
-
-	/* setup runtime files */
-	err = mkdir(DEFAULT_TEMP_DIRECTORY, S_IRWXU | S_IRWXG | S_IRWXO);
-	if (err == -1 && errno != EEXIST) {
-		fprintf(stderr, "failed to create directory %s, %s\n", 
-				DEFAULT_TEMP_DIRECTORY, strerror(errno));
-		return -1;
-	}
-	struct passwd *pwd = getpwuid(getuid());
-	if (!pwd) {
-		fprintf(stderr, "failed to get usrname for uid %d\n", getuid());
-		return -1;
-	}
-	sshfsm.op_vardir = g_strdup_printf("%s/%s-%u", DEFAULT_TEMP_DIRECTORY,
-							pwd->pw_name, g_str_hash(sshfsm.mountpoint));
-	err = mkdir(sshfsm.op_vardir, S_IRWXU);
-	if (err == -1 && errno != EEXIST) {
-		fprintf(stderr, "failed to create directory %s, %s\n", 
-				sshfsm.op_vardir, strerror(errno));
-		return -1;
-	}
-	char *portfile = g_strdup_printf("%s/%s", sshfsm.op_vardir, 
-						OP_VARFILE_PORT);
-	int fd = open(portfile, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
-	if (fd == -1) {
-		fprintf(stderr, "failed to open file %s, %s\n", portfile,
-				strerror(errno));
-		return -1;
-	}
-	write(fd, sshfsm.op_port, strlen(sshfsm.op_port));
-	close(fd);
-	
-	freeaddrinfo(ai);
-	g_free(portfile);
-	g_free(portstr);
-	return 0;
-}
-
-static void op_server_start_processing(void)
-{
-	pthread_t thread_id;
-	int err;
-
-	err = pthread_create(&thread_id, NULL, op_server_process, NULL); 
-	if (err != 0) {
-		fprintf(stderr, "failed to create thread, %s\n", strerror(err));
-		return;
-	};
-	pthread_detach(thread_id);
-	sshfsm.op_serv.thread_id = thread_id;
-	sshfsm.op_serv.processing_thread_started = 1;
-	DEBUG("opserver started on %s:%d\n", 
-		  sshfsm.op_serv.hostname, sshfsm.op_serv.port);
-}
-
-static void op_server_destroy(void)
-{
-	/* remove vardir */
-	char *portfile = g_strdup_printf("%s/%s", sshfsm.op_vardir,
-						OP_VARFILE_PORT);
-	remove(portfile);
-	g_free(portfile);
-	remove(sshfsm.op_vardir);
-	pthread_kill(sshfsm.op_serv.thread_id, SIGTERM);
-	close(sshfsm.op_serv.sockfd);
-	g_free(sshfsm.op_serv.hostname);
-	g_free(sshfsm.op_vardir);
-	g_free(sshfsm.op_server);
-}
-
-/*
- * main entry
- */
+#endif
 
 int main(int argc, char *argv[])
 {
@@ -5177,7 +4062,7 @@ int main(int argc, char *argv[])
 	char *fsname;
 	const char *sftp_server;
 	int libver;
-	
+
 	if (!g_thread_supported())
 		g_thread_init(NULL);
 
@@ -5186,18 +4071,12 @@ int main(int argc, char *argv[])
 	sshfsm.max_write = 65536;
 	sshfsm.nodelay_workaround = 1;
 	sshfsm.nodelaysrv_workaround = 0;
-	sshfsm.fakelink_workaround = 0;
 	sshfsm.rename_workaround = 0;
 	sshfsm.truncate_workaround = 0;
 	sshfsm.buflimit_workaround = 1;
 	sshfsm.ssh_ver = 2;
 	sshfsm.progname = argv[0];
-	sshfsm.hosts_num = 0;
-	sshfsm.hosts_num_max = DEFAULT_MAX_HOSTS_NUM;
-	sshfsm.hosts = g_new0(struct host *, sshfsm.hosts_num_max);
-	sshfsm.rank_interval = DEFAULT_RANK_INTERVAL;
-	sshfsm.oper = 1;
-	sshfsm.op_port = OP_SERVER_DEFAULT_PORT;
+	sshfsm.serv_arr = g_array_new(FALSE, TRUE, sizeof(struct serv));
 	ssh_add_arg("ssh");
 	ssh_add_arg("-x");
 	ssh_add_arg("-a");
@@ -5206,35 +4085,8 @@ int main(int argc, char *argv[])
 	if (fuse_opt_parse(&args, &sshfsm, sshfsm_opts, sshfsm_opt_proc) == -1 ||
 	    parse_workarounds() == -1)
 		exit(1);
-	
-	DEBUG("SSHFSM version %s\n", PACKAGE_VERSION);
-	
-	/* operation handling */
-	if (!sshfsm.op_server)
-		sshfsm.op_server = g_strdup(g_get_host_name());
-	
-	if (sshfsm.op_flag) {
-		struct oprequest *rp = op_request_init(&creq, sshfsm.op_server, 
-				atoi(sshfsm.op_port), creq.opcode, creq.sendbuf, NULL);
-		if (op_request_connect(rp) == -1)
-			exit(EIO);
 
-		if (op_request_sendrecv(rp) == -1)
-			exit(EIO);
-		
-		if ((res = op_request_fprint_reply(stdout, rp)) == -1)
-			exit(EIO);
-		
-		op_buffer_free(rp->sendbuf);
-		op_buffer_free(rp->recvbuf);
-		g_free(rp->host);
-		g_free(sshfsm.hosts);
-		fuse_opt_free_args(&args);
-		fuse_opt_free_args(&sshfsm.ssh_args);
-		free(sshfsm.directport);
-		g_free(sshfsm.op_server);
-		exit(res);
-	}
+	DEBUG("SSHFSM version %s\n", PACKAGE_VERSION);
 	
 	/* hacking mount point */
 	if (fuse_parse_cmdline(&args, &(sshfsm.mountpoint), NULL, NULL) == -1)
@@ -5244,21 +4096,12 @@ int main(int argc, char *argv[])
 		fuse_opt_free_args(&args);
 		exit(1);
 	}
-
 	fuse_opt_insert_arg(&args, 1, sshfsm.mountpoint);
 	
-	
-	if (sshfsm.oper) {
-		if (op_server_init() == -1)
-			exit(1);
-	}
-
 	if (sshfsm.password_stdin) {
 		if (read_password() == -1)
 			exit(1);
 	}
-	
-	/* TODO: table_parse_options */
 
 	if (sshfsm.buflimit_workaround)
 		/* Work around buggy sftp-server in OpenSSH.  Without this on
@@ -5268,13 +4111,13 @@ int main(int argc, char *argv[])
 	else
 		sshfsm.max_outstanding_len = ~0;
 
-	if (sshfsm.hosts_num == 0) {
+	if (!sshfsm.serv_arr->len) {
 		fprintf(stderr, "missing host\n");
 		fprintf(stderr, "see `%s -h' for usage\n", argv[0]);
 		exit(1);
 	}
 
-	fsname = g_strdup_printf("[%dhosts]", sshfsm.hosts_num);
+	fsname = g_strdup_printf("[%dhosts]", sshfsm.serv_arr->len);
 
 	if (sshfsm.ssh_command)
 		set_ssh_command();
@@ -5296,19 +4139,10 @@ int main(int argc, char *argv[])
 	ssh_add_arg(sftp_server);
 	free(sshfsm.sftp_server);
 
-	res = processing_init();
-	if (res == -1)
+	if (processing_init() == -1)
 		exit(1);
 	
-	if (connect_remote_all() == -1)
-		exit(1);
-
-#ifndef SSHFSM_USE_INIT
-	if (sshfsm.detect_uid)
-		sftp_detect_uid_all();
-#endif
-
-	if (!sshfsm.no_check_root && sftp_check_root_all() == -1)
+	if (sftp_servers_init() == -1)
 		exit(1);
 	
 	if (table_init() == -1)
@@ -5334,8 +4168,13 @@ int main(int argc, char *argv[])
 #if FUSE_VERSION >= 27
 	libver = fuse_version();
 	assert(libver >= 27);
+	if (libver >= 28)
+		fsname = fsname_escape_commas(fsname);
+	else
+		fsname_remove_commas(fsname);
 	tmp = g_strdup_printf("-osubtype=sshfsm,fsname=%s", fsname);
 #else
+	fsname_remove_commas(fsname);
 	tmp = g_strdup_printf("-ofsname=sshfsm#%s", fsname);
 #endif
 	fuse_opt_insert_arg(&args, 1, tmp);
@@ -5346,21 +4185,29 @@ int main(int argc, char *argv[])
 
 	if (sshfsm.debug) {
 		unsigned int avg_rtt = 0;
+		unsigned int i;
+		struct serv *servp; 
+		
+		for (i = 0; i < sshfsm.serv_arr->len; i++) {
+			servp = serv_arr_index(i);
+			if (servp->num_sent)
+				avg_rtt = servp->total_rtt / servp->num_sent;
 
-		if (sshfsm.num_sent)
-			avg_rtt = sshfsm.total_rtt / sshfsm.num_sent;
-
-		DEBUG("\n"
-		      "sent:               %llu messages, %llu bytes\n"
-		      "received:           %llu messages, %llu bytes\n"
-		      "rtt min/max/avg:    %ums/%ums/%ums\n"
-		      "num connect:        %u\n",
-		      (unsigned long long) sshfsm.num_sent,
-		      (unsigned long long) sshfsm.bytes_sent,
-		      (unsigned long long) sshfsm.num_received,
-		      (unsigned long long) sshfsm.bytes_received,
-		      sshfsm.min_rtt, sshfsm.max_rtt, avg_rtt,
-		      sshfsm.num_connect);
+			DEBUG("\n"
+			      "statistics for server %s:%s\n"
+				  "  sent:               %llu messages, %llu bytes\n"
+				  "  received:           %llu messages, %llu bytes\n"
+				  "  rtt min/max/avg:    %ums/%ums/%ums\n"
+				  "  num connect:        %u\n",
+				  servp->hostname, servp->base_path,
+				  (unsigned long long) servp->num_sent,
+				  (unsigned long long) servp->bytes_sent,
+				  (unsigned long long) servp->num_received,
+				  (unsigned long long) servp->bytes_received,
+				  servp->min_rtt, servp->max_rtt, avg_rtt,
+				  servp->num_connect);
+		 }
+		 serv_arr_destroy();
 	}
 
 	fuse_opt_free_args(&args);
