@@ -1,5 +1,5 @@
 AC_PREREQ(2.61)
-AC_INIT(sshfs-mux, 1.1, sshfsm@gmail.com)
+AC_INIT(sshfs-mux, 1.2, dunnan@yl.is.s.u-tokyo.ac.jp)
 AM_INIT_AUTOMAKE
 AM_CONFIG_HEADER(config.h)
 
