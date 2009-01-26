@@ -16,7 +16,7 @@ LIBS=
 AC_HEADER_STDC
 AC_HEADER_SYS_WAIT
 AC_CHECK_HEADERS([fcntl.h netdb.h arpa/inet.h netinet/in.h stdint.h \
-stdlib.h string.h sys/socket.h sys/time.h unistd.h malloc.h])
+stdlib.h string.h sys/socket.h sys/time.h unistd.h malloc.h sys/statvfs.h])
 
 # Checks for typedefs, structures, and compiler characteristics.
 AC_C_CONST
@@ -28,6 +28,7 @@ AC_TYPE_SIZE_T
 AC_CHECK_MEMBERS([struct stat.st_blksize])
 AC_STRUCT_ST_BLOCKS
 AC_HEADER_TIME
+AC_HEADER_DIRENT
 AC_TYPE_UINT32_T
 AC_TYPE_UINT64_T
 AC_TYPE_UINT8_T
@@ -41,9 +42,14 @@ AC_FUNC_MMAP
 AC_FUNC_REALLOC
 AC_TYPE_SIGNAL
 AC_FUNC_UTIME_NULL
+AC_FUNC_CLOSEDIR_VOID
+AC_FUNC_LSTAT
+AC_FUNC_LSTAT_FOLLOWS_SLASHED_SYMLINK
+AC_FUNC_STAT
 AC_CHECK_FUNCS([dup2 ftruncate getpagesize gettimeofday \
 memmove memset mkdir munmap realpath rmdir setenv socket \
-strchr strdup strerror strcasecmp strncasecmp strrchr uname utime])
+strchr strdup strerror strcasecmp strncasecmp strrchr uname \
+utime lchown mkfifo])
 
 # Checking sshnodelay
 AC_ARG_ENABLE(sshnodelay,
