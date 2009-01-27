@@ -9,6 +9,10 @@
 #define _GNU_SOURCE /* avoid implicit declaration of *pt* functions */
 #include "config.h"
 
+#ifdef linux
+#define _XOPEN_SOURCE 500 /* for pread()/pwrite() */
+#endif
+
 #include <fuse.h>
 #include <fuse_opt.h>
 #include <assert.h>
@@ -37,7 +41,6 @@
 #include <netinet/tcp.h>
 #include <glib.h>
 
-/* sshfsm extented */
 #include "cache.h"
 #include "table.h"
 
@@ -125,7 +128,6 @@
 
 #define SSHNODELAY_SO "sshnodelay.so"
 
-/* sshfsm extented */
 #if GLIB_CHECK_VERSION(2, 16, 0)
 #define G_HASH_TABLE_HAS_ITER
 #endif
@@ -1592,6 +1594,14 @@ static int sftp_error_to_errno(uint32_t error)
 
 static void sftp_detect_uid(const int idx)
 {
+	struct serv *servp = serv_arr_index(idx);
+	
+	if (serv_is_local(idx)) {
+		servp->remote_uid = sshfsm.local_uid = getuid();
+		servp->remote_uid_detected = 1;
+		return;
+	}
+
 	int flags;
 	uint32_t id = sftp_get_id();
 	uint32_t replid;
@@ -1599,7 +1609,6 @@ static void sftp_detect_uid(const int idx)
 	struct buffer buf;
 	struct stat stbuf;
 	struct iovec iov[1];
-	struct serv *servp = serv_arr_index(idx);
 
 	buf_init(&buf, 5);
 	buf_add_string(&buf, ".");
@@ -1636,7 +1645,6 @@ static void sftp_detect_uid(const int idx)
 	servp->remote_uid = stbuf.st_uid;
 	sshfsm.local_uid = getuid();
 	servp->remote_uid_detected = 1;
-	DEBUG("server %s remote_uid = %i\n", servp->hostname, servp->remote_uid);
 
 out:
 	if (!servp->remote_uid_detected)
@@ -1648,12 +1656,19 @@ out:
 
 static int sftp_check_root(const int idx)
 {
+	struct stat stbuf;
+	if (serv_is_local(idx)) {
+		char *realpath = serv_add_path(idx, ".");
+		int res = lstat(realpath, &stbuf);
+		g_free(realpath);
+		return res;
+	}
+
 	int flags;
 	uint32_t id = sftp_get_id();
 	uint32_t replid;
 	uint8_t type;
 	struct buffer buf;
-	struct stat stbuf;
 	struct iovec iov[1];
 	int err = -1;
 	struct serv *servp = serv_arr_index(idx);
@@ -1708,6 +1723,9 @@ out:
 
 static int connect_remote(const int idx)
 {
+	if (serv_is_local(idx))
+		return 0;
+
 	int err;
 	struct serv *servp = serv_arr_index(idx);
 
@@ -1728,6 +1746,9 @@ static int connect_remote(const int idx)
 
 static int start_processing_thread(const int idx)
 {
+	if (serv_is_local(idx))
+		return 0;
+
 	int err;
 	pthread_t thread_id;
 	sigset_t oldset;
@@ -2015,22 +2036,21 @@ static int processing_by_threads(idx_list_t list,
 
 static int serv_getattr(const int idx, const char *path, struct stat *stbuf)
 {
-	int err;
 	
-	/* local system call */
 	if (serv_is_local(idx)) {
 		char *realpath = serv_add_path(idx, path);
+		int res;
 		if (sshfsm.follow_symlinks)
-			err = stat(realpath, stbuf);
+			res = stat(realpath, stbuf);
 		else
-			err = lstat(realpath, stbuf);
+			res = lstat(realpath, stbuf);
 		g_free(realpath);
-		if (err == -1)
+		if (res == -1)
 			return -errno;
-		return 0;
+		return res;
 	}
 	
-	/* sftp request */
+	int err;
 	struct buffer buf;
 	struct buffer outbuf;
 	buf_init(&buf, 0);
@@ -2146,22 +2166,20 @@ static void transform_symlink(const int idx, const char *path, char **linkp)
 static int serv_readlink(const int idx, const char *path, char *linkbuf,
 						size_t size)
 {
-	int err;
 
 	assert(size > 0);
-
-	/* local system call */
+	
 	if (serv_is_local(idx)) {
 		char *realpath = serv_add_path(idx, path);
-		err = readlink(realpath, linkbuf, size - 1);
+		int res = readlink(realpath, linkbuf, size - 1);
 		g_free(realpath);
-		if (err == -1)
+		if (res == -1)
 			return -errno;
 		linkbuf[size - 1] = '\0';
-		return 0;
+		return res;
 	}
 	
-	/* sftp request */
+	int err;
 	struct buffer buf;
 	struct buffer name;
 	struct serv *servp = serv_arr_index(idx);
@@ -2214,9 +2232,6 @@ static int sshfsm_readlink(const char *path, char *linkbuf, size_t size)
 static int serv_getdir_0(const int idx, const char *path, fuse_cache_dirh_t h,
                       	fuse_cache_dirfil_t filler)
 {
-	int err;
-
-	/* local system call */
 	if (serv_is_local(idx)) {
 		char *realpath = serv_add_path(idx, path);
 		DIR *dp = opendir(realpath);
@@ -2232,27 +2247,30 @@ static int serv_getdir_0(const int idx, const char *path, fuse_cache_dirh_t h,
 		struct dirent *dep;
 		struct stat stbuf;
 		char *filename;
+		int res = 0;
 		while ((readdir_r(dp, &u.de, &dep) == 0) && dep) {
 			memset(&stbuf, 0, sizeof(stbuf));
 			filename = g_strdup_printf("%s/%s", realpath, u.de.d_name);
 			if (sshfsm.follow_symlinks)
-				err = stat(filename, &stbuf);
+				res = stat(filename, &stbuf);
 			else
-				err = lstat(filename, &stbuf);
+				res = lstat(filename, &stbuf);
 			g_free(filename);
-			if (err == -1) {
-				g_free(realpath);
-				return -errno;
-			}
-			if (filler(h, u.de.d_name, &stbuf))
+			if (res == -1) {
+				res = -errno;
 				break;
+			}
+			if (filler(h, u.de.d_name, &stbuf)) {
+				res = -EIO;
+				break;
+			}
 		}
 		closedir(dp);
 		g_free(realpath);
-		return 0;
+		return res;
 	}
 
-	/* sftp request */
+	int err;
 	struct buffer buf;
 	struct buffer handle;
 	buf_init(&buf, 0);
@@ -2284,9 +2302,6 @@ static int serv_getdir_0(const int idx, const char *path, fuse_cache_dirh_t h,
 
 static int serv_getdir(const int idx, const char *path, GSList **entry_list)
 {
-	int err;
-
-	/* local system call */
 	if (serv_is_local(idx)) {
 		char *realpath = serv_add_path(idx, path);
 		DIR *dp = opendir(realpath);
@@ -2305,6 +2320,7 @@ static int serv_getdir(const int idx, const char *path, GSList **entry_list)
 		char *filename;
 		uint32_t flags = 0;
 		uint32_t count = 0;
+		int res = 0;
 		flags = flags | SSH_FILEXFER_ATTR_SIZE | SSH_FILEXFER_ATTR_UIDGID |
 				SSH_FILEXFER_ATTR_PERMISSIONS | SSH_FILEXFER_ATTR_ACMODTIME;
 
@@ -2315,37 +2331,35 @@ static int serv_getdir(const int idx, const char *path, GSList **entry_list)
 			memset(&stbuf, 0, sizeof(stbuf));
 			filename = g_strdup_printf("%s/%s", realpath, u.de.d_name);
 			if (sshfsm.follow_symlinks)
-				err = stat(filename, &stbuf);
+				res = stat(filename, &stbuf);
 			else
-				err = lstat(filename, &stbuf);
+				res = lstat(filename, &stbuf);
 			g_free(filename);
-			if (err == -1) {
-				g_free(realpath);
-				return -errno;
+			if (res == -1) {
+				res = -errno;
+				break;
 			}
 			buf_add_string(entry, u.de.d_name);	/* filename */
-			buf_add_string(entry, u.de.d_name);	/* longname */
+			buf_add_string(entry, "longname");	/* longname */
 			buf_add_attrs(entry, &stbuf, flags);
 			count ++;
 		}
 
-		if (count == 0) {
+		closedir(dp);
+		if (res < 0 || count == 0) {
 			buf_free(entry);
 			g_free(entry);
 		} else {
-			/* modify back count */
 			count = htonl(count);
 			memcpy(entry->p, &count, sizeof(count));
 			entry->len = 0;
 			*entry_list = g_slist_prepend(*entry_list, entry);
 		}
-
-		closedir(dp);
 		g_free(realpath);
-		return 0;
+		return res;
 	}
 	
-	/* sftp request */
+	int err;
 	struct buffer buf;
 	struct buffer handle;
 	buf_init(&buf, 0);
@@ -2488,19 +2502,16 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 
 static int serv_mkdir(const int idx, const char *path, mode_t mode)
 {
-	int err;
-	
-	/* local system call */
 	if (serv_is_local(idx)) {
 		char *realpath = serv_add_path(idx, path);
-		err = mkdir(realpath, mode);
+		int res = mkdir(realpath, mode);
 		g_free(realpath);
-		if (err == -1)
+		if (res == -1)
 			return -errno;
-		return 0;
+		return res;
 	}
 
-	/* sftp request */
+	int err;
 	struct buffer buf;
 	buf_init(&buf, 0);
 	buf_add_path(idx, &buf, path);
@@ -2537,25 +2548,23 @@ static int sshfsm_mkdir(const char *path, mode_t mode)
 
 static int serv_mknod(const int idx, const char *path, mode_t mode, dev_t rdev)
 {
-	int err;
-
 	if ((mode & S_IFMT) != S_IFREG)
 		return -EPERM;
 	
-	/* local system call */
 	if (serv_is_local(idx)) {
+		int res;
 		char *realpath = serv_add_path(idx, path);
 		if (S_ISFIFO(mode))
-			err = mkfifo(realpath, mode);
+			res = mkfifo(realpath, mode);
 		else
-			err = mknod(realpath, mode, rdev);
+			res = mknod(realpath, mode, rdev);
 		g_free(realpath);
-		if (err == -1)
+		if (res == -1)
 			return -errno;
-		return 0;
+		return res;
 	}
 
-	/* sftp request */
+	int err;
 	struct buffer buf;
 	struct buffer handle;
 	(void) rdev;
@@ -2603,21 +2612,18 @@ static int sshfsm_mknod(const char *path, mode_t mode, dev_t rdev)
 
 static int serv_symlink(const int idx, const char *from, const char *to)
 {
-	int err;
-
-	/* local system call */
 	if (serv_is_local(idx)) {
 		char *realfrom = serv_add_path(idx, to);
 		char *realto = serv_add_path(idx, to);
-		err = symlink(realfrom, realto);
+		int res = symlink(realfrom, realto);
 		g_free(realfrom);
 		g_free(realto);
-		if (err == -1)
+		if (res == -1)
 			return -errno;
-		return 0;
+		return res;
 	}
 
-	/* sftp request */
+	int err;
 	struct buffer buf;
 	struct serv *servp = serv_arr_index(idx);
 	if (servp->server_version < 3)
@@ -2656,19 +2662,16 @@ static int sshfsm_symlink(const char *from, const char *to)
 
 static int serv_unlink(const int idx, const char *path)
 {
-	int err;
-		
-	/* local system call */
 	if (serv_is_local(idx)) {
 		char *realpath = serv_add_path(idx, path);
-		err = unlink(realpath);
+		int res = unlink(realpath);
 		g_free(realpath);
-		if (err == -1)
+		if (res == -1)
 			return -errno;
-		return 0;
+		return res;
 	}
 
-	/* sftp request */
+	int err;
 	struct buffer buf;
 	buf_init(&buf, 0);
 	buf_add_path(idx, &buf, path);
@@ -2724,19 +2727,16 @@ static int sshfsm_unlink(const char *path)
 
 static int serv_rmdir(const int idx, const char *path)
 {
-	int err;
-	
-	/* local system call */
 	if (serv_is_local(idx)) {
 		char *realpath = serv_add_path(idx, path);
-		err = rmdir(realpath);
+		int res = rmdir(realpath);
 		g_free(realpath);
-		if (err == -1)
+		if (res == -1)
 			return -errno;
-		return 0;
+		return res;
 	}
 	
-	/* sftp request */
+	int err;
 	struct buffer buf;
 	buf_init(&buf, 0);
 	buf_add_path(idx, &buf, path);
@@ -2826,21 +2826,18 @@ static void random_string(char *str, int length)
 
 static int serv_rename(const int idx, const char *from, const char *to)
 {
-	int err;
-	
-	/* local system call */
 	if (serv_is_local(idx)) {
 		char *realfrom = serv_add_path(idx, from);
 		char *realto = serv_add_path(idx, to);
-		err = rename(realfrom, realto);
+		int res = rename(realfrom, realto);
 		g_free(realfrom);
 		g_free(realto);
-		if (err == -1)
+		if (res == -1)
 			return -errno;
-		return 0;
+		return res;
 	}
 	
-	/* sftp request */
+	int err;
 	if (sshfsm.ext_posix_rename)
 		err = serv_ext_posix_rename(idx, from, to);
 	else
@@ -2892,19 +2889,16 @@ static int sshfsm_rename(const char *from, const char *to)
 
 static int serv_chmod(const int idx, const char *path, mode_t mode)
 {
-	int err;
-	
-	/* local system call */
 	if (serv_is_local(idx)) {
 		char *realpath = serv_add_path(idx, path);
-		err = chmod(realpath, mode);
+		int res = chmod(realpath, mode);
 		g_free(realpath);
-		if (err == -1)
+		if (res == -1)
 			return -errno;
-		return 0;
+		return res;
 	}
 	
-	/* sftp request */
+	int err;
 	struct buffer buf;
 	buf_init(&buf, 0);
 	buf_add_path(idx, &buf, path);
@@ -2938,22 +2932,20 @@ static int sshfsm_chmod(const char *path, mode_t mode)
 
 static int serv_chown(const int idx, const char *path, uid_t uid, gid_t gid)
 {
-	int err;
-	
-	/* local system call */
 	if (serv_is_local(idx)) {
+		int res;
 		char *realpath = serv_add_path(idx, path);
 		if (sshfsm.follow_symlinks)
-			err = chown(realpath, uid, gid);
+			res = chown(realpath, uid, gid);
 		else
-			err = lchown(realpath, uid, gid);
+			res = lchown(realpath, uid, gid);
 		g_free(realpath);
-		if (err == -1)
+		if (res == -1)
 			return -errno;
-		return 0;
+		return res;
 	}
 	
-	/* sftp request */
+	int err;
 	struct buffer buf;
 	buf_init(&buf, 0);
 	buf_add_path(idx, &buf, path);
@@ -2994,22 +2986,19 @@ static int serv_truncate_workaround(const int idx, const char *path,
 
 static int serv_truncate(const int idx, const char *path, off_t size)
 {
-	int err;
-	struct serv *servp = serv_arr_index(idx);
-
-	servp->modifver ++;
-	/* local system call */
 	if (serv_is_local(idx)) {
 		char *realpath = serv_add_path(idx, path);
-		err = truncate(realpath, size);
+		int res = truncate(realpath, size);
 		g_free(realpath);
-		if (err == -1)
+		if (res == -1)
 			return -errno;
-		return 0;
+		return res;
 	}
 	
-	/* sftp request */
+	int err;
 	struct buffer buf;
+	struct serv *servp = serv_arr_index(idx);
+	servp->modifver ++;
 	if (size == 0 || sshfsm.truncate_workaround)
 		return serv_truncate_workaround(idx, path, size, NULL);
 
@@ -3045,19 +3034,16 @@ static int sshfsm_truncate(const char *path, off_t size)
 
 static int serv_utime(const int idx, const char *path, struct utimbuf *ubuf)
 {
-	int err;
-
-	/* local system call */
 	if (serv_is_local(idx)) {
 		char *realpath = serv_add_path(idx, path);
-		err = utime(realpath, ubuf);
+		int res = utime(realpath, ubuf);
 		g_free(realpath);
-		if (err == -1)
+		if (res == -1)
 			return -errno;
-		return 0;
+		return res;
 	}
 
-	/* sftp request */
+	int err;
 	struct buffer buf;
 	buf_init(&buf, 0);
 	buf_add_path(idx, &buf, path);
@@ -3100,45 +3086,44 @@ static inline int serv_file_is_conn(struct sshfsm_file *sf)
 static int serv_open_common(const int idx, const char *path, mode_t mode,
                            struct fuse_file_info *fi)
 {
-	int err;
-	int err2;
-	struct buffer buf;
-	struct buffer outbuf;
 	struct stat stbuf;
 	struct sshfsm_file *sf;
-	struct request *open_req;
-	uint32_t pflags = 0;
-	struct iovec iov;
-	uint8_t type;
-	uint64_t wrctr = cache_get_write_ctr(); /* TODO: figure out what */
-	struct serv *servp = serv_arr_index(idx);
+	uint64_t wrctr = cache_get_write_ctr();
 	
-	DEBUG("open file common, flags=0x%x\n", fi->flags);
-	DEBUG("open file common, syncread: %d, syncwrite: %d\n", sshfsm.sync_read,
-	sshfsm.sync_write);
-	sf = g_new0(struct sshfsm_file, 1);
-	/* local system call */
 	if (serv_is_local(idx)) {
 		char *realpath = serv_add_path(idx, path);
 		if (sshfsm.sync_write)
 			fi->flags |= O_SYNC;
-
+		sf = g_new0(struct sshfsm_file, 1);
 		sf->serv_idx = idx;
-		sf->modifver= servp->modifver;
-		sf->connver = servp->connver;
 		sf->fd = open(realpath, fi->flags, mode);
 		if (sf->fd == -1) {
 			cache_invalidate(path);
 			g_free(sf);
+			g_free(realpath);
 			return -errno;
 		}
-		lstat(realpath, &stbuf);
+		int res = lstat(realpath, &stbuf);
+		g_free(realpath);
+		if (res == -1) {
+			cache_invalidate(path);
+			g_free(sf);
+			return -errno;
+		}
 		cache_add_attr(path, &stbuf, wrctr);
 		fi->fh = (unsigned long) sf;
-		g_free(realpath);
-		return 0;
+		return res;
 	}
 
+	int err;
+	int err2;
+	struct buffer buf;
+	struct buffer outbuf;
+	struct request *open_req;
+	uint32_t pflags = 0;
+	struct iovec iov;
+	uint8_t type;
+	struct serv *servp = serv_arr_index(idx);
 
 	if ((fi->flags & O_ACCMODE) == O_RDONLY)
 		pflags = SSH_FXF_READ;
@@ -3158,7 +3143,7 @@ static int serv_open_common(const int idx, const char *path, mode_t mode,
 	if (fi->flags & O_TRUNC)
 		pflags |= SSH_FXF_TRUNC;
 
-	/* sftp request */
+	sf = g_new0(struct sshfsm_file, 1);
 	list_init(&sf->write_reqs);
 	pthread_cond_init(&sf->write_finished, NULL);
 	/* Assume random read after open */
@@ -3233,15 +3218,14 @@ static inline struct sshfsm_file *get_sshfsm_file(struct fuse_file_info *fi)
 
 static int sshfsm_flush(const char *path, struct fuse_file_info *fi)
 {
-	int err;
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
-	struct list_head write_reqs;
-	struct list_head *curr_list;
-	struct serv *servp = serv_arr_index(sf->serv_idx);
-	
 	if (serv_is_local(sf->serv_idx))
 		return 0;
 
+	int err;
+	struct list_head write_reqs;
+	struct list_head *curr_list;
+	struct serv *servp = serv_arr_index(sf->serv_idx);
 	if (!serv_file_is_conn(sf))
 		return -EIO;
 
@@ -3286,14 +3270,13 @@ static void sshfsm_file_get(struct sshfsm_file *sf)
 static int sshfsm_release(const char *path, struct fuse_file_info *fi)
 {
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
-	struct buffer *handle = &sf->handle;
 	int idx = sf->serv_idx;
-
 	if (serv_is_local(idx)) {
 		close(sf->fd);
 		return 0;
 	}
 	
+	struct buffer *handle = &sf->handle;
 	if (serv_file_is_conn(sf)) {
 		sshfsm_flush(path, fi);
 		sftp_request(idx, SSH_FXP_CLOSE, handle, 0, NULL);
@@ -3500,22 +3483,16 @@ static int sshfsm_read(const char *path, char *rbuf, size_t size, off_t offset,
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
 	(void) path;
 
-	if (!serv_file_is_conn(sf))
-		return -EIO;
-	
-	/* local system call */
 	if (serv_is_local(sf->serv_idx)) {
 		int res = pread(sf->fd, rbuf, size, offset);
 		if (res == -1)
 			return -errno;
-		struct serv *servp = serv_arr_index(sf->serv_idx);
-		sf->modifver = servp->modifver;
-		DEBUG("read file fd=%d, res=%d\n", sf->fd, res);
-		DEBUG("read file buf=%s\n", rbuf);
 		return res;
 	}
 
-	/* sftp request */
+	if (!serv_file_is_conn(sf))
+		return -EIO;
+	
 	if (sshfsm.sync_read)
 		return sshfsm_sync_read(sf, rbuf, size, offset);
 	else
@@ -3553,21 +3530,9 @@ static void sshfsm_write_end(struct request *req)
 static int sshfsm_write(const char *path, const char *wbuf, size_t size,
                        off_t offset, struct fuse_file_info *fi)
 {
-	int err;
-	struct buffer buf;
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
-	struct buffer *handle = &sf->handle;
-	struct iovec iov[2];
 	int idx = sf->serv_idx;
-	struct serv *servp = serv_arr_index(idx);
 
-	(void) path;
-
-	if (!serv_file_is_conn(sf))
-		return -EIO;
-
-	servp->modifver ++;
-	/* local system call */
 	if (serv_is_local(idx)) {
 		int res = pwrite(sf->fd, wbuf, size, offset);
 		if (res == -1)
@@ -3575,7 +3540,17 @@ static int sshfsm_write(const char *path, const char *wbuf, size_t size,
 		return res;
 	}
 
-	/* sftp request */
+	int err;
+	struct buffer buf;
+	struct buffer *handle = &sf->handle;
+	struct iovec iov[2];
+	struct serv *servp = serv_arr_index(idx);
+	(void) path;
+	
+	if (!serv_file_is_conn(sf))
+		return -EIO;
+
+	servp->modifver ++;
 	buf_init(&buf, 0);
 	buf_add_buf(&buf, handle);
 	buf_add_uint64(&buf, offset);
@@ -3598,18 +3573,16 @@ static int sshfsm_write(const char *path, const char *wbuf, size_t size,
 static int serv_ext_statvfs(const int idx, const char *path, 
 						   struct statvfs *stbuf)
 {
-	int err;
-	/* local system call */
 	if (serv_is_local(idx)) {
 		char *realpath = serv_add_path(idx, path);
-		err = statvfs(realpath, stbuf);
-		if (err == -1)
-			return -errno;
+		int res = statvfs(realpath, stbuf);
 		g_free(realpath);
-		return 0;
+		if (res == -1)
+			return -errno;
+		return res;
 	}
 
-	/* sftp request */
+	int err;
 	struct buffer buf;
 	struct buffer outbuf;
 	buf_init(&buf, 0);
@@ -3999,9 +3972,8 @@ static int table_init()
 	struct serv *servp;
 	for (i = 0; i < serv_arr_len(); i++) {
 		servp = serv_arr_index(i);
-		if (servp->fd != -1) {
+		if (servp->fd != -1 || serv_is_local(i))
 			table_insert("/", i, servp->rank);
-		}
 	}
 	return 0;
 }
