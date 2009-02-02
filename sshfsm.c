@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <string.h>
+#include <libgen.h>
 #include <stdint.h>
 #include <errno.h>
 #include <semaphore.h>
@@ -258,6 +259,7 @@ struct sshfsm {
 	char *mountpoint;
 	GArray *serv_arr;
 	pthread_mutex_t lock_serv_arr;
+	int allow_mkdirs;
 };
 
 static struct sshfsm sshfsm;
@@ -345,6 +347,7 @@ static struct fuse_opt sshfsm_opts[] = {
 	SSHFSM_OPT("follow_symlinks",   follow_symlinks, 1),
 	SSHFSM_OPT("no_check_root",     no_check_root, 1),
 	SSHFSM_OPT("password_stdin",    password_stdin, 1),
+	SSHFSM_OPT("allow_mkdirs",      allow_mkdirs, 1),
 
 	FUSE_OPT_KEY("-p ",            KEY_PORT),
 	FUSE_OPT_KEY("-C",             KEY_COMPRESS),
@@ -2522,10 +2525,46 @@ static int serv_mkdir(const int idx, const char *path, mode_t mode)
 	return err;
 }
 
+static int serv_mkdirs(const int idx, const char *path, mode_t mode)
+{	
+	struct serv *servp;
+	int err;
+
+start:
+
+	err = serv_mkdir(idx, path, mode);
+	if (err == 0 || err == -EEXIST) {
+		servp = serv_arr_index(idx);
+		table_insert(path, idx, servp->rank);
+		return 0;
+	} 
+	
+	if (err == -ENOENT) {
+		char *parent_dir = dirname(g_strdup(path));
+		err = serv_mkdirs(idx, parent_dir, mode);
+		g_free(parent_dir);
+		if (err == 0)
+			goto start;
+	}
+
+	return err;
+}
+
 static int sshfsm_mkdir(const char *path, mode_t mode)
 {
+	/* parent directory of path has been confirmed exist
+	 * when this has been called */
+
 	if (serv_arr_len() == 1)
 		return serv_mkdir(0, path, mode);
+
+	/* duplicate parent directories in the branch 
+	 * with the highest rank */
+	if (sshfsm.allow_mkdirs) {
+		char *parent_dir = dirname(g_strdup(path));
+		serv_mkdirs(serv_arr_len() - 1, parent_dir, mode);
+		g_free(parent_dir);
+	}
 	
 	int r_flag = 1;
 	idx_list_t list = table_lookup_r(path, &r_flag);
@@ -2591,6 +2630,13 @@ static int sshfsm_mknod(const char *path, mode_t mode, dev_t rdev)
 	if (serv_arr_len() == 1)
 		return serv_mknod(0, path, mode, rdev);
 	
+	if (sshfsm.allow_mkdirs) {
+		char *parent_dir = dirname(g_strdup(path));
+		mode_t dir_mode = S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH;
+		serv_mkdirs(serv_arr_len() - 1, parent_dir, dir_mode);
+		g_free(parent_dir);
+	}
+
 	int r_flag = 1;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
@@ -3661,6 +3707,13 @@ static int sshfsm_create(const char *path, mode_t mode,
 	if (serv_arr_len() == 1)
 		return serv_open_common(0, path, mode, fi);
 
+	if (sshfsm.allow_mkdirs) {
+		char *parent_dir = dirname(g_strdup(path));
+		mode_t dir_mode = S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH;
+		serv_mkdirs(serv_arr_len() - 1, parent_dir, dir_mode);
+		g_free(parent_dir);
+	}
+	
 	int r_flag = 1;
 	idx_list_t list = table_lookup_r(path, &r_flag);
 	struct idx_item *item = NULL;
@@ -4049,6 +4102,7 @@ static void usage(const char *progname)
 "    -o idmap=TYPE          user/group ID mapping, possible types are:\n"
 "             none             no translation of the ID space (default)\n"
 "             user             only translate UID of connecting user\n"
+"    -o allow_mkdirs        make parent directories on create\n"
 "    -o ssh_command=CMD     execute CMD instead of 'ssh'\n"
 "    -o ssh_protocol=N      ssh protocol to use (default: 2)\n"
 "    -o sftp_server=SERV    path to sftp server or subsystem (default: sftp)\n"
@@ -4140,9 +4194,9 @@ static int parse_serv_args(const char *arg)
 	else
 		servp->base_path = g_strdup(base_path);
 	servp->hostname = g_strdup(tmp);	
-	servp->rank = -1;
-	DEBUG("append sshfsm.serv_arr[%d]: %s:%s\n", serv_arr_len(),
-		  servp->hostname, servp->base_path);
+	servp->rank = serv_arr_len() * 100;
+	DEBUG("append sshfsm.serv_arr[%d]: %s:%s:%d\n", serv_arr_len(),
+		  servp->hostname, servp->base_path, servp->rank);
 	g_array_append_vals(sshfsm.serv_arr, servp, 1);
 	
 	g_free(tmp);

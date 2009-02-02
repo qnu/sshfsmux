@@ -111,8 +111,6 @@ void table_insert(const char *path, const int idx, const int rank)
 		GSList* idx_list = insert_item(NULL, item);
 		g_hash_table_insert(table.table, g_strdup(path), idx_list);
 		pthread_mutex_unlock(&table.lock);
-		DEBUG("  table: insert(path: %s, idx: %d, rank: %d)\n",
-			  path, item->idx, item->rank);
 		return;
 	}
 
@@ -128,8 +126,6 @@ void table_insert(const char *path, const int idx, const int rank)
 	g_hash_table_steal(table.table, (const void *) orig_key);
 	g_hash_table_insert(table.table, orig_key, orig_value);
 	pthread_mutex_unlock(&table.lock);
-	DEBUG("  table: insert(path: %s, idx: %d, rank: %d)\n",
-		  path, item->idx, item->rank);
 }
 
 void table_remove(const char *path)
@@ -184,7 +180,6 @@ idx_list_t table_lookup_r(const char *path, int *r_flag)
 		*r_flag = *r_flag + 1;
 		parent_dir = dirname(parent_dir);
 		idx_list = g_hash_table_lookup(table.table, parent_dir);
-		DEBUG("debug: table lookup recusively for %s\n", parent_dir);
 		if (idx_list)
 			break;
 	}
