@@ -1,5 +1,9 @@
+#                                               -*- Autoconf -*-
+# Process this file with autoconf to produce a configure script.
+
 AC_PREREQ(2.61)
-AC_INIT(sshfs-mux, 1.2, dunnan@yl.is.s.u-tokyo.ac.jp)
+AC_INIT(sshfsmux, 1.3, dunnan@yl.is.s.u-tokyo.ac.jp, sshfsm,
+http://sshfsmux.googlecode.com)
 AM_INIT_AUTOMAKE
 AM_CONFIG_HEADER(config.h)
 

@@ -1,3 +1,8 @@
+2010-06-12  Nan Dun <dunnan@yl.is.s.u-tokyo.ac.jp>
+	* Merge SSHFS-latest changes, up to 2010/06/01
+	* Add session directory for further usage
+	* Add debug/error log file
+
 2009-01-12  Nan Dun <dunnan@yl.is.s.u-tokyo.ac.jp>
 	
 	* Merge SSHFS-2.2 changes.
