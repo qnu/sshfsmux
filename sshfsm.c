@@ -237,6 +237,8 @@ struct sshfsm {
 	int ext_posix_rename;
 	int ext_statvfs;
 	mode_t mnt_mode;
+	int daemon;
+	int port;
 
 	/* statistics */
 	uint64_t bytes_sent;
@@ -317,6 +319,7 @@ enum {
 	KEY_VERSION,
 	KEY_FOREGROUND,
 	KEY_CONFIGFILE,
+	KEY_DAEMON,
 };
 
 #define SSHFSM_OPT(t, p, v) { t, offsetof(struct sshfsm, p), v }
@@ -344,16 +347,17 @@ static struct fuse_opt sshfsm_opts[] = {
 	SSHFSM_OPT("session_dir=%s",    session_dir, 0),
 	SSHFSM_OPT("dump",              dump, 1),
 
-	FUSE_OPT_KEY("-p ",            KEY_PORT),
-	FUSE_OPT_KEY("-C",             KEY_COMPRESS),
-	FUSE_OPT_KEY("-V",             KEY_VERSION),
-	FUSE_OPT_KEY("--version",      KEY_VERSION),
-	FUSE_OPT_KEY("-h",             KEY_HELP),
-	FUSE_OPT_KEY("--help",         KEY_HELP),
-	FUSE_OPT_KEY("debug",          KEY_FOREGROUND),
-	FUSE_OPT_KEY("-d",             KEY_FOREGROUND),
-	FUSE_OPT_KEY("-f",             KEY_FOREGROUND),
-	FUSE_OPT_KEY("-F ",            KEY_CONFIGFILE),
+	FUSE_OPT_KEY("-p ",             KEY_PORT),
+	FUSE_OPT_KEY("-C",              KEY_COMPRESS),
+	FUSE_OPT_KEY("-V",              KEY_VERSION),
+	FUSE_OPT_KEY("--version",       KEY_VERSION),
+	FUSE_OPT_KEY("-h",              KEY_HELP),
+	FUSE_OPT_KEY("--help",          KEY_HELP),
+	FUSE_OPT_KEY("debug",           KEY_FOREGROUND),
+	FUSE_OPT_KEY("-d",              KEY_FOREGROUND),
+	FUSE_OPT_KEY("-f",              KEY_FOREGROUND),
+	FUSE_OPT_KEY("-F ",             KEY_CONFIGFILE),
+	FUSE_OPT_KEY("-D",              KEY_DAEMON),
 	FUSE_OPT_END
 };
 
@@ -2934,6 +2938,71 @@ static int processing_init(void)
 	return 0;
 }
 
+/* 
+ * Direct port daemon
+ * inspired by Kenjiro Taura
+ */
+static int ssh_port_daemon(void)
+{
+	int serv_sockfd, clnt_sockfd;
+	struct sockaddr_in serv_addr, clnt_addr;
+	socklen_t clnt_len;
+	pid_t pid;
+	int res, flag = 1;
+
+	serv_sockfd = socket(AF_INET, SOCK_STREAM, 0);
+	if (serv_sockfd == -1) {
+		ERROR("create socket: %s\n", strerror(errno));
+		exit(1);
+	}
+	
+	res = setsockopt(serv_sockfd, SOL_SOCKET, SO_REUSEADDR, &flag,
+		sizeof(flag)); 
+	if (res == -1) {
+	    ERROR("setsockopt: %s\n", strerror(errno));
+		exit(1);
+	}
+
+	memset(&serv_addr, 0x0, sizeof(serv_addr));
+	serv_addr.sin_family = AF_INET;
+	serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	serv_addr.sin_port = htons(sshfsm.port);
+
+	res = bind(serv_sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr));
+	if (res == -1) {
+	    ERROR("bind: %s\n", strerror(errno));
+		exit(1);
+	}
+
+	
+	res = listen(serv_sockfd, 5);
+	if (res == -1) {
+	    ERROR("listen: %s\n", strerror(errno));
+		exit(1);
+	}
+
+	while (1) {
+		clnt_sockfd = accept(serv_sockfd, (struct sockaddr *) &clnt_addr,
+			&clnt_len);
+		if (clnt_sockfd == -1) {
+			ERROR("accept: %s\n", strerror(errno));
+			exit(1);
+		}
+
+		pid = fork();
+		if (pid < 0) {
+			ERROR("fork: %s\n", strerror(errno));
+			exit(1);
+		} else if (pid == 0) {
+			close(serv_sockfd);
+			dup2(clnt_sockfd, 0);
+			dup2(clnt_sockfd, 1);
+			execl(SFTP_SERVER_PATH, "sftp", NULL);
+		}
+		close(clnt_sockfd);
+	}
+}
+
 static struct fuse_cache_operations sshfsm_oper = {
 	.oper = {
 		.init       = sshfsm_init,
@@ -2981,6 +3050,7 @@ static void usage(const char *progname)
 "    -C                     equivalent to '-o compression=yes'\n"
 "    -F ssh_configfile      specifies alternative ssh configuration file\n"
 "    -1                     equivalent to '-o ssh_protocol=1'\n"
+"    -D                     start as directport daemon\n"
 "    -o reconnect           reconnect to server\n"
 "    -o delay_connect       delay connection to server\n"
 "    -o sshfsm_sync         synchronous writes\n"
@@ -3067,6 +3137,7 @@ static int sshfsm_opt_proc(void *data, const char *arg, int key,
 		tmp = g_strdup_printf("-oPort=%s", arg + 2);
 		ssh_add_arg(tmp);
 		g_free(tmp);
+		sshfsm.port = atoi(arg+2);
 		return 0;
 
 	case KEY_COMPRESS:
@@ -3095,6 +3166,10 @@ static int sshfsm_opt_proc(void *data, const char *arg, int key,
 
 	case KEY_FOREGROUND:
 		sshfsm.foreground = 1;
+		return 1;
+	
+	case KEY_DAEMON:
+		sshfsm.daemon = 1;
 		return 1;
 
 	default:
@@ -3329,6 +3404,7 @@ int main(int argc, char *argv[])
 	char *fsname;
 	const char *sftp_server;
 	int libver;
+	pid_t pid;
 
 	g_thread_init(NULL);
 
@@ -3346,6 +3422,7 @@ int main(int argc, char *argv[])
 	sshfsm.ptyfd = -1;
 	sshfsm.ptyslavefd = -1;
 	sshfsm.delay_connect = 0;
+	sshfsm.port = 6302; /* last 4 digits of MD5 hash of "sshfsm" */
 	sshfsm.err_stream = stderr;
 	ssh_add_arg("ssh");
 	ssh_add_arg("-x");
@@ -3357,6 +3434,20 @@ int main(int argc, char *argv[])
 		exit(1);
 
 	DEBUG("SSHFSM version %s\n", PACKAGE_VERSION);
+
+	if (sshfsm.daemon == 1) {
+		pid = fork();
+		if (pid < 0) {
+			ERROR("fork: %s\n", strerror(errno));
+			exit(1);
+		} else if (pid == 0) {
+			setsid();
+			res = chdir("/");
+			umask(0);
+			ssh_port_daemon();
+		}
+		exit(0);
+	}
 
 	/* extrace mount point, and need to insert it back */
 	if (fuse_parse_cmdline(&args, &sshfsm.mountpoint, NULL, NULL) == -1) {
