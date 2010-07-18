@@ -241,6 +241,7 @@ struct sshfsm {
 	int ext_statvfs;
 	mode_t mnt_mode;
 	int sftp_proxy;
+	int sftp_proxy_lockfd;
 	int port;
 	int backlog;
 	char *psk_path;
@@ -261,6 +262,7 @@ struct sshfsm {
 	gid_t gid;
 	char *username;
 	char *userhome;
+	char *config_dir;
 	char *session_dir;
 	char *mountpoint;
 	FILE *err_stream;
@@ -405,14 +407,11 @@ static int sftp_proxy_connect(char *host, char *port);
 #define debug(format, args...)						\
 	if (sshfsm.debug) {fprintf(sshfsm.err_stream, "debug: "format, args);}
 
-static inline char * strdup_and_free(char *src)
+static inline char * g_strdup_and_free(char *s)
 {
-	char *tmp;
-
-	tmp = src;
-	src = g_strdup(tmp);
-	free(tmp);
-	return src;
+	char *t = g_strdup(s);
+	free(s);
+	return t;
 }
 
 static int get_currtime_str(char *buf, size_t buflen, const char *format)
@@ -2982,16 +2981,45 @@ enum {
 
 static char * sftp_proxy_get_psk(size_t *len)
 {
-	if (sshfsm.psk_path) {
-		/* keep consistent of using g_strdup() */
-		char *tmp = sshfsm.psk_path;
-		sshfsm.psk_path = g_strdup(tmp);
-		free(tmp);
-	} else
-		sshfsm.psk_path = g_strdup_printf("%s/.sshfsm/key",
-			sshfsm.userhome);
+	if (sshfsm.psk_path)
+		sshfsm.psk_path = g_strdup_and_free(sshfsm.psk_path);
+ 	else
+		sshfsm.psk_path = g_strdup_printf("%s/key",
+			sshfsm.config_dir);
 
 	return get_file(sshfsm.psk_path, len, 0);
+}
+
+static int sftp_proxy_chk_psk(void)
+{
+	struct stat stbuf;
+
+	if (sshfsm.psk_path)
+		sshfsm.psk_path = g_strdup_and_free(sshfsm.psk_path);
+	else
+		sshfsm.psk_path = g_strdup_printf("%s/key",
+			sshfsm.config_dir);
+	
+	if (stat(sshfsm.psk_path, &stbuf) == -1) {
+		ERROR("failed to stat '%s': %s\n", 
+			sshfsm.psk_path, strerror(errno));
+		return -1;
+	}
+
+	if (!S_ISREG(stbuf.st_mode)) {
+		ERROR("psk file \"%s\" is not a regular file\n",
+			sshfsm.psk_path);
+		return -1;
+	}
+
+	if ((stbuf.st_mode & 0177) != 0 || 
+		(stbuf.st_mode & 0600) != 0600) {
+		fprintf(stdout, "file mode of psk '%s' should be 0600\n", 
+			sshfsm.psk_path);
+		return -1;
+	}
+
+	return 0;
 }
 
 static int sftp_proxy_auth_challenge(int sockfd, const char *key)
@@ -3083,16 +3111,8 @@ static int sftp_proxy_connect(char *host, char *port)
 	char *key;
 	size_t key_len;
 	
-	if (sshfsm.psk_path)
-		sshfsm.psk_path = strdup_and_free(sshfsm.psk_path);
-	else
-		sshfsm.psk_path = g_strdup_printf("%s/.sshfsm/key",
-			sshfsm.userhome);
-	if (access(sshfsm.psk_path, R_OK) == -1) {
-		fprintf(stdout, "cannot access psk '%s': %s\n", 
-			sshfsm.psk_path, strerror(errno));
+	if (sftp_proxy_chk_psk() == -1)
 		return -1;
-	}
 	
 	debug("direct connect to %s:%s\n", host, port);
 
@@ -3173,7 +3193,6 @@ static void sftp_proxy_process(void)
 	    ERROR("listen: %s\n", strerror(errno));
 		exit(1);
 	}
-	
 
 	debug("start listen from %d with backlog=%d\n", 
 		serv_sockfd, sshfsm.backlog);
@@ -3215,7 +3234,7 @@ static void sftp_proxy_process(void)
 					_exit(0);
 			}
 			setsid();
-			res = chdir("/");
+			res = chdir(sshfsm.userhome);
 			umask(0);
 			close(serv_sockfd);
 			dup2(clnt_sockfd, 0);
@@ -3234,6 +3253,7 @@ static void sftp_proxy_process(void)
 
 static void sftp_proxy_destroy(void)
 {
+	close(sshfsm.sftp_proxy_lockfd);
 	fclose(sshfsm.err_stream);
 	g_free(sshfsm.username);
 	g_free(sshfsm.userhome);
@@ -3261,17 +3281,9 @@ static void sftp_proxy_init(void)
 			sshfsm.sftp_server, strerror(errno));
 		exit(1);
 	}
-
-	if (sshfsm.psk_path)
-		sshfsm.psk_path = strdup_and_free(sshfsm.psk_path);
-	else
-		sshfsm.psk_path = g_strdup_printf("%s/.sshfsm/key",
-			sshfsm.userhome);
-	if (access(sshfsm.psk_path, R_OK) == -1) {
-		fprintf(stdout, "cannot access psk '%s': %s\n", 
-			sshfsm.psk_path, strerror(errno));
+	
+	if (sftp_proxy_chk_psk() == -1)
 		exit(1);
-	}
 	
 	if (!sshfsm.session_dir)
 		sshfsm.session_dir = g_strdup_printf("/tmp/sshfsmd-%s",
@@ -3283,7 +3295,18 @@ static void sftp_proxy_init(void)
 			strerror(errno));
 		exit(1);
 	}
-		
+	
+	/* start only one server using lock */
+	memset(path, 0, PATH_MAX);
+	snprintf(path, PATH_MAX, "%s/daemon.lock", sshfsm.config_dir);
+	sshfsm.sftp_proxy_lockfd = open(path, O_RDWR | O_CREAT, 0640);
+	if (sshfsm.sftp_proxy_lockfd < 0)
+		exit(1);
+	if (lockf(sshfsm.sftp_proxy_lockfd, F_TLOCK, 0) < 0) {
+		fprintf(stderr, "other proxy daemon is running?%d\n", 0);
+		exit(0);
+	}
+	
 	switch (fork()) {
 		case -1:
 			ERROR("fork: %s\n", strerror(errno));
@@ -3364,9 +3387,10 @@ static void usage(const char *progname)
 "    -C                     equivalent to '-o compression=yes'\n"
 "    -F ssh_configfile      specifies alternative ssh configuration file\n"
 "    -1                     equivalent to '-o ssh_protocol=1'\n"
+"    -P sftp_server_path    connect directly to local sftp server\n"
 "    -D                     sftp directport proxy daemon (default port: 5285)\n"
 "    -o backlog=N           sftp proxy backlog (default: 20)\n"
-"    -o psk=PATH            sftp proxy pre-shared key file (default: ~/.sshfsm/key\n"
+"    -o psk=PATH            sftp proxy pre-shared key (default: ~/.sshfsm/key)\n"
 "    -o reconnect           reconnect to server\n"
 "    -o delay_connect       delay connection to server\n"
 "    -o sshfsm_sync         synchronous writes\n"
@@ -3763,11 +3787,19 @@ int main(int argc, char *argv[])
 
 	debug("SSHFSM version %s\n", PACKAGE_VERSION);
 
+	sshfsm.config_dir = g_strdup_printf("%s/.sshfsm", sshfsm.userhome);
+	res = mkdir(sshfsm.config_dir, S_IRUSR | S_IWUSR | S_IXUSR);
+	if (res == -1 && errno != EEXIST) {
+		ERROR("create directory %s: %s\n", sshfsm.config_dir, 
+			strerror(errno));
+		exit(1);
+	}
+
 	if (sshfsm.sftp_proxy == 1) {
 		sftp_proxy_init();
 		exit(0);
 	}
-
+	
 	/* extrace mount point, and need to insert it back */
 	if (fuse_parse_cmdline(&args, &sshfsm.mountpoint, NULL, NULL) == -1) {
 		fuse_opt_free_args(&args);
