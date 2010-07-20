@@ -245,6 +245,7 @@ struct sshfsm {
 	int port;
 	int backlog;
 	char *psk_path;
+	char *sftp_local_server;
 
 	/* statistics */
 	uint64_t bytes_sent;
@@ -328,6 +329,7 @@ enum {
 	KEY_FOREGROUND,
 	KEY_CONFIGFILE,
 	KEY_DAEMON,
+	KEY_LOCALSRV,
 };
 
 #define SSHFSM_OPT(t, p, v) { t, offsetof(struct sshfsm, p), v }
@@ -356,7 +358,8 @@ static struct fuse_opt sshfsm_opts[] = {
 	SSHFSM_OPT("delay_connect",     delay_connect, 1),
 	SSHFSM_OPT("session_dir=%s",    session_dir, 0),
 	SSHFSM_OPT("dump",              dump, 1),
-
+	
+	/* Append a space if the option takes an argument */
 	FUSE_OPT_KEY("-p ",             KEY_PORT),
 	FUSE_OPT_KEY("-C",              KEY_COMPRESS),
 	FUSE_OPT_KEY("-V",              KEY_VERSION),
@@ -368,6 +371,7 @@ static struct fuse_opt sshfsm_opts[] = {
 	FUSE_OPT_KEY("-f",              KEY_FOREGROUND),
 	FUSE_OPT_KEY("-F ",             KEY_CONFIGFILE),
 	FUSE_OPT_KEY("-D",              KEY_DAEMON),
+	FUSE_OPT_KEY("-P ",             KEY_LOCALSRV),
 	FUSE_OPT_END
 };
 
@@ -396,6 +400,7 @@ static struct fuse_opt workaround_opts[] = {
 };
 
 /* forward all function declarations here */
+static int sftp_local_connect(void);
 static int sftp_proxy_connect(char *host, char *port);
 
 #define ERROR(format, args...) \
@@ -1649,10 +1654,13 @@ static int connect_remote(void)
 {
 	int err;
 
-	if (sshfsm.directport)
+	if (sshfsm.sftp_local_server)
+		err = sftp_local_connect();
+	else if (sshfsm.directport)
 		err = sftp_proxy_connect(sshfsm.host, sshfsm.directport);
 	else
 		err = start_ssh();
+
 	if (!err)
 		err = sftp_init();
 
@@ -2968,6 +2976,48 @@ static int processing_init(void)
 	return 0;
 }
 
+static int sftp_local_connect(void)
+{
+	pid_t pid;
+	int sockpair[2];
+
+	if (access(sshfsm.sftp_local_server, R_OK | X_OK) == -1) {
+		fprintf(stdout, "cannot access '%s': %s\n", 
+			sshfsm.sftp_local_server, strerror(errno));
+		exit(1);
+	}
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockpair) == -1) {
+		ERROR("socketpair: %s\n", strerror(errno));
+		exit(1);
+	}
+	
+	pid = fork();
+	if (pid == -1) {
+		ERROR("fork: %s\n", strerror(errno));
+		_exit(1);
+	}
+
+	if (pid == 0) {
+		if (dup2(sockpair[1], 0) == -1 || dup2(sockpair[1], 1) == -1) {
+			ERROR("dup2: %s\n", strerror(errno));
+			_exit(1);
+		}
+		close(sockpair[0]);
+		close(sockpair[1]);
+		signal(SIGINT, SIG_IGN);
+		execl(sshfsm.sftp_local_server, "sftp.local.sshfsm", NULL);
+		fprintf(stderr, "failed to execute \"%s\": %s\n",
+			sshfsm.sftp_local_server, strerror(errno));
+		_exit(0);
+	} else {
+		close(sockpair[1]);
+		sshfsm.fd = sockpair[0];
+	}
+	
+	return 0;
+}
+
 /* 
  * SFTP direct connection bypassing ssh
  * inspired by Kenjiro Taura
@@ -3296,14 +3346,16 @@ static void sftp_proxy_init(void)
 		exit(1);
 	}
 	
-	/* start only one server using lock */
+	/* make sure only one server started */
 	memset(path, 0, PATH_MAX);
 	snprintf(path, PATH_MAX, "%s/daemon.lock", sshfsm.config_dir);
 	sshfsm.sftp_proxy_lockfd = open(path, O_RDWR | O_CREAT, 0640);
-	if (sshfsm.sftp_proxy_lockfd < 0)
+	if (sshfsm.sftp_proxy_lockfd < 0) {
 		exit(1);
-	if (lockf(sshfsm.sftp_proxy_lockfd, F_TLOCK, 0) < 0) {
+	}
+	if (lockf(sshfsm.sftp_proxy_lockfd, F_TEST, 0) < 0) {
 		fprintf(stderr, "other proxy daemon is running?%d\n", 0);
+		close(sshfsm.sftp_proxy_lockfd);
 		exit(0);
 	}
 	
@@ -3320,7 +3372,7 @@ static void sftp_proxy_init(void)
 	char tmstr[200];
 	memset(tmstr, 0x0, sizeof(tmstr));
 	get_currtime_str(tmstr, sizeof(tmstr), "%D %T");
-
+	
 	sshfsm.pid = getpid();
 	memset(path, 0, PATH_MAX);
 	snprintf(path, PATH_MAX, "%s/%d.log", 
@@ -3337,6 +3389,12 @@ static void sftp_proxy_init(void)
 	res = chdir("/");
 	umask(0);
 	signal(SIGTERM, sftp_proxy_signal_handler);
+	
+	if (lockf(sshfsm.sftp_proxy_lockfd, F_TLOCK, 0) < 0) {
+		ERROR("failed to acquire lock: %s\n", strerror(errno));
+		exit(1);
+	}
+	
 	sftp_proxy_process();
 }
 
@@ -3511,6 +3569,10 @@ static int sshfsm_opt_proc(void *data, const char *arg, int key,
 	case KEY_DAEMON:
 		sshfsm.sftp_proxy = 1;
 		return 1;
+
+	case KEY_LOCALSRV:
+		sshfsm.sftp_local_server = g_strdup(arg + 2);
+		return 0;
 
 	default:
 		fprintf(stderr, "internal error\n");
