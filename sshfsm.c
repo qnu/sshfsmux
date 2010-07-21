@@ -1770,8 +1770,9 @@ static void runtime_init(void)
 		sshfsm.errlog = fopen(path, "wb");
 		if (sshfsm.errlog == NULL)
 			fatal(1, "open file \"%s\"", path);
-		dup2(fileno(sshfsm.errlog), 1);	
-		dup2(fileno(sshfsm.errlog), 2);	
+		if (dup2(fileno(sshfsm.errlog), 1) == -1 || 
+			dup2(fileno(sshfsm.errlog), 2) == -1) 
+			fatal(1, "failed to redirect stdout and stderr to \"%s\"", path);
 	}
 
 	debug("initial\n"
@@ -3234,7 +3235,7 @@ static void sftp_proxy_process(void)
 {
 	int serv_sockfd, clnt_sockfd;
 	struct sockaddr_in serv_addr, clnt_addr;
-	socklen_t clnt_len;
+	socklen_t clnt_len = sizeof(clnt_addr);
 	pid_t pid;
 	char *key;
 	size_t key_len;
@@ -3266,7 +3267,7 @@ static void sftp_proxy_process(void)
 		serv_sockfd, sshfsm.backlog);
 	
 	key = sftp_proxy_get_psk(&key_len);
-
+	
 	while (1) {
 		clnt_sockfd = accept(serv_sockfd, (struct sockaddr *) &clnt_addr,
 			&clnt_len);
@@ -3341,11 +3342,8 @@ static void sftp_proxy_init(void)
 	if (!sshfsm.sftp_server)
 		sshfsm.sftp_server = SFTP_SERVER_PATH;
 	
-	if (access(sshfsm.sftp_server, R_OK | X_OK) == -1) {
-		fprintf(stdout, "cannot access '%s': %s\n", 
-			sshfsm.sftp_server, strerror(errno));
-		exit(1);
-	}
+	if (access(sshfsm.sftp_server, R_OK | X_OK) == -1)
+		fatal(1, "failed to access \"%s\"", sshfsm.sftp_server);
 	
 	if (sftp_proxy_chk_psk() == -1)
 		exit(1);
@@ -3360,13 +3358,13 @@ static void sftp_proxy_init(void)
 	
 	/* make sure only one server started */
 	memset(path, 0, PATH_MAX);
-	snprintf(path, PATH_MAX, "%s/daemon.lock", sshfsm.config_dir);
+	snprintf(path, PATH_MAX, "%s/lock", sshfsm.session_dir);
 	sshfsm.sftp_proxy_lockfd = open(path, O_RDWR | O_CREAT, 0640);
 	if (sshfsm.sftp_proxy_lockfd < 0)
 		fatal(1, "failed to open file \"%s\"", path);
 
 	if (lockf(sshfsm.sftp_proxy_lockfd, F_TEST, 0) < 0) {
-		warning("Other proxy daemon is running?", NULL);
+		warning("Another proxy daemon is running?", NULL);
 		close(sshfsm.sftp_proxy_lockfd);
 		exit(0);
 	}
@@ -3387,12 +3385,15 @@ static void sftp_proxy_init(void)
 	
 	sshfsm.pid = getpid();
 	memset(path, 0, PATH_MAX);
-	snprintf(path, PATH_MAX, "%s/%d.log", 
-		sshfsm.session_dir, sshfsm.pid);
-	sshfsm.errlog = fopen(path, "wb");
+	snprintf(path, PATH_MAX, "%s/error.log", sshfsm.session_dir);
+	sshfsm.errlog = fopen(path, "w+b");
 	if (sshfsm.errlog == NULL)
 		fatal(1, "failed to open file \"%s\"", path);
-
+	
+	if (dup2(fileno(sshfsm.errlog), 1) == -1 || 
+		dup2(fileno(sshfsm.errlog), 2) == -1) 
+		fatal(1, "failed to redirect stdout and stderr to \"%s\"", path);
+	
 	log("sftp proxy init at %s\n", tmstr);
 	
 	setsid();
