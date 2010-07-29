@@ -139,6 +139,8 @@
 #define MAX_PATH    1024
 #define MAX_BUF_LEN 1024
 
+#define MAX_REQ_SIZE 65536
+
 struct buffer {
 	uint8_t *p;
 	size_t len;
@@ -244,6 +246,8 @@ struct sshfsm {
 	int sftp_proxy_lockfd;
 	int port;
 	int backlog;
+	int sndbuf;
+	int rcvbuf;
 	char *psk_path;
 	char *sftp_local_server;
 
@@ -340,6 +344,8 @@ static struct fuse_opt sshfsm_opts[] = {
 	SSHFSM_OPT("sftp_server=%s",    sftp_server, 0),
 	SSHFSM_OPT("backlog=%u",        backlog, 0),
 	SSHFSM_OPT("psk=%s",            psk_path, 0),
+	SSHFSM_OPT("sndbuf=%u",         sndbuf, 0),
+	SSHFSM_OPT("rcvbuf=%u",         rcvbuf, 0),
 	SSHFSM_OPT("max_read=%u",       max_read, 0),
 	SSHFSM_OPT("max_write=%u",      max_write, 0),
 	SSHFSM_OPT("ssh_protocol=%u",   ssh_ver, 0),
@@ -410,17 +416,6 @@ static void error2(int errnum, const char *format, ...)
 	fprintf(stderr, ": %s\n", strerror(errnum));
 }
 
-static void error3(const char *format, ...)
-{
-	va_list argv;
-	fprintf(stderr, "error: ");
-	va_start(argv, format);
-	vfprintf(stderr, format, argv);
-	va_end(argv);
-	fprintf(stderr, "\n");
-}
-
-
 static void perror2(const char *format, ...)
 {
 	va_list argv;
@@ -432,27 +427,22 @@ static void perror2(const char *format, ...)
 	fprintf(stderr, ": %s\n", strerror(errno));
 }
 
-static void _stderr(const char *type, const char *format, ...)
-{
-	va_list argv;
-	fprintf(stderr, "%s: ", type);
-	va_start(argv, format);
-	vfprintf(stderr, format, argv);
-	va_end(argv);
-	fprintf(stderr, "\n");
-}
-
 /* forward all function declarations here */
 static int sftp_local_connect(void);
 static int sftp_proxy_connect(char *host, char *port);
 
-#define message(format, args...) _stderr("sshfsm", format, args)
-#define warning(format, args...) _stderr("warning", format, args)
-#define fatal(status, format, args...) \
-	{perror2(format, args); exit(status);}
-#define log(format, args...) _stderr("log", format, args)
-#define debug(format, args...) \
-	if (sshfsm.debug) {_stderr("debug", format, args);}
+#define error3(format, ...) \
+	fprintf(stderr, "error: "format"\n", ## __VA_ARGS__)
+#define message(format, ...) \
+	fprintf(stderr, "sshfsm: "format"\n", ## __VA_ARGS__)
+#define warning(format, ...) \
+	fprintf(stderr, "warning: "format"\n", ## __VA_ARGS__)
+#define fatal(status, format, ...) \
+	{perror2(format, ## __VA_ARGS__); exit(status);}
+#define log(format, ...) \
+	fprintf(stderr, "log: "format"\n", ## __VA_ARGS__)
+#define debug(format, ...) \
+	if (sshfsm.debug) {fprintf(stderr, "debug: "format"\n", ## __VA_ARGS__);}
 
 static inline char * g_strdup_and_free(char *s)
 {
@@ -1807,6 +1797,8 @@ static void runtime_destroy(void)
 	g_free(sshfsm.username);
 	g_free(sshfsm.userhome);
 	g_free(sshfsm.session_dir);
+	if (sshfsm.sftp_local_server)
+		g_free(sshfsm.sftp_local_server);
 }
 
 #if FUSE_VERSION >= 26
@@ -3183,6 +3175,7 @@ static int sftp_proxy_connect(char *host, char *port)
 	int err;
 	int sock;
 	int opt;
+	socklen_t len;
 	struct addrinfo *ai;
 	struct addrinfo hint;
 	char *key;
@@ -3213,9 +3206,24 @@ static int sftp_proxy_connect(char *host, char *port)
 		return -1;
 	}
 	opt = 1;
-	err = setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+	len = sizeof(opt);
+	err = setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, len);
 	if (err == -1)
 		perror("warning: failed to set TCP_NODELAY");
+
+	if (sshfsm.sndbuf) {
+		len = sizeof(sshfsm.sndbuf);
+		err = setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sshfsm, len);
+		if (err == -1)
+			perror("warning: failed to set SO_SNDBUF");
+	}
+	
+	if (sshfsm.rcvbuf) {
+		len = sizeof(sshfsm.rcvbuf);
+		err = setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &sshfsm, len);
+		if (err == -1)
+			perror("warning: failed to set SO_RCVBUF");
+	}
 
 	freeaddrinfo(ai);
 	
@@ -3364,7 +3372,7 @@ static void sftp_proxy_init(void)
 		fatal(1, "failed to open file \"%s\"", path);
 
 	if (lockf(sshfsm.sftp_proxy_lockfd, F_TEST, 0) < 0) {
-		warning("Another proxy daemon is running?", NULL);
+		warning("Another proxy daemon is running?");
 		close(sshfsm.sftp_proxy_lockfd);
 		exit(0);
 	}
@@ -3458,6 +3466,8 @@ static void usage(const char *progname)
 "    -D                     sftp directport proxy daemon (default port: 5285)\n"
 "    -o backlog=N           sftp proxy backlog (default: 20)\n"
 "    -o psk=PATH            sftp proxy pre-shared key (default: ~/.sshfsm/key)\n"
+"    -o sndbuf=N            directport send buffer size (default: auto)\n"
+"    -o rcvbuf=N            directport receive buffer size (default: auto)\n"
 "    -o reconnect           reconnect to server\n"
 "    -o delay_connect       delay connection to server\n"
 "    -o sshfsm_sync         synchronous writes\n"
@@ -3818,8 +3828,8 @@ int main(int argc, char *argv[])
 	g_thread_init(NULL);
 
 	sshfsm.blksize = 4096;
-	sshfsm.max_read = 65536;
-	sshfsm.max_write = 65536;
+	sshfsm.max_read = MAX_REQ_SIZE;
+	sshfsm.max_write = MAX_REQ_SIZE;
 	sshfsm.nodelay_workaround = 1;
 	sshfsm.nodelaysrv_workaround = 0;
 	sshfsm.rename_workaround = 0;
@@ -3833,6 +3843,8 @@ int main(int argc, char *argv[])
 	sshfsm.delay_connect = 0;
 	sshfsm.port = 5285;
 	sshfsm.backlog = 20;
+	sshfsm.sndbuf = 0;
+	sshfsm.rcvbuf = 0;
 	sshfsm.errlog = stderr;
 	ssh_add_arg("ssh");
 	ssh_add_arg("-x");
@@ -3926,17 +3938,16 @@ int main(int argc, char *argv[])
 	ssh_add_arg(sftp_server);
 	free(sshfsm.sftp_server);
 
-
 	res = cache_parse_options(&args);
 	if (res == -1)
 		exit(1);
 
 	sshfsm.randseed = time(0);
 
-	if (sshfsm.max_read > 65536)
-		sshfsm.max_read = 65536;
-	if (sshfsm.max_write > 65536)
-		sshfsm.max_write = 65536;
+	if (sshfsm.max_read > MAX_REQ_SIZE)
+		sshfsm.max_read = MAX_REQ_SIZE;
+	if (sshfsm.max_write > MAX_REQ_SIZE)
+		sshfsm.max_write = MAX_REQ_SIZE;
 
 	if (fuse_is_lib_option("ac_attr_timeout="))
 		fuse_opt_insert_arg(&args, 1, "-oauto_cache,ac_attr_timeout=0");
