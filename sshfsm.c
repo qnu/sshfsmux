@@ -505,6 +505,27 @@ static char * get_file(const char *path, size_t *len, int escape)
 	return buf;
 }
 
+static void set_nodelay(int sockfd)
+{
+	int opt;
+	socklen_t optlen;
+
+	optlen = sizeof(opt);
+	if (getsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &opt, &optlen) == -1) {
+		perror("warning: failed to get TCP_NODELAY");
+		return;
+	}
+
+	if (opt == 1)
+		return;
+
+	opt = 1;
+	if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &opt, 
+		sizeof(opt)) == -1) {
+		perror("warning: failed to get TCP_NODELAY");
+	}
+}
+
 static const char *type_name(uint8_t type)
 {
 	switch(type) {
@@ -3138,8 +3159,6 @@ static int sftp_proxy_auth_response(int sockfd, const char *key)
 		return -1;
 	}
 		
-	debug("recv authenticate msg %s", buf);
-	
 	ptr = strchr(buf, ':');
 	*ptr = '\0';
 	res = atoi(buf);
@@ -3174,7 +3193,6 @@ static int sftp_proxy_connect(char *host, char *port)
 {
 	int err;
 	int sock;
-	int opt;
 	socklen_t len;
 	struct addrinfo *ai;
 	struct addrinfo hint;
@@ -3205,11 +3223,8 @@ static int sftp_proxy_connect(char *host, char *port)
 		perror2("failed to connect");
 		return -1;
 	}
-	opt = 1;
-	len = sizeof(opt);
-	err = setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, len);
-	if (err == -1)
-		perror("warning: failed to set TCP_NODELAY");
+
+	set_nodelay(sock);
 
 	if (sshfsm.sndbuf) {
 		len = sizeof(sshfsm.sndbuf);
@@ -3290,9 +3305,10 @@ static void sftp_proxy_process(void)
 			debug("authentication failed from %d", clnt_sockfd);
 			continue;
 		}
-		
 		debug("authentication success from %d", clnt_sockfd);
 		fflush(sshfsm.errlog);
+		
+		set_nodelay(clnt_sockfd);
 		
 		pid = fork();
 		if (pid < 0) {
