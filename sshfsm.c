@@ -53,6 +53,7 @@
 #include <sys/poll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <arpa/inet.h>
 
 #include <glib.h>
 
@@ -124,6 +125,8 @@
 #define SFTP_EXT_POSIX_RENAME "posix-rename@openssh.com"
 #define SFTP_EXT_STATVFS "statvfs@openssh.com"
 
+#define INADDR_MASK 0x1234567800000000
+
 #define PROTO_VERSION 3
 
 #define MY_EOF 1
@@ -140,6 +143,7 @@
 #define MAX_BUF_LEN 1024
 
 #define MAX_REQ_SIZE 65536
+
 
 struct buffer {
 	uint8_t *p;
@@ -798,7 +802,7 @@ static int buf_get_attrs(struct buffer *buf, struct stat *stbuf, int *flagsp)
 	uint32_t atime = 0;
 	uint32_t mtime = 0;
 	uint32_t mode = S_IFREG | 0777;
-	uint64_t ino = 0;
+	uint64_t ino = 64;
 
 	if (buf_get_uint32(buf, &flags) == -1)
 		return -1;
@@ -853,6 +857,10 @@ static int buf_get_attrs(struct buffer *buf, struct stat *stbuf, int *flagsp)
 	stbuf->st_atime = atime;
 	stbuf->st_ctime = stbuf->st_mtime = mtime;
 	stbuf->st_ino = ino;
+	if (sshfsm.inaddr_ino && 
+		(ino & 0x1111111100000000) != INADDR_MASK) 
+		stbuf->st_ino = INADDR_MASK + sshfsm.host_addr.s_addr;
+
 	return 0;
 }
 
@@ -1701,9 +1709,36 @@ out:
 	return err;
 }
 
+static int get_hostinfo(char *host, char *port)
+{	
+	int err;
+	struct addrinfo *ai;
+	struct addrinfo hint;
+	struct in_addr addr;
+
+	memset(&hint, 0, sizeof(hint));
+	hint.ai_family = AF_INET;
+	hint.ai_socktype = SOCK_STREAM;
+	err = getaddrinfo(host, port, &hint, &ai);
+	if (err) {
+		fprintf(stderr, "failed to resolve %s:%s: %s\n", host, port,
+			gai_strerror(err));
+		return -1;
+	}
+
+	addr.s_addr = ((struct sockaddr_in *) (ai->ai_addr))->sin_addr.s_addr;
+	debug("%s has ip address: %s (%u)", host, inet_ntoa(addr), addr.s_addr);
+	
+	sshfsm.host_addr = addr;
+	freeaddrinfo(ai);
+	return 0;
+}
+
 static int connect_remote(void)
 {
 	int err;
+
+	get_hostinfo(sshfsm.host, sshfsm.directport);
 
 	if (sshfsm.sftp_local_server)
 		err = sftp_local_connect();
@@ -1711,7 +1746,7 @@ static int connect_remote(void)
 		err = sftp_proxy_connect(sshfsm.host, sshfsm.directport);
 	else
 		err = start_ssh();
-
+	
 	if (!err)
 		err = sftp_init();
 
@@ -2834,7 +2869,7 @@ static int sshfsm_statfs(const char *path, struct statfs *buf)
 #if FUSE_VERSION >= 25
 static int sshfsm_create(const char *path, mode_t mode,
                         struct fuse_file_info *fi)
-{
+{	
 	return sshfsm_open_common(path, mode, fi);
 }
 
@@ -3886,7 +3921,7 @@ int main(int argc, char *argv[])
 	    parse_workarounds() == -1)
 		exit(1);
 
-	debug("SSHFSM version %s\n", PACKAGE_VERSION);
+	debug("SSHFSM version %s", PACKAGE_VERSION);
 
 	sshfsm.config_dir = g_strdup_printf("%s/.sshfsm", sshfsm.userhome);
 	res = mkdir(sshfsm.config_dir, S_IRUSR | S_IWUSR | S_IXUSR);
