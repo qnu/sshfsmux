@@ -1,0 +1,63 @@
+Only in openssh-4.7p1-patch/: .sftp-common.h.swp
+diff -crB openssh-4.7p1/sftp-common.c openssh-4.7p1-patch/sftp-common.c
+*** openssh-4.7p1/sftp-common.c	Sat Aug  5 11:39:40 2006
+--- openssh-4.7p1-patch/sftp-common.c	Sat Sep 25 23:43:21 2010
+***************
+*** 55,60 ****
+--- 55,61 ----
+  	a->perm = 0;
+  	a->atime = 0;
+  	a->mtime = 0;
++ 	a->ino = 0;
+  }
+  
+  /* Convert from struct stat to filexfer attribs */
+***************
+*** 73,78 ****
+--- 74,81 ----
+  	a->flags |= SSH2_FILEXFER_ATTR_ACMODTIME;
+  	a->atime = st->st_atime;
+  	a->mtime = st->st_mtime;
++ 	a->flags |= SSH2_FILEXFER_ATTR_EXTENDED;
++ 	a->ino = st->st_ino;
+  }
+  
+  /* Convert from filexfer attribs to struct stat */
+***************
+*** 93,98 ****
+--- 96,103 ----
+  		st->st_atime = a->atime;
+  		st->st_mtime = a->mtime;
+  	}
++ 	if (a->flags & SSH2_FILEXFER_ATTR_EXTENDED)
++ 		st->st_ino = a->ino;
+  }
+  
+  /* Decode attributes in buffer */
+***************
+*** 149,154 ****
+--- 154,164 ----
+  		buffer_put_int(b, a->atime);
+  		buffer_put_int(b, a->mtime);
+  	}
++ 	if (a->flags & SSH2_FILEXFER_ATTR_EXTENDED) {
++ 		buffer_put_int(b, 1);			/* count */
++ 		buffer_put_cstring(b, "ino");	/* type */
++ 		buffer_put_int64(b, a->ino);	/* data */
++ 	}
+  }
+  
+  /* Convert from SSH2_FX_ status to text error message */
+diff -crB openssh-4.7p1/sftp-common.h openssh-4.7p1-patch/sftp-common.h
+*** openssh-4.7p1/sftp-common.h	Sat Aug  5 11:39:40 2006
+--- openssh-4.7p1-patch/sftp-common.h	Sat Sep 25 23:44:10 2010
+***************
+*** 39,44 ****
+--- 39,45 ----
+  	u_int32_t	perm;
+  	u_int32_t	atime;
+  	u_int32_t	mtime;
++ 	u_int64_t	ino;
+  };
+  
+  void	 attrib_clear(Attrib *);
