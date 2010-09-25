@@ -217,6 +217,7 @@ struct sshfsm {
 	int reconnect;
 	int delay_connect;
 	char *host;
+	struct in_addr host_addr;
 	char *base_path;
 	GHashTable *reqtab;
 	pthread_mutex_t lock;
@@ -250,6 +251,7 @@ struct sshfsm {
 	int rcvbuf;
 	char *psk_path;
 	char *sftp_local_server;
+	int inaddr_ino;
 
 	/* statistics */
 	uint64_t bytes_sent;
@@ -364,6 +366,7 @@ static struct fuse_opt sshfsm_opts[] = {
 	SSHFSM_OPT("delay_connect",     delay_connect, 1),
 	SSHFSM_OPT("session_dir=%s",    session_dir, 0),
 	SSHFSM_OPT("dump",              dump, 1),
+	SSHFSM_OPT("inaddr_ino",        inaddr_ino, 1),
 	
 	/* Append a space if the option takes an argument */
 	FUSE_OPT_KEY("-p ",             KEY_PORT),
@@ -795,6 +798,7 @@ static int buf_get_attrs(struct buffer *buf, struct stat *stbuf, int *flagsp)
 	uint32_t atime = 0;
 	uint32_t mtime = 0;
 	uint32_t mode = S_IFREG | 0777;
+	uint64_t ino = 0;
 
 	if (buf_get_uint32(buf, &flags) == -1)
 		return -1;
@@ -821,13 +825,14 @@ static int buf_get_attrs(struct buffer *buf, struct stat *stbuf, int *flagsp)
 		if (buf_get_uint32(buf, &extcount) == -1)
 			return -1;
 		for (i = 0; i < extcount; i++) {
-			struct buffer tmp;
-			if (buf_get_data(buf, &tmp) == -1)
+			char *type;
+			if (buf_get_string(buf, &type) == -1)
 				return -1;
-			buf_free(&tmp);
-			if (buf_get_data(buf, &tmp) == -1)
-				return -1;
-			buf_free(&tmp);
+			if (strcmp(type, "ino") == 0) {
+				if (buf_get_uint64(buf, &ino) == -1)
+					return -1;
+			}
+			free(type);
 		}
 	}
 
@@ -847,6 +852,7 @@ static int buf_get_attrs(struct buffer *buf, struct stat *stbuf, int *flagsp)
 	stbuf->st_gid = gid;
 	stbuf->st_atime = atime;
 	stbuf->st_ctime = stbuf->st_mtime = mtime;
+	stbuf->st_ino = ino;
 	return 0;
 }
 
@@ -911,10 +917,8 @@ static int buf_get_entries(struct buffer *buf, fuse_cache_dirh_t h,
 		if (buf_get_string(buf, &longname) != -1) {
 			free(longname);
 			if (buf_get_attrs(buf, &stbuf, NULL) != -1) {
-				if (sshfsm.follow_symlinks &&
-				    S_ISLNK(stbuf.st_mode)) {
+				if (sshfsm.follow_symlinks && S_ISLNK(stbuf.st_mode))
 					stbuf.st_mode = 0;
-				}
 				filler(h, name, &stbuf);
 				err = 0;
 			}
@@ -3508,6 +3512,7 @@ static void usage(const char *progname)
 "    -o ssh_protocol=N      ssh protocol to use (default: 2)\n"
 "    -o sftp_server=SERV    path to sftp server or subsystem (default: sftp)\n"
 "    -o directport=PORT     directly connect to PORT bypassing ssh\n"
+"    -o inaddr_ino          piggybacking ip address using inode numbers"
 "    -o transform_symlinks  transform absolute symlinks to relative\n"
 "    -o follow_symlinks     follow symlinks on the server\n"
 "    -o no_check_root       don't check for existence of 'dir' on server\n"
@@ -3973,6 +3978,10 @@ int main(int argc, char *argv[])
 	tmp = g_strdup_printf("-omax_write=%u", sshfsm.max_write);
 	fuse_opt_insert_arg(&args, 1, tmp);
 	g_free(tmp);
+
+	if (sshfsm.inaddr_ino)
+		fuse_opt_insert_arg(&args, 1, "-ouse_ino");
+
 #if FUSE_VERSION >= 27
 	libver = fuse_version();
 	assert(libver >= 27);
@@ -3988,6 +3997,7 @@ int main(int argc, char *argv[])
 	fuse_opt_insert_arg(&args, 1, tmp);
 	g_free(tmp);
 	g_free(fsname);
+
 	check_large_read(&args);
 
 #if FUSE_VERSION >= 26

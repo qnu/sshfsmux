@@ -1,3 +1,9 @@
+2010-09-24  Nan Dun
+	* Add "inaddr_ino" for piggybacking file location using inodes number
+
+2010-09-07  Nan Dun
+	* Add directport server/client for SSH bypassing enhancement
+
 2010-06-12  Nan Dun <dunnan@yl.is.s.u-tokyo.ac.jp>
 	* Merge SSHFS-latest changes, up to 2010/06/01
 	* Add session directory for further usage

@@ -290,7 +290,7 @@ static int cache_readlink(const char *path, char *buf, size_t size)
 static int cache_dirfill(fuse_cache_dirh_t ch, const char *name,
                          const struct stat *stbuf)
 {
-	int err = ch->filler(ch->h, name, 0, 0);
+	int err = ch->filler(ch->h, name, 0, stbuf->st_ino);
 	if (!err) {
 		g_ptr_array_add(ch->dir, g_strdup(name));
 		if (stbuf->st_mode & S_IFMT) {
@@ -317,8 +317,8 @@ static int cache_getdir(const char *path, fuse_dirh_t h, fuse_dirfil_t filler)
 	if (node != NULL && node->dir != NULL) {
 		time_t now = time(NULL);
 		if (node->dir_valid - now >= 0) {
-			for(dir = node->dir; *dir != NULL; dir++)
-				filler(h, *dir, 0, 0);
+			for(dir = node->dir; *dir != NULL; dir++) 
+				filler(h, *dir, 0, node->stat.st_ino);
 			pthread_mutex_unlock(&cache.lock);
 			return 0;
 		}
@@ -344,8 +344,7 @@ static int cache_getdir(const char *path, fuse_dirh_t h, fuse_dirfil_t filler)
 static int cache_unity_dirfill(fuse_cache_dirh_t ch, const char *name,
                                const struct stat *stbuf)
 {
-	(void) stbuf;
-	return ch->filler(ch->h, name, 0, 0);
+	return ch->filler(ch->h, name, 0, stbuf->st_ino);
 }
 
 static int cache_unity_getdir(const char *path, fuse_dirh_t h,

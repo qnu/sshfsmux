@@ -1,0 +1,8 @@
+How to apply the patches.
+1. Download the OpenSSH source code from http://openssh.org/
+2. Extract OpenSSH tarball
+3. cd into the OpenSSH source directory
+4. Test patch by 'patch -p1 -i path/to/openssh-X.YpZ.patch --dry-run'
+5. Patch source by 'patch -p1 -i path/to/openssh-X.YpZ.patch'
+6. 'configure && make'
+7. 'make install'
