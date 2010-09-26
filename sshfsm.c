@@ -125,7 +125,14 @@
 #define SFTP_EXT_POSIX_RENAME "posix-rename@openssh.com"
 #define SFTP_EXT_STATVFS "statvfs@openssh.com"
 
-#define INADDR_MASK 0x1234567800000000
+/* 0x1234------------LLU: in_addr flag
+ * 0x----XXXX--------LLU: hops of in_addr piggybacking
+ * 0x--------XXXXXXXXLLU: in_addr (ip address) */
+#define INADDR_FLAG 0x1234000000000000LLU
+#define INADDR_MASK 0x1111000000000000LLU
+#define INADDR_HOPS 0x0000111100000000LLU
+#define INADDR_HOPS_1 0x0000000100000000LLU
+#define INADDR_ADDR 0x0000000011111111LLU
 
 #define PROTO_VERSION 3
 
@@ -857,9 +864,9 @@ static int buf_get_attrs(struct buffer *buf, struct stat *stbuf, int *flagsp)
 	stbuf->st_atime = atime;
 	stbuf->st_ctime = stbuf->st_mtime = mtime;
 	stbuf->st_ino = ino;
-	if (sshfsm.inaddr_ino && 
-		(ino & 0x1111111100000000) != INADDR_MASK) 
-		stbuf->st_ino = INADDR_MASK + sshfsm.host_addr.s_addr;
+	if (sshfsm.inaddr_ino && (ino & INADDR_MASK) != INADDR_FLAG)
+		/* flag + (hops+1) + ip address */
+		stbuf->st_ino = INADDR_FLAG + INADDR_HOPS_1 + sshfsm.host_addr.s_addr;
 
 	return 0;
 }
@@ -1709,27 +1716,25 @@ out:
 	return err;
 }
 
-static int get_hostinfo(char *host, char *port)
+static int get_hostinfo(char *host, char *port, struct in_addr *addr)
 {	
 	int err;
 	struct addrinfo *ai;
 	struct addrinfo hint;
-	struct in_addr addr;
 
 	memset(&hint, 0, sizeof(hint));
 	hint.ai_family = AF_INET;
 	hint.ai_socktype = SOCK_STREAM;
 	err = getaddrinfo(host, port, &hint, &ai);
 	if (err) {
-		fprintf(stderr, "failed to resolve %s:%s: %s\n", host, port,
-			gai_strerror(err));
+		debug("failed to resolve %s: %s\n", host, gai_strerror(err));
+		addr->s_addr = 0;
 		return -1;
 	}
 
-	addr.s_addr = ((struct sockaddr_in *) (ai->ai_addr))->sin_addr.s_addr;
-	debug("%s has ip address: %s (%u)", host, inet_ntoa(addr), addr.s_addr);
+	addr->s_addr = ((struct sockaddr_in *) (ai->ai_addr))->sin_addr.s_addr;
+	debug("%s has ip address: %s (%u)", host, inet_ntoa(*addr), addr->s_addr);
 	
-	sshfsm.host_addr = addr;
 	freeaddrinfo(ai);
 	return 0;
 }
@@ -1738,7 +1743,7 @@ static int connect_remote(void)
 {
 	int err;
 
-	get_hostinfo(sshfsm.host, sshfsm.directport);
+	get_hostinfo(sshfsm.host, sshfsm.directport, &sshfsm.host_addr);
 
 	if (sshfsm.sftp_local_server)
 		err = sftp_local_connect();
