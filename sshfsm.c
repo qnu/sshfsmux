@@ -125,14 +125,17 @@
 #define SFTP_EXT_POSIX_RENAME "posix-rename@openssh.com"
 #define SFTP_EXT_STATVFS "statvfs@openssh.com"
 
-/* 0x1234------------LLU: in_addr flag
+/* 
+ * inaddr piggybacking flags
+ * 0x1234------------LLU: in_addr flag
  * 0x----XXXX--------LLU: hops of in_addr piggybacking
- * 0x--------XXXXXXXXLLU: in_addr (ip address) */
+ * 0x--------XXXXXXXXLLU: in_addr (ip address)
+ */
 #define INADDR_FLAG 0x1234000000000000LLU
-#define INADDR_MASK 0x1111000000000000LLU
-#define INADDR_HOPS 0x0000111100000000LLU
+#define INADDR_MASK 0xffff000000000000LLU
+#define INADDR_HOPS 0x0000ffff00000000LLU
 #define INADDR_HOPS_1 0x0000000100000000LLU
-#define INADDR_ADDR 0x0000000011111111LLU
+#define INADDR_ADDR 0x00000000ffffffffLLU
 
 #define PROTO_VERSION 3
 
@@ -263,6 +266,7 @@ struct sshfsm {
 	char *psk_path;
 	char *sftp_local_server;
 	int inaddr_ino;
+	unsigned int inaddr_hops;
 
 	/* statistics */
 	uint64_t bytes_sent;
@@ -378,6 +382,7 @@ static struct fuse_opt sshfsm_opts[] = {
 	SSHFSM_OPT("session_dir=%s",    session_dir, 0),
 	SSHFSM_OPT("dump",              dump, 1),
 	SSHFSM_OPT("inaddr_ino",        inaddr_ino, 1),
+	SSHFSM_OPT("inaddr_hops=%u",    inaddr_hops, 0),
 	
 	/* Append a space if the option takes an argument */
 	FUSE_OPT_KEY("-p ",             KEY_PORT),
@@ -457,6 +462,7 @@ static int sftp_proxy_connect(char *host, char *port);
 	fprintf(stderr, "log: "format"\n", ## __VA_ARGS__)
 #define debug(format, ...) \
 	if (sshfsm.debug) {fprintf(stderr, "debug: "format"\n", ## __VA_ARGS__);}
+#define get_ino_hops(ino) ((ino & INADDR_HOPS) >> 32)
 
 static inline char * g_strdup_and_free(char *s)
 {
@@ -863,10 +869,14 @@ static int buf_get_attrs(struct buffer *buf, struct stat *stbuf, int *flagsp)
 	stbuf->st_gid = gid;
 	stbuf->st_atime = atime;
 	stbuf->st_ctime = stbuf->st_mtime = mtime;
+	if (sshfsm.inaddr_ino) { 
+		if ((ino & INADDR_MASK) != INADDR_FLAG)
+			ino = INADDR_FLAG + sshfsm.host_addr.s_addr;
+		else if (get_ino_hops(ino) <= sshfsm.inaddr_hops)
+			ino = (ino & 0xffffffff00000000LLU) + sshfsm.host_addr.s_addr;
+		ino += INADDR_HOPS_1;
+	}
 	stbuf->st_ino = ino;
-	if (sshfsm.inaddr_ino && (ino & INADDR_MASK) != INADDR_FLAG)
-		/* flag + (hops+1) + ip address */
-		stbuf->st_ino = INADDR_FLAG + INADDR_HOPS_1 + sshfsm.host_addr.s_addr;
 
 	return 0;
 }
@@ -3553,6 +3563,7 @@ static void usage(const char *progname)
 "    -o sftp_server=SERV    path to sftp server or subsystem (default: sftp)\n"
 "    -o directport=PORT     directly connect to PORT bypassing ssh\n"
 "    -o inaddr_ino          piggybacking ip address using inode numbers"
+"    -o inaddr_hops=N       hops of the Nth ip address (default: 0)"
 "    -o transform_symlinks  transform absolute symlinks to relative\n"
 "    -o follow_symlinks     follow symlinks on the server\n"
 "    -o no_check_root       don't check for existence of 'dir' on server\n"
@@ -3906,6 +3917,7 @@ int main(int argc, char *argv[])
 	sshfsm.backlog = 20;
 	sshfsm.sndbuf = 0;
 	sshfsm.rcvbuf = 0;
+	sshfsm.inaddr_hops = 0;
 	sshfsm.errlog = stderr;
 	ssh_add_arg("ssh");
 	ssh_add_arg("-x");
