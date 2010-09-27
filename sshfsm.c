@@ -197,22 +197,6 @@ struct read_chunk {
 	long modifver;
 };
 
-struct sshfsm_file {
-	struct buffer handle;
-	struct list_head write_reqs;
-	pthread_cond_t write_finished;
-	int write_error;
-	struct read_chunk *readahead;
-	off_t next_pos;
-	int is_seq;
-	int connver;
-	int modifver;
-	int refs;
-	struct serv *srv;
-	int local_fd;
-	struct in_addr inaddr;	/* piggybacked location */
-};
-
 struct serv {
 	char *hostname;
 	struct in_addr inaddr;
@@ -246,6 +230,23 @@ struct serv {
 	uint64_t total_rtt;
 	unsigned int num_connect;
 };
+typedef struct serv * serv_t;
+
+struct sshfsm_file {
+	struct buffer handle;
+	struct list_head write_reqs;
+	pthread_cond_t write_finished;
+	int write_error;
+	struct read_chunk *readahead;
+	off_t next_pos;
+	int is_seq;
+	int connver;
+	int modifver;
+	int refs;
+	serv_t serv;
+	int local_fd;
+	struct in_addr inaddr;	/* piggybacked location */
+};
 
 struct sshfsm {
 	char *directport;
@@ -255,7 +256,7 @@ struct sshfsm {
 	char *workarounds;
 	int rename_workaround;
 	int nodelay_workaround;
-	int nodelaysrv_workaround;
+	int nodelayserv_workaround;
 	int truncate_workaround;
 	int buflimit_workaround;
 	int transform_symlinks;
@@ -271,28 +272,11 @@ struct sshfsm {
 	int foreground;
 	int reconnect;
 	int delay_connect;
-	char *host;
-	struct in_addr host_addr;
-	char *base_path;
-	GHashTable *reqtab;
-	pthread_mutex_t lock;
-	pthread_mutex_t lock_write;
-	int processing_thread_started;
 	unsigned int randseed;
-	int fd;
-	int ptyfd;
-	int ptyslavefd;
-	int connver;
-	int server_version;
-	unsigned remote_uid;
 	unsigned local_uid;
-	int remote_uid_detected;
 	unsigned blksize;
 	char *progname;
-	long modifver;
-	unsigned outstanding_len;
 	unsigned max_outstanding_len;
-	pthread_cond_t outstanding_cond;
 	int password_stdin;
 	char *password;
 	int ext_posix_rename;
@@ -310,6 +294,7 @@ struct sshfsm {
 	unsigned int inaddr_nth;
 	GPtrArray *serv_arr;
 	GNode *tree;
+	pthread_mutex_t lock_serv_arr;
 
 	/* statistics */
 	uint64_t bytes_sent;
@@ -446,20 +431,20 @@ static struct fuse_opt sshfsm_opts[] = {
 static struct fuse_opt workaround_opts[] = {
 	SSHFSM_OPT("none",       rename_workaround, 0),
 	SSHFSM_OPT("none",       nodelay_workaround, 0),
-	SSHFSM_OPT("none",       nodelaysrv_workaround, 0),
+	SSHFSM_OPT("none",       nodelayserv_workaround, 0),
 	SSHFSM_OPT("none",       truncate_workaround, 0),
 	SSHFSM_OPT("none",       buflimit_workaround, 0),
 	SSHFSM_OPT("all",        rename_workaround, 1),
 	SSHFSM_OPT("all",        nodelay_workaround, 1),
-	SSHFSM_OPT("all",        nodelaysrv_workaround, 1),
+	SSHFSM_OPT("all",        nodelayserv_workaround, 1),
 	SSHFSM_OPT("all",        truncate_workaround, 1),
 	SSHFSM_OPT("all",        buflimit_workaround, 1),
 	SSHFSM_OPT("rename",     rename_workaround, 1),
 	SSHFSM_OPT("norename",   rename_workaround, 0),
 	SSHFSM_OPT("nodelay",    nodelay_workaround, 1),
 	SSHFSM_OPT("nonodelay",  nodelay_workaround, 0),
-	SSHFSM_OPT("nodelaysrv", nodelaysrv_workaround, 1),
-	SSHFSM_OPT("nonodelaysrv", nodelaysrv_workaround, 0),
+	SSHFSM_OPT("nodelayserv", nodelayserv_workaround, 1),
+	SSHFSM_OPT("nonodelayserv", nodelayserv_workaround, 0),
 	SSHFSM_OPT("truncate",   truncate_workaround, 1),
 	SSHFSM_OPT("notruncate", truncate_workaround, 0),
 	SSHFSM_OPT("buflimit",   buflimit_workaround, 1),
@@ -490,8 +475,8 @@ static void perror2(const char *format, ...)
 }
 
 /* forward all function declarations here */
-static int sftp_local_connect(void);
-static int sftp_proxy_connect(char *host, char *port);
+static int sftp_local_connect(serv_t);
+static int sftp_proxy_connect(serv_t, char *);
 
 static int tree_init(void);
 static void tree_destroy(void);
@@ -767,19 +752,19 @@ static inline void buf_add_string(struct buffer *buf, const char *str)
 	buf_add_data(buf, &data);
 }
 
-static inline void buf_add_path(struct serv *srv, struct buffer *buf, 
+static inline void buf_add_path(serv_t serv, struct buffer *buf, 
 	const char *path)
 {
 	char *realpath;
 
-	if (srv->basepath[0]) {
+	if (serv->basepath[0]) {
 		if (path[1]) {
-			if (srv->basepath[strlen(srv->basepath)-1] != '/')
-				realpath = g_strdup_printf("%s/%s", srv->basepath, path + 1);
+			if (serv->basepath[strlen(serv->basepath)-1] != '/')
+				realpath = g_strdup_printf("%s/%s", serv->basepath, path + 1);
 			else
-				realpath = g_strdup_printf("%s%s", srv->basepath, path + 1);
+				realpath = g_strdup_printf("%s%s", serv->basepath, path + 1);
 		} else
-			realpath = g_strdup(srv->basepath);
+			realpath = g_strdup(serv->basepath);
 	} else {
 		if (path[1])
 			realpath = g_strdup(path + 1);
@@ -858,7 +843,7 @@ static inline int buf_get_string(struct buffer *buf, char **str)
 	return 0;
 }
 
-static int buf_get_attrs(struct serv *srv, struct buffer *buf, 
+static int buf_get_attrs(serv_t serv, struct buffer *buf, 
 						 struct stat *stbuf, int *flagsp)
 {
 	uint32_t flags;
@@ -907,7 +892,7 @@ static int buf_get_attrs(struct serv *srv, struct buffer *buf,
 	}
 
 	/* TODO: Set local uid properly */
-	if (srv->remote_uid_detected && uid == srv->remote_uid)
+	if (serv->remote_uid_detected && uid == serv->remote_uid)
 		uid = sshfsm.local_uid;
 
 	memset(stbuf, 0, sizeof(struct stat));
@@ -925,10 +910,9 @@ static int buf_get_attrs(struct serv *srv, struct buffer *buf,
 	stbuf->st_ctime = stbuf->st_mtime = mtime;
 	if (sshfsm.inaddr_ino) { 
 		if ((ino & INADDR_MASK) != INADDR_FLAG)
-			/* TODO: set server address */
-			ino = INADDR_FLAG + sshfsm.host_addr.s_addr;
+			ino = INADDR_FLAG + serv->inaddr.s_addr;
 		else if (get_ino_hops(ino) <= sshfsm.inaddr_nth)
-			ino = (ino & 0xffffffff00000000LLU) + sshfsm.host_addr.s_addr;
+			ino = (ino & 0xffffffff00000000LLU) + serv->inaddr.s_addr;
 		ino += 0x0000000100000000LLU;
 	}
 	stbuf->st_ino = ino;
@@ -977,7 +961,7 @@ static int buf_get_statvfs(struct buffer *buf, struct statvfs *stbuf)
 	return 0;
 }
 
-static int buf_get_entries_0(struct serv *srv, struct buffer *buf, 
+static int buf_get_entries_0(serv_t serv, struct buffer *buf, 
 	fuse_cache_dirh_t h, fuse_cache_dirfil_t filler)
 {
 	uint32_t count;
@@ -995,7 +979,7 @@ static int buf_get_entries_0(struct serv *srv, struct buffer *buf,
 			return -1;
 		if (buf_get_string(buf, &longname) != -1) {
 			free(longname);
-			if (buf_get_attrs(srv, buf, &stbuf, NULL) != -1) {
+			if (buf_get_attrs(serv, buf, &stbuf, NULL) != -1) {
 				if (sshfsm.follow_symlinks && S_ISLNK(stbuf.st_mode))
 					stbuf.st_mode = 0;
 				filler(h, name, &stbuf);
@@ -1060,7 +1044,7 @@ static int do_ssh_nodelay_workaround(void)
 }
 #endif
 
-static int pty_expect_loop(struct serv *srv)
+static int pty_expect_loop(serv_t serv)
 {
 	int res;
 	char buf[256];
@@ -1073,9 +1057,9 @@ static int pty_expect_loop(struct serv *srv)
 	while (1) {
 		struct pollfd fds[2];
 
-		fds[0].fd = srv->fd;
+		fds[0].fd = serv->fd;
 		fds[0].events = POLLIN;
-		fds[1].fd = srv->ptyfd;
+		fds[1].fd = serv->ptyfd;
 		fds[1].events = POLLIN;
 		res = poll(fds, 2, timeout);
 		if (res == -1) {
@@ -1096,7 +1080,7 @@ static int pty_expect_loop(struct serv *srv)
 			break;
 		}
 
-		res = read(srv->ptyfd, &c, 1);
+		res = read(serv->ptyfd, &c, 1);
 		if (res == -1) {
 			perror2("failed to read");
 			return -1;
@@ -1109,7 +1093,7 @@ static int pty_expect_loop(struct serv *srv)
 		len++;
 		if (len == passwd_len) {
 			if (memcmp(buf, passwd_str, passwd_len) == 0) {
-				res = write(srv->ptyfd, sshfsm.password,
+				res = write(serv->ptyfd, sshfsm.password,
 				      strlen(sshfsm.password));
 			}
 			memmove(buf, buf + 1, passwd_len - 1);
@@ -1160,7 +1144,7 @@ static void replace_arg(char **argp, const char *newarg)
 	}
 }
 
-static int start_ssh(struct serv *srv)
+static int start_ssh(serv_t serv)
 {
 	char *ptyname = NULL;
 	int sockpair[2];
@@ -1172,16 +1156,16 @@ static int start_ssh(struct serv *srv)
 		if (fuse_opt_add_arg(&ssh_args, sshfsm.ssh_args.argv[i]) == -1)
 			return -1;
 	}
-	if (fuse_opt_insert_arg(&ssh_args, 1, srv->hostname) == -1)
+	if (fuse_opt_insert_arg(&ssh_args, 1, serv->hostname) == -1)
 		return -1;
 
 	if (sshfsm.password_stdin) {
-		srv->ptyfd = pty_master(&ptyname);
-		if (srv->ptyfd == -1)
+		serv->ptyfd = pty_master(&ptyname);
+		if (serv->ptyfd == -1)
 			return -1;
 
-		srv->ptyslavefd = open(ptyname, O_RDWR | O_NOCTTY);
-		if (srv->ptyslavefd == -1)
+		serv->ptyslavefd = open(ptyname, O_RDWR | O_NOCTTY);
+		if (serv->ptyslavefd == -1)
 			return -1;
 	}
 
@@ -1189,7 +1173,7 @@ static int start_ssh(struct serv *srv)
 		perror2("failed to create socket pair");
 		return -1;
 	}
-	srv->fd = sockpair[0];
+	serv->fd = sockpair[0];
 
 	pid = fork();
 	if (pid == -1) {
@@ -1206,7 +1190,7 @@ static int start_ssh(struct serv *srv)
 		}
 #endif
 
-		if (sshfsm.nodelaysrv_workaround) {
+		if (sshfsm.nodelayserv_workaround) {
 			int i;
 			/*
 			 * Hack to work around missing TCP_NODELAY
@@ -1254,8 +1238,8 @@ static int start_ssh(struct serv *srv)
 				_exit(1);
 			}
 			close(sfd);
-			close(srv->ptyslavefd);
-			close(srv->ptyfd);
+			close(serv->ptyslavefd);
+			close(serv->ptyfd);
 		}
 
 		if (sshfsm.debug) {
@@ -1278,11 +1262,11 @@ static int start_ssh(struct serv *srv)
 	return 0;
 }
 
-static int do_write(struct serv *srv, struct iovec *iov, size_t count)
+static int do_write(serv_t serv, struct iovec *iov, size_t count)
 {
 	int res;
 	while (count) {
-		res = writev(srv->fd, iov, count);
+		res = writev(serv->fd, iov, count);
 		if (res == -1) {
 			perror2("failed to writev");
 			return -1;
@@ -1329,7 +1313,7 @@ static size_t iov_length(const struct iovec *iov, unsigned long nr_segs)
 
 #define SFTP_MAX_IOV 3
 
-static int sftp_send_iov(struct serv *srv, uint8_t type, uint32_t id, 
+static int sftp_send_iov(serv_t serv, uint8_t type, uint32_t id, 
 	struct iovec iov[], size_t count)
 {
 	int res;
@@ -1346,25 +1330,25 @@ static int sftp_send_iov(struct serv *srv, uint8_t type, uint32_t id,
 	buf_to_iov(&buf, &iovout[nout++]);
 	for (i = 0; i < count; i++)
 		iovout[nout++] = iov[i];
-	pthread_mutex_lock(&srv->lock_write);
-	res = do_write(srv, iovout, nout);
-	pthread_mutex_unlock(&srv->lock_write);
+	pthread_mutex_lock(&serv->lock_write);
+	res = do_write(serv, iovout, nout);
+	pthread_mutex_unlock(&serv->lock_write);
 	buf_free(&buf);
 	return res;
 }
 
-static int do_read(struct serv *srv, struct buffer *buf)
+static int do_read(serv_t serv, struct buffer *buf)
 {
 	int res;
 	uint8_t *p = buf->p;
 	size_t size = buf->size;
 	while (size) {
-		res = read(srv->fd, p, size);
+		res = read(serv->fd, p, size);
 		if (res == -1) {
 			perror2("failed to read");
 			return -1;
 		} else if (res == 0) {
-			error3("remote host %s has disconnected", srv->hostname);
+			error3("remote host %s has disconnected", serv->hostname);
 			return -1;
 		}
 		size -= res;
@@ -1373,13 +1357,13 @@ static int do_read(struct serv *srv, struct buffer *buf)
 	return 0;
 }
 
-static int sftp_read(struct serv *srv, uint8_t *type, struct buffer *buf)
+static int sftp_read(serv_t serv, uint8_t *type, struct buffer *buf)
 {
 	int res;
 	struct buffer buf2;
 	uint32_t len;
 	buf_init(&buf2, 5);
-	res = do_read(srv, &buf2);
+	res = do_read(serv, &buf2);
 	if (res != -1) {
 		if (buf_get_uint32(&buf2, &len) == -1)
 			return -1;
@@ -1390,7 +1374,7 @@ static int sftp_read(struct serv *srv, uint8_t *type, struct buffer *buf)
 		if (buf_get_uint8(&buf2, type) == -1)
 			return -1;
 		buf_init(buf, len - 1);
-		res = do_read(srv, buf);
+		res = do_read(serv, buf);
 	}
 	buf_free(&buf2);
 	return res;
@@ -1419,11 +1403,11 @@ static void chunk_put(struct read_chunk *chunk)
 	}
 }
 
-static void chunk_put_locked(struct serv *srv, struct read_chunk *chunk)
+static void chunk_put_locked(serv_t serv, struct read_chunk *chunk)
 {
-	pthread_mutex_lock(&srv->lock);
+	pthread_mutex_lock(&serv->lock);
 	chunk_put(chunk);
-	pthread_mutex_unlock(&srv->lock);
+	pthread_mutex_unlock(&serv->lock);
 }
 
 static int clean_req(void *key_, struct request *req)
@@ -1441,7 +1425,7 @@ static int clean_req(void *key_, struct request *req)
 	return TRUE;
 }
 
-static int process_one_request(struct serv *srv)
+static int process_one_request(serv_t serv)
 {
 	int res;
 	struct buffer buf;
@@ -1450,29 +1434,29 @@ static int process_one_request(struct serv *srv)
 	uint32_t id;
 
 	buf_init(&buf, 0);
-	res = sftp_read(srv, &type, &buf);
+	res = sftp_read(serv, &type, &buf);
 	if (res == -1)
 		return -1;
 	if (buf_get_uint32(&buf, &id) == -1)
 		return -1;
 
-	pthread_mutex_lock(&srv->lock);
+	pthread_mutex_lock(&serv->lock);
 	req = (struct request *)
-		g_hash_table_lookup(srv->reqtab, GUINT_TO_POINTER(id));
+		g_hash_table_lookup(serv->reqtab, GUINT_TO_POINTER(id));
 	if (req == NULL)
 		error3("request %i not found", id);
 	else {
 		int was_over;
 
-		was_over = srv->outstanding_len > sshfsm.max_outstanding_len;
-		srv->outstanding_len -= req->len;
+		was_over = serv->outstanding_len > sshfsm.max_outstanding_len;
+		serv->outstanding_len -= req->len;
 		if (was_over &&
-		    srv->outstanding_len <= sshfsm.max_outstanding_len) {
-			pthread_cond_broadcast(&srv->outstanding_cond);
+		    serv->outstanding_len <= sshfsm.max_outstanding_len) {
+			pthread_cond_broadcast(&serv->outstanding_cond);
 		}
-		g_hash_table_remove(srv->reqtab, GUINT_TO_POINTER(id));
+		g_hash_table_remove(serv->reqtab, GUINT_TO_POINTER(id));
 	}
-	pthread_mutex_unlock(&srv->lock);
+	pthread_mutex_unlock(&serv->lock);
 	if (req != NULL) {
 		if (sshfsm.debug) {
 			struct timeval now;
@@ -1485,13 +1469,13 @@ static int process_one_request(struct serv *srv)
 			debug("  [%05i] %14s %8ubytes (%ims)", id,
 			      type_name(type), msgsize, difftime);
 
-			if (difftime < srv->min_rtt || !srv->num_received)
-				srv->min_rtt = difftime;
-			if (difftime > srv->max_rtt)
-				srv->max_rtt = difftime;
-			srv->total_rtt += difftime;
-			srv->num_received++;
-			srv->bytes_received += msgsize;
+			if (difftime < serv->min_rtt || !serv->num_received)
+				serv->min_rtt = difftime;
+			if (difftime > serv->max_rtt)
+				serv->max_rtt = difftime;
+			serv->total_rtt += difftime;
+			serv->num_received++;
+			serv->bytes_received += msgsize;
 		}
 		req->reply = buf;
 		req->reply_type = type;
@@ -1500,9 +1484,9 @@ static int process_one_request(struct serv *srv)
 			sem_post(&req->ready);
 		else {
 			if (req->end_func) {
-				pthread_mutex_lock(&srv->lock);
+				pthread_mutex_lock(&serv->lock);
 				req->end_func(req);
-				pthread_mutex_unlock(&srv->lock);
+				pthread_mutex_unlock(&serv->lock);
 			}
 			request_free(req);
 		}
@@ -1512,26 +1496,26 @@ static int process_one_request(struct serv *srv)
 	return 0;
 }
 
-static void close_conn(struct serv *srv)
+static void close_conn(serv_t serv)
 {
-	close(srv->fd);
-	srv->fd = -1;
-	if (srv->ptyfd != -1) {
-		close(srv->ptyfd);
-		srv->ptyfd = -1;
+	close(serv->fd);
+	serv->fd = -1;
+	if (serv->ptyfd != -1) {
+		close(serv->ptyfd);
+		serv->ptyfd = -1;
 	}
-	if (srv->ptyslavefd != -1) {
-		close(srv->ptyslavefd);
-		srv->ptyslavefd = -1;
+	if (serv->ptyslavefd != -1) {
+		close(serv->ptyslavefd);
+		serv->ptyslavefd = -1;
 	}
 }
 
 static void *process_requests(void *data)
 {
-	struct serv *srv = (struct serv *) data;
+	serv_t serv = (struct serv *) data;
 
 	while (1) {
-		if (process_one_request(srv) == -1)
+		if (process_one_request(serv) == -1)
 			break;
 	}
 
@@ -1539,17 +1523,17 @@ static void *process_requests(void *data)
 		/* harakiri */
 		kill(getpid(), SIGTERM);
 	} else {
-		pthread_mutex_lock(&srv->lock);
-		sshfsm.processing_thread_started = 0;
-		close_conn(srv);
-		g_hash_table_foreach_remove(srv->reqtab, (GHRFunc) clean_req, NULL);
-		srv->connver ++;
-		pthread_mutex_unlock(&srv->lock);
+		pthread_mutex_lock(&serv->lock);
+		serv->processing_thread_started = 0;
+		close_conn(serv);
+		g_hash_table_foreach_remove(serv->reqtab, (GHRFunc) clean_req, NULL);
+		serv->connver ++;
+		pthread_mutex_unlock(&serv->lock);
 	}
 	return NULL;
 }
 
-static int sftp_init_reply_ok(struct serv *srv, struct buffer *buf, 
+static int sftp_init_reply_ok(serv_t serv, struct buffer *buf, 
 	uint32_t *version)
 {
 	uint32_t len;
@@ -1576,7 +1560,7 @@ static int sftp_init_reply_ok(struct serv *srv, struct buffer *buf,
 		struct buffer buf2;
 
 		buf_init(&buf2, len - 5);
-		if (do_read(srv, &buf2) == -1)
+		if (do_read(serv, &buf2) == -1)
 			return -1;
 
 		do {
@@ -1602,17 +1586,17 @@ static int sftp_init_reply_ok(struct serv *srv, struct buffer *buf,
 	return 0;
 }
 
-static int sftp_find_init_reply(struct serv *srv, uint32_t *version)
+static int sftp_find_init_reply(serv_t serv, uint32_t *version)
 {
 	int res;
 	struct buffer buf;
 
 	buf_init(&buf, 9);
-	res = do_read(srv, &buf);
+	res = do_read(serv, &buf);
 	while (res != -1) {
 		struct buffer buf2;
 
-		res = sftp_init_reply_ok(srv, &buf, version);
+		res = sftp_init_reply_ok(serv, &buf, version);
 		if (res <= 0)
 			break;
 
@@ -1622,28 +1606,28 @@ static int sftp_find_init_reply(struct serv *srv, uint32_t *version)
 		buf.len = 0;
 		buf2.p = buf.p + buf.size - 1;
 		buf2.size = 1;
-		res = do_read(srv, &buf2);
+		res = do_read(serv, &buf2);
 	}
 	buf_free(&buf);
 	return res;
 }
 
-static int sftp_init(struct serv *srv)
+static int sftp_init(serv_t serv)
 {
 	int res = -1;
 	uint32_t version = 0;
 	struct buffer buf;
 	buf_init(&buf, 0);
-	if (sftp_send_iov(srv, SSH_FXP_INIT, PROTO_VERSION, NULL, 0) == -1)
+	if (sftp_send_iov(serv, SSH_FXP_INIT, PROTO_VERSION, NULL, 0) == -1)
 		goto out;
 
-	if (sshfsm.password_stdin && pty_expect_loop(srv) == -1)
+	if (sshfsm.password_stdin && pty_expect_loop(serv) == -1)
 		goto out;
 
-	if (sftp_find_init_reply(srv, &version) == -1)
+	if (sftp_find_init_reply(serv, &version) == -1)
 		goto out;
 
-	sshfsm.server_version = version;
+	serv->version = version;
 	if (version > PROTO_VERSION)
 		warning("server uses version: %i, we support: %i",
 			version, PROTO_VERSION);
@@ -1669,11 +1653,11 @@ static int sftp_error_to_errno(uint32_t error)
 	}
 }
 
-static void sftp_detect_uid(struct serv *srv)
+static void sftp_detect_uid(serv_t serv)
 {
-	if (srv->local) {
-		srv->remote_uid = sshfsm.local_uid = getuid();
-		srv->remote_uid_detected = 1;
+	if (serv->local) {
+		serv->remote_uid = sshfsm.local_uid = getuid();
+		serv->remote_uid_detected = 1;
 		return;
 	}
 
@@ -1688,10 +1672,10 @@ static void sftp_detect_uid(struct serv *srv)
 	buf_init(&buf, 5);
 	buf_add_string(&buf, ".");
 	buf_to_iov(&buf, &iov[0]);
-	if (sftp_send_iov(srv, SSH_FXP_STAT, id, iov, 1) == -1)
+	if (sftp_send_iov(serv, SSH_FXP_STAT, id, iov, 1) == -1)
 		goto out;
 	buf_clear(&buf);
-	if (sftp_read(srv, &type, &buf) == -1)
+	if (sftp_read(serv, &type, &buf) == -1)
 		goto out;
 	if (type != SSH_FXP_ATTRS && type != SSH_FXP_STATUS) {
 		error3("protocol perror2");
@@ -1711,29 +1695,29 @@ static void sftp_detect_uid(struct serv *srv)
 		error3("failed to stat home directory (%i)", serr);
 		goto out;
 	}
-	if (buf_get_attrs(srv, &buf, &stbuf, &flags) == -1)
+	if (buf_get_attrs(serv, &buf, &stbuf, &flags) == -1)
 		goto out;
 
 	if (!(flags & SSH_FILEXFER_ATTR_UIDGID))
 		goto out;
 
-	sshfsm.remote_uid = stbuf.st_uid;
+	serv->remote_uid = stbuf.st_uid;
 	sshfsm.local_uid = getuid();
-	sshfsm.remote_uid_detected = 1;
-	debug("remote_uid = %i", sshfsm.remote_uid);
+	serv->remote_uid_detected = 1;
+	debug("remote_uid = %i", serv->remote_uid);
 
 out:
-	if (!sshfsm.remote_uid_detected)
-		error3("failed to detect remote user ID for %s\n", srv->hostname);
+	if (!serv->remote_uid_detected)
+		error3("failed to detect remote user ID for %s\n", serv->hostname);
 
 	buf_free(&buf);
 }
 
-static int sftp_check_root(struct serv *srv)
+static int sftp_check_root(serv_t serv)
 {
 	struct stat stbuf;
-	if (srv->local) {
-		char *realpath = serv_add_path(srv, ".");
+	if (serv->local) {
+		char *realpath = serv_add_path(serv, ".");
 		int res = lstat(realpath, &stbuf);
 		g_free(realpath);
 		return res;
@@ -1746,15 +1730,15 @@ static int sftp_check_root(struct serv *srv)
 	struct buffer buf;
 	struct iovec iov[1];
 	int err = -1;
-	const char *remote_dir = srv->basepath[0] ? srv->basepath : ".";
+	const char *remote_dir = serv->basepath[0] ? serv->basepath : ".";
 
 	buf_init(&buf, 0);
 	buf_add_string(&buf, remote_dir);
 	buf_to_iov(&buf, &iov[0]);
-	if (sftp_send_iov(srv, SSH_FXP_STAT, id, iov, 1) == -1)
+	if (sftp_send_iov(serv, SSH_FXP_STAT, id, iov, 1) == -1)
 		goto out;
 	buf_clear(&buf);
-	if (sftp_read(srv, &type, &buf) == -1)
+	if (sftp_read(serv, &type, &buf) == -1)
 		goto out;
 	if (type != SSH_FXP_ATTRS && type != SSH_FXP_STATUS) {
 		perror2("protocol error");
@@ -1771,24 +1755,24 @@ static int sftp_check_root(struct serv *srv)
 		if (buf_get_uint32(&buf, &serr) == -1)
 			goto out;
 
-		error3("%s:%s: %s", srv->hostname, remote_dir,
+		error3("%s:%s: %s", serv->hostname, remote_dir,
 			strerror(sftp_error_to_errno(serr)));
 
 		goto out;
 	}
-	if (buf_get_attrs(srv, &buf, &stbuf, &flags) == -1)
+	if (buf_get_attrs(serv, &buf, &stbuf, &flags) == -1)
 		goto out;
 
 	if (!(flags & SSH_FILEXFER_ATTR_PERMISSIONS))
 		goto out;
 
 	if (S_ISDIR(sshfsm.mnt_mode) && !S_ISDIR(stbuf.st_mode)) {
-		error3("%s:%s: Not a directory", srv->hostname, remote_dir);
+		error3("%s:%s: Not a directory", serv->hostname, remote_dir);
 		goto out;
 	}
 	if ((sshfsm.mnt_mode ^ stbuf.st_mode) & S_IFMT) {
 		error3("%s:%s: type of file differs from mountpoint",
-			srv->hostname, remote_dir);
+			serv->hostname, remote_dir);
 		goto out;
 	}
 
@@ -1814,60 +1798,55 @@ static int get_hostinfo(char *host, char *port, struct in_addr *addr)
 		addr->s_addr = 0;
 		return -1;
 	}
-
 	addr->s_addr = ((struct sockaddr_in *) (ai->ai_addr))->sin_addr.s_addr;
-	debug("%s has ip address: %s (%u)", host, inet_ntoa(*addr), addr->s_addr);
 	
 	freeaddrinfo(ai);
 	return 0;
 }
 
-static int connect_remote(struct serv *srv)
+static int connect_remote(serv_t serv)
 {
-	if (srv->local)
+	if (serv->local)
 		return 0;
 
 	int err;
 	
-	/* TODO: move following line */
-	get_hostinfo(sshfsm.host, sshfsm.directport, &sshfsm.host_addr);
-
 	if (sshfsm.sftp_local_server)
-		err = sftp_local_connect();
+		err = sftp_local_connect(serv);
 	else if (sshfsm.directport)
-		err = sftp_proxy_connect(srv->hostname, sshfsm.directport);
+		err = sftp_proxy_connect(serv, sshfsm.directport);
 	else
-		err = start_ssh(srv);
+		err = start_ssh(serv);
 	
 	if (!err)
-		err = sftp_init(srv);
+		err = sftp_init(serv);
 
 	if (err)
-		close_conn(srv);
+		close_conn(serv);
 	else
-		srv->num_connect++;
+		serv->num_connect++;
 
 	return err;
 }
 
-static int start_processing_thread(struct serv *srv)
+static int start_processing_thread(serv_t serv)
 {
 	int err;
 	pthread_t thread_id;
 	sigset_t oldset;
 	sigset_t newset;
 
-	if (srv->processing_thread_started)
+	if (serv->processing_thread_started)
 		return 0;
 
-	if (srv->fd == -1) {
-		err = connect_remote(srv);
+	if (serv->fd == -1) {
+		err = connect_remote(serv);
 		if (err)
 			return -EIO;
 	}
 
 	if (sshfsm.detect_uid)
-		sftp_detect_uid(srv);
+		sftp_detect_uid(serv);
 	
 	/* TODO:NOW */
 	sigemptyset(&newset);
@@ -1883,8 +1862,8 @@ static int start_processing_thread(struct serv *srv)
 	}
 	pthread_detach(thread_id);
 	pthread_sigmask(SIG_SETMASK, &oldset, NULL);
-	srv->thread_id = thread_id;
-	srv->processing_thread_started = 1;
+	serv->thread_id = thread_id;
+	serv->processing_thread_started = 1;
 	return 0;
 }
 
@@ -1893,12 +1872,12 @@ static int start_processing_thread_all(void)
 	/* TODO: use g_ptr_for_each */
 	int err;
 	unsigned int i;
-	struct serv *srv;
+	serv_t serv;
 	for (i = 0; i < serv_num; i++)
-		srv = serv_i(i);
-		if ((err = start_processing_thread(srv)) != 0) {
+		serv = serv_i(i);
+		if ((err = start_processing_thread(serv)) != 0) {
 			error2(err, "%s: starting processing thread failed: %s", 
-					srv->hostname);
+					serv->hostname);
 			return -EIO;
 		}
 	return 0;
@@ -1998,7 +1977,7 @@ static void sshfsm_destroy(void *data_)
 	runtime_destroy();
 }
 
-static int sftp_request_wait(struct serv *srv, struct request *req, 
+static int sftp_request_wait(serv_t serv, struct request *req, 
 	uint8_t type, uint8_t expect_type, struct buffer *outbuf)
 {
 	int err;
@@ -2049,15 +2028,15 @@ static int sftp_request_wait(struct serv *srv, struct request *req,
 
 out:
 	if (req->end_func) {
-		pthread_mutex_lock(&srv->lock);
+		pthread_mutex_lock(&serv->lock);
 		req->end_func(req);
-		pthread_mutex_unlock(&srv->lock);
+		pthread_mutex_unlock(&serv->lock);
 	}
 	request_free(req);
 	return err;
 }
 
-static int sftp_request_send(struct serv *srv,
+static int sftp_request_send(serv_t serv,
 	uint8_t type, struct iovec *iov, size_t count,
 	request_func begin_func, request_func end_func,
     int want_reply, void *data, struct request **reqp)
@@ -2071,34 +2050,34 @@ static int sftp_request_send(struct serv *srv,
 	req->data = data;
 	sem_init(&req->ready, 0, 0);
 	buf_init(&req->reply, 0);
-	pthread_mutex_lock(&sshfsm.lock);
+	pthread_mutex_lock(&serv->lock);
 	if (begin_func)
 		begin_func(req);
 	id = sftp_get_id();
-	err = start_processing_thread(srv);
+	err = start_processing_thread(serv);
 	if (err) {
-		pthread_mutex_unlock(&srv->lock);
+		pthread_mutex_unlock(&serv->lock);
 		goto out;
 	}
 	req->len = iov_length(iov, count) + 9;
-	srv->outstanding_len += req->len;
-	while (srv->outstanding_len > sshfsm.max_outstanding_len)
-		pthread_cond_wait(&srv->outstanding_cond, &srv->lock);
+	serv->outstanding_len += req->len;
+	while (serv->outstanding_len > sshfsm.max_outstanding_len)
+		pthread_cond_wait(&serv->outstanding_cond, &serv->lock);
 
-	g_hash_table_insert(srv->reqtab, GUINT_TO_POINTER(id), req);
+	g_hash_table_insert(serv->reqtab, GUINT_TO_POINTER(id), req);
 	if (sshfsm.debug) {
 		gettimeofday(&req->start, NULL);
-		srv->num_sent++;
-		srv->bytes_sent += req->len;
+		serv->num_sent++;
+		serv->bytes_sent += req->len;
 	}
 	debug("[%05i] %s", id, type_name(type));
-	pthread_mutex_unlock(&srv->lock);
+	pthread_mutex_unlock(&serv->lock);
 
 	err = -EIO;
-	if (sftp_send_iov(srv, type, id, iov, count) == -1) {
-		pthread_mutex_lock(&srv->lock);
-		g_hash_table_remove(srv->reqtab, GUINT_TO_POINTER(id));
-		pthread_mutex_unlock(&srv->lock);
+	if (sftp_send_iov(serv, type, id, iov, count) == -1) {
+		pthread_mutex_lock(&serv->lock);
+		g_hash_table_remove(serv->reqtab, GUINT_TO_POINTER(id));
+		pthread_mutex_unlock(&serv->lock);
 		goto out;
 	}
 	if (want_reply)
@@ -2108,7 +2087,7 @@ static int sftp_request_send(struct serv *srv,
 out:
 	req->error = err;
 	if (!want_reply)
-		sftp_request_wait(srv, req, type, 0, NULL);
+		sftp_request_wait(serv, req, type, 0, NULL);
 	else
 		*reqp = req;
 
@@ -2116,28 +2095,28 @@ out:
 }
 
 
-static int sftp_request_iov(struct serv *srv,
+static int sftp_request_iov(serv_t serv,
 							uint8_t type, struct iovec *iov, size_t count,
                             uint8_t expect_type, struct buffer *outbuf)
 {
 	struct request *req;
 
-	sftp_request_send(srv, type, iov, count, NULL, NULL, expect_type, NULL,
+	sftp_request_send(serv, type, iov, count, NULL, NULL, expect_type, NULL,
 			  &req);
 	if (expect_type == 0)
 		return 0;
 
-	return sftp_request_wait(srv, req, type, expect_type, outbuf);
+	return sftp_request_wait(serv, req, type, expect_type, outbuf);
 }
 
-static int sftp_request(struct serv *srv,
+static int sftp_request(serv_t serv,
 						uint8_t type, const struct buffer *buf,
                         uint8_t expect_type, struct buffer *outbuf)
 {
 	struct iovec iov;
 
 	buf_to_iov(buf, &iov);
-	return sftp_request_iov(srv, type, &iov, 1, expect_type, outbuf);
+	return sftp_request_iov(serv, type, &iov, 1, expect_type, outbuf);
 }
 
 /*
@@ -2160,32 +2139,36 @@ static void tree_destroy(void)
  * FUSE APIs
  */
 /* getattr */
-static int getattr_local(const char *path, struct stat *stbuf)
+static int getattr_local(serv_t serv, const char *path, struct stat *stbuf)
 {
 	int res;
+	char *realpath;
+
+	realpath = serv_add_path(serv, path);
 	if (sshfsm.follow_symlinks)
-		res = stat(path, stbuf);
+		res = stat(realpath, stbuf);
 	else
-		res = lstat(path, stbuf);
+		res = lstat(realpath, stbuf);
+	g_free(realpath);
 	if (res == -1)
 		return -errno;
 	
 	return res;
 }
 
-static int getattr_remote(struct serv *srv,
+static int getattr_remote(serv_t serv,
 	const char *path, struct stat *stbuf)
 {
 	int err;
 	struct buffer buf;
 	struct buffer outbuf;
 	buf_init(&buf, 0);
-	buf_add_path(srv, &buf, path);
-	err = sftp_request(srv, 
+	buf_add_path(serv, &buf, path);
+	err = sftp_request(serv, 
 			sshfsm.follow_symlinks ? SSH_FXP_STAT : SSH_FXP_LSTAT,
 			&buf, SSH_FXP_ATTRS, &outbuf);
 	if (!err) {
-		if (buf_get_attrs(srv, &outbuf, stbuf, NULL) == -1)
+		if (buf_get_attrs(serv, &outbuf, stbuf, NULL) == -1)
 			err = -EIO;
 		buf_free(&outbuf);
 	}
@@ -2193,23 +2176,19 @@ static int getattr_remote(struct serv *srv,
 	return err;
 }
 
-static int serv_getattr(struct serv *srv, const char *path,
+static int serv_getattr(serv_t serv, const char *path,
 						struct stat *stbuf)
 {
-	if (srv->local) {
-		char *realpath = serv_add_path(srv, path);
-		int res = getattr_local(realpath, stbuf);
-		g_free(realpath);
-		return res;
-	}
-
-	return getattr_remote(srv, path, stbuf);
+	return serv->local ? 
+		getattr_local(serv, path, stbuf) : getattr_remote(serv, path, stbuf);
 }
 
 static int sshfsm_getattr(const char *path, struct stat *stbuf)
 {
 	if (serv_num == 1)
 		return serv_getattr(serv_0, path, stbuf);
+
+	return 0;
 }
 
 /* readlink */
@@ -2238,10 +2217,10 @@ static void strip_common(const char **sp, const char **tp)
 	} while ((*s == *t && *s) || (!*s && *t == '/') || (*s == '/' && !*t));
 }
 
-static void transform_symlink(const char *path, char **linkp)
+static void transform_symlink(serv_t serv, const char *path, char **linkp)
 {
 	const char *l = *linkp;
-	const char *b = sshfsm.base_path;
+	const char *b = serv->basepath;
 	char *newlink;
 	char *s;
 	int dotdots;
@@ -2279,29 +2258,34 @@ static void transform_symlink(const char *path, char **linkp)
 	*linkp = newlink;
 }
 
-static int readlink_local(const char *path, char *linkbuf, size_t size)
+static int readlink_local(serv_t serv, const char *path, char *linkbuf, 
+	size_t size)
 {
 	int res;
-	res = readlink(path, linkbuf, size - 1);
+	char *realpath;
+
+	realpath = serv_add_path(serv, path);
+	res = readlink(realpath, linkbuf, size - 1);
+	g_free(realpath);
 	if (res == -1)
 		return -errno;
 	linkbuf[size - 1] = '\0';
 	return res;
 }
 
-static int readlink_remote(struct serv *srv, const char *path, 
+static int readlink_remote(serv_t serv, const char *path, 
 	char *linkbuf, size_t size)
 {
 	int err;
 	struct buffer buf;
 	struct buffer name;
 
-	if (sshfsm.server_version < 3)
+	if (serv->version < 3)
 		return -EPERM;
 
 	buf_init(&buf, 0);
-	buf_add_path(srv, &buf, path);
-	err = sftp_request(srv, SSH_FXP_READLINK, &buf, SSH_FXP_NAME, &name);
+	buf_add_path(serv, &buf, path);
+	err = sftp_request(serv, SSH_FXP_READLINK, &buf, SSH_FXP_NAME, &name);
 	if (!err) {
 		uint32_t count;
 		char *link;
@@ -2309,7 +2293,7 @@ static int readlink_remote(struct serv *srv, const char *path,
 		if(buf_get_uint32(&name, &count) != -1 && count == 1 &&
 		   buf_get_string(&name, &link) != -1) {
 			if (sshfsm.transform_symlinks)
-				transform_symlink(path, &link);
+				transform_symlink(serv, path, &link);
 			strncpy(linkbuf, link, size - 1);
 			linkbuf[size - 1] = '\0';
 			free(link);
@@ -2321,35 +2305,32 @@ static int readlink_remote(struct serv *srv, const char *path,
 	return err;
 }
 
-static int serv_readlink(struct serv *srv, const char *path,
+static int serv_readlink(serv_t serv, const char *path,
 						 char *linkbuf, size_t size)
 {
 	assert(size > 0);
-
-	if (srv->local) {
-		char *realpath = serv_add_path(srv, path);
-		int res = readlink_local(realpath, linkbuf, size);
-		g_free(realpath);
-		return res;
-	}
-
-	return readlink_remote(srv, path, linkbuf, size);
+	return serv->local ? readlink_local(serv, path, linkbuf, size) : 
+		readlink_remote(serv, path, linkbuf, size);
 }
 
 static int sshfsm_readlink(const char *path, char *linkbuf, size_t size)
 {
 	if (serv_num == 1)
 		return serv_readlink(serv_0, path, linkbuf, size);
+	return 0;
 }
 
 /* getdir */
 /* getdir() when there is only one server */
-static int getdir_local_0(const char *path, fuse_cache_dirh_t h,
+static int getdir_local_0(serv_t serv, const char *path, fuse_cache_dirh_t h,
 	fuse_cache_dirfil_t filler)
 {
-	DIR *dp = opendir(path);
-	if (dp == NULL) 
+	char *realpath = serv_add_path(serv, path);
+	DIR *dp = opendir(realpath);
+	if (dp == NULL) {
+		g_free(realpath);
 		return -errno;
+	}
 
 	union {
 		struct dirent de;
@@ -2361,7 +2342,7 @@ static int getdir_local_0(const char *path, fuse_cache_dirh_t h,
 	int res = 0;
 	while ((readdir_r(dp, &u.de, &dep) == 0) && dep) {
 		memset(&stbuf, 0, sizeof(stbuf));
-		filename = g_strdup_printf("%s/%s", path, u.de.d_name);
+		filename = g_strdup_printf("%s/%s", realpath, u.de.d_name);
 		if (sshfsm.follow_symlinks)
 			res = stat(filename, &stbuf);
 		else
@@ -2377,28 +2358,28 @@ static int getdir_local_0(const char *path, fuse_cache_dirh_t h,
 		}
 	}
 	closedir(dp);
+	g_free(realpath);
 	return res;
-	
 }
 
-static int getdir_remote_0(struct serv *srv, const char *path,
+static int getdir_remote_0(serv_t serv, const char *path,
 	fuse_cache_dirh_t h, fuse_cache_dirfil_t filler)
 {
 	int err;
 	struct buffer buf;
 	struct buffer handle;
 	buf_init(&buf, 0);
-	buf_add_path(srv, &buf, path);
-	err = sftp_request(srv, SSH_FXP_OPENDIR, &buf, SSH_FXP_HANDLE, &handle);
+	buf_add_path(serv, &buf, path);
+	err = sftp_request(serv, SSH_FXP_OPENDIR, &buf, SSH_FXP_HANDLE, &handle);
 	if (!err) {
 		int err2;
 		buf_finish(&handle);
 		do {
 			struct buffer name;
-			err = sftp_request(srv, SSH_FXP_READDIR, &handle, 
+			err = sftp_request(serv, SSH_FXP_READDIR, &handle, 
 				SSH_FXP_NAME, &name);
 			if (!err) {
-				if (buf_get_entries_0(srv, &name, h, filler) == -1)
+				if (buf_get_entries_0(serv, &name, h, filler) == -1)
 					err = -EIO;
 				buf_free(&name);
 			}
@@ -2406,7 +2387,7 @@ static int getdir_remote_0(struct serv *srv, const char *path,
 		if (err == MY_EOF)
 			err = 0;
 
-		err2 = sftp_request(srv, SSH_FXP_CLOSE, &handle, 0, NULL);
+		err2 = sftp_request(serv, SSH_FXP_CLOSE, &handle, 0, NULL);
 		if (!err)
 			err = err2;
 		buf_free(&handle);
@@ -2415,17 +2396,11 @@ static int getdir_remote_0(struct serv *srv, const char *path,
 	return err;
 }
 
-static int serv_getdir_0(struct serv *srv, const char *path,
+static int serv_getdir_0(serv_t serv, const char *path,
 	fuse_cache_dirh_t h, fuse_cache_dirfil_t filler)
 {
-	if (srv->local) {
-		char *realpath = serv_add_path(srv, path);
-		int res = getdir_local_0(realpath, h, filler);
-		g_free(realpath);
-		return res;
-	}
-
-	return getdir_remote_0(srv, path, h, filler);
+	return serv->local ? getdir_local_0(serv, path, h, filler) : 
+		getdir_remote_0(serv, path, h, filler);
 }
 
 static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
@@ -2438,37 +2413,32 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 }
 
 /* mkdir */
-static int mkdir_local(const char *path, mode_t mode)
+static int mkdir_local(serv_t serv, const char *path, mode_t mode)
 {
-	int res = mkdir(path, mode);
+	char *realpath = serv_add_path(serv, path);
+	int res = mkdir(realpath, mode);
+	g_free(realpath);
 	if (res == -1)
 		return -errno;
 	return res;
 }
 
-static int mkdir_remote(struct serv *srv, const char *path, mode_t mode)
+static int mkdir_remote(serv_t serv, const char *path, mode_t mode)
 {
 	int err;
 	struct buffer buf;
 	buf_init(&buf, 0);
-	buf_add_path(srv, &buf, path);
+	buf_add_path(serv, &buf, path);
 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_PERMISSIONS);
 	buf_add_uint32(&buf, mode);
-	err = sftp_request(srv, SSH_FXP_MKDIR, &buf, SSH_FXP_STATUS, NULL);
+	err = sftp_request(serv, SSH_FXP_MKDIR, &buf, SSH_FXP_STATUS, NULL);
 	buf_free(&buf);
 	return err;
 }
 
-static int serv_mkdir(struct serv *srv, const char *path, mode_t mode)
+static int serv_mkdir(serv_t serv, const char *path, mode_t mode)
 {
-	if (srv->local) {
-		char *realpath = serv_add_path(srv, path);
-		int res = mkdir_local(realpath, mode);
-		g_free(realpath);
-		return res;
-	}
-
-	return mkdir_remote(srv, path, mode);
+	return serv->local ? mkdir_local(serv, path, mode) : mkdir_remote(serv, path, mode);
 }
 
 static int sshfsm_mkdir(const char *path, mode_t mode)
@@ -2478,23 +2448,25 @@ static int sshfsm_mkdir(const char *path, mode_t mode)
 
 	if (serv_num == 1)
 		return serv_mkdir(serv_0, path, mode);
+	return 0;
 }
 
 /* mknod */
-static int mknod_local(const char *path, mode_t mode, dev_t rdev)
+static int mknod_local(serv_t serv, const char *path, mode_t mode, dev_t rdev)
 {
 	int res;
-
+	char *realpath = serv_add_path(serv, path);
 	if (S_ISFIFO(mode))
-		res = mkfifo(path, mode);
+		res = mkfifo(realpath, mode);
 	else
-		res = mknod(path, mode, rdev);
+		res = mknod(realpath, mode, rdev);
+	g_free(realpath);
 	if (res == -1)
 		return -errno;
 	return res;
 }
 
-static int mknod_remote(struct serv *srv, const char *path,
+static int mknod_remote(serv_t serv, const char *path,
 	mode_t mode, dev_t rdev)
 {
 	int err;
@@ -2506,15 +2478,15 @@ static int mknod_remote(struct serv *srv, const char *path,
 		return -EPERM;
 
 	buf_init(&buf, 0);
-	buf_add_path(srv, &buf, path);
+	buf_add_path(serv, &buf, path);
 	buf_add_uint32(&buf, SSH_FXF_WRITE | SSH_FXF_CREAT | SSH_FXF_EXCL);
 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_PERMISSIONS);
 	buf_add_uint32(&buf, mode);
-	err = sftp_request(srv, SSH_FXP_OPEN, &buf, SSH_FXP_HANDLE, &handle);
+	err = sftp_request(serv, SSH_FXP_OPEN, &buf, SSH_FXP_HANDLE, &handle);
 	if (!err) {
 		int err2;
 		buf_finish(&handle);
-		err2 = sftp_request(srv, SSH_FXP_CLOSE, &handle, SSH_FXP_STATUS, NULL);
+		err2 = sftp_request(serv, SSH_FXP_CLOSE, &handle, SSH_FXP_STATUS, NULL);
 		if (!err)
 			err = err2;
 		buf_free(&handle);
@@ -2523,195 +2495,173 @@ static int mknod_remote(struct serv *srv, const char *path,
 	return err;
 }
 
-static int serv_mknod(struct serv *srv, const char *path,
+static int serv_mknod(serv_t serv, const char *path,
 	mode_t mode, dev_t rdev)
 {
-	if (srv->local) {
-		char *realpath = serv_add_path(srv, path);
-		int res = mknod_local(realpath, mode, rdev);
-		g_free(realpath);
-		return res;
-	}
-
-	return mknod_remote(srv, path, mode, rdev);
+	return serv->local ? mknod_local(serv, path, mode, rdev) : 
+		mknod_remote(serv, path, mode, rdev);
 }
 
 static int sshfsm_mknod(const char *path, mode_t mode, dev_t rdev)
 {
 	if (serv_num == 1)
 		return serv_mknod(serv_0, path, mode, rdev);
+	return 0;
 }
 
 /* symlink */
-static int symlink_local(const char *from, const char *to)
+static int symlink_local(serv_t serv, const char *from, const char *to)
 {
-	int res;
-
-	res = symlink(from, to);
+	char *realfrom = serv_add_path(serv, from);
+	char *realto = serv_add_path(serv, to);
+	int res = symlink(realfrom, realto);
+	g_free(realfrom);
+	g_free(realto);
 	if (res == -1)
 		return -errno;
 	return res;
 }
 
-static int symlink_remote(struct serv *srv, const char *from,
+static int symlink_remote(serv_t serv, const char *from,
 	const char *to)
 {
 	int err;
 	struct buffer buf;
 
-	if (sshfsm.server_version < 3)
+	if (serv->version < 3)
 		return -EPERM;
 
 	/* openssh sftp server doesn't follow standard: link target and
 	   link name are mixed up, so we must also be non-standard :( */
 	buf_init(&buf, 0);
 	buf_add_string(&buf, from);
-	buf_add_path(srv, &buf, to);
-	err = sftp_request(srv, SSH_FXP_SYMLINK, &buf, SSH_FXP_STATUS, NULL);
+	buf_add_path(serv, &buf, to);
+	err = sftp_request(serv, SSH_FXP_SYMLINK, &buf, SSH_FXP_STATUS, NULL);
 	buf_free(&buf);
 	return err;
 }
 
-static int serv_symlink(struct serv *srv, const char *from, 
+static int serv_symlink(serv_t serv, const char *from, 
 	const char *to)
 {
-	if (srv->local) {
-		char *realfrom = serv_add_path(srv, from);
-		char *realto = serv_add_path(srv, to);
-		int res = symlink_local(realfrom, realto);
-		g_free(realfrom);
-		g_free(realto);
-		return res;
-	}
-
-	return symlink_remote(srv, from, to);
+	return serv->local ? symlink_local(serv, from, to) : 
+		symlink_remote(serv, from, to);
 }
 
 static int sshfsm_symlink(const char *from, const char *to)
 {
 	if (serv_num == 1)
 		return serv_symlink(serv_0, from, to);
+	return 0;
 }
 
 /* unlink */
-static int unlink_local(const char *path)
+static int unlink_local(serv_t serv, const char *path)
 {
-	int res;
-	
-	res = unlink(path);
+	char *realpath = serv_add_path(serv, path);
+	int res = unlink(realpath);
+	g_free(realpath);
 	if (res == -1)
 		return -errno;
 	return res;
 }
 
-static int unlink_remote(struct serv *srv, const char *path)
+static int unlink_remote(serv_t serv, const char *path)
 {
 	int err;
 	struct buffer buf;
 	
 	buf_init(&buf, 0);
-	buf_add_path(srv, &buf, path);
-	err = sftp_request(srv, SSH_FXP_REMOVE, &buf, SSH_FXP_STATUS, NULL);
+	buf_add_path(serv, &buf, path);
+	err = sftp_request(serv, SSH_FXP_REMOVE, &buf, SSH_FXP_STATUS, NULL);
 	buf_free(&buf);
 	return err;
 }
 
-static int serv_unlink(struct serv *srv, const char *path)
+static int serv_unlink(serv_t serv, const char *path)
 {
-	if (srv->local) {
-		char *realpath = serv_add_path(srv, path);
-		int res = unlink_local(realpath);
-		g_free(realpath);
-		return res;
-	}
-
-	return unlink_remote(srv, path);
+	return serv->local ? unlink_local(serv, path) : unlink_remote(serv, path);
 }
 
 static int sshfsm_unlink(const char *path)
 {
 	if (serv_num == 1)
 		return serv_unlink(serv_0, path);
+	return 0;
 }
 
 /* rmdir */
-static int rmdir_local(const char *path)
+static int rmdir_local(serv_t serv, const char *path)
 {
-	int res;
-
-	res = rmdir(path);
+	char *realpath = serv_add_path(serv, path);
+	int res = rmdir(realpath);
+	g_free(realpath);
 	if (res == -1)
 		return -errno;
 	return res;
 }
 
-static int rmdir_remote(struct serv *srv, const char *path)
+static int rmdir_remote(serv_t serv, const char *path)
 {
 	int err;
 	struct buffer buf;
 	
 	buf_init(&buf, 0);
-	buf_add_path(srv, &buf, path);
-	err = sftp_request(srv, SSH_FXP_RMDIR, &buf, SSH_FXP_STATUS, NULL);
+	buf_add_path(serv, &buf, path);
+	err = sftp_request(serv, SSH_FXP_RMDIR, &buf, SSH_FXP_STATUS, NULL);
 	buf_free(&buf);
 	return err;
 }
 
-static int serv_rmdir(struct serv *srv, const char *path)
+static int serv_rmdir(serv_t serv, const char *path)
 {
-	if (srv->local) {
-		char *realpath = serv_add_path(srv, path);
-		int res = rmdir_local(realpath);
-		g_free(realpath);
-		return res;
-	}
-
-	return rmdir_remote(srv, path);
+	return serv->local ? rmdir_local(serv, path) : rmdir_remote(serv, path);
 }
 
 static int sshfsm_rmdir(const char *path)
 {
 	if (serv_num == 1)
 		return serv_rmdir(serv_0, path);
+	return 0;
 }
 
 /* rename */
 
-static int rename_local(const char *from, const char *to)
+static int rename_local(serv_t serv, const char *from, const char *to)
 {
-	int res;
-
-	res = rename(from, to);
+	char *realfrom = serv_add_path(serv, from);
+	char *realto = serv_add_path(serv, to);
+	int res = rename(realfrom, realto);
+	g_free(realfrom);
+	g_free(realto);
 	if (res == -1)
 		return -errno;
 	return res;
 }
 
-static int rename_remote(struct serv *srv, const char *from, 
-	const char *to)
+static int rename_remote(serv_t serv, const char *from, const char *to)
 {
 	int err;
 	struct buffer buf;
 
 	buf_init(&buf, 0);
-	buf_add_path(srv, &buf, from);
-	buf_add_path(srv, &buf, to);
-	err = sftp_request(srv, SSH_FXP_RENAME, &buf, SSH_FXP_STATUS, NULL);
+	buf_add_path(serv, &buf, from);
+	buf_add_path(serv, &buf, to);
+	err = sftp_request(serv, SSH_FXP_RENAME, &buf, SSH_FXP_STATUS, NULL);
 	buf_free(&buf);
 	return err;
 }
 
-static int rename_remote_ext_posix(struct serv *srv, const char *from, 
-	const char *to)
+static int rename_remote_ext_posix(serv_t serv, const char *from, const char *to)
 {
 	int err;
 	struct buffer buf;
 
 	buf_init(&buf, 0);
 	buf_add_string(&buf, SFTP_EXT_POSIX_RENAME);
-	buf_add_path(srv, &buf, from);
-	buf_add_path(srv, &buf, to);
-	err = sftp_request(srv, SSH_FXP_EXTENDED, &buf, SSH_FXP_STATUS, NULL);
+	buf_add_path(serv, &buf, from);
+	buf_add_path(serv, &buf, to);
+	err = sftp_request(serv, SSH_FXP_EXTENDED, &buf, SSH_FXP_STATUS, NULL);
 	buf_free(&buf);
 	return err;
 }
@@ -2724,23 +2674,16 @@ static void random_string(char *str, int length)
 	*str = '\0';
 }
 
-static int serv_rename(struct serv *srv, const char *from,
-	const char *to)
+static int serv_rename(serv_t serv, const char *from, const char *to)
 {
-	if (srv->local) {
-		char *realfrom = serv_add_path(srv, from);
-		char *realto = serv_add_path(srv, to);
-		int res = rename(realfrom, realto);
-		g_free(realfrom);
-		g_free(realto);
-		return res;
-	}
+	if (serv->local)
+		return rename_local(serv, from, to);
 	
 	int err;
 	if (sshfsm.ext_posix_rename)
-		err = rename_remote_ext_posix(srv, from, to);
+		err = rename_remote_ext_posix(serv, from, to);
 	else
-		err = rename_remote(srv, from, to);
+		err = rename_remote(serv, from, to);
 	if (err == -EPERM && sshfsm.rename_workaround) {
 		size_t tolen = strlen(to);
 		if (tolen + RENAME_TEMP_CHARS < PATH_MAX) {
@@ -2748,13 +2691,13 @@ static int serv_rename(struct serv *srv, const char *from,
 			char totmp[PATH_MAX];
 			strcpy(totmp, to);
 			random_string(totmp + tolen, RENAME_TEMP_CHARS);
-			tmperr = rename_remote(srv, to, totmp);
+			tmperr = rename_remote(serv, to, totmp);
 			if (!tmperr) {
-				err = rename_remote(srv, from, to);
+				err = rename_remote(serv, from, to);
 				if (!err)
-					err = serv_unlink(srv, totmp);
+					err = serv_unlink(serv, totmp);
 				else
-					rename_remote(srv, totmp, to);
+					rename_remote(serv, totmp, to);
 			}
 		}
 	}
@@ -2765,234 +2708,220 @@ static int sshfsm_rename(const char *from, const char *to)
 {
 	if (serv_num == 1)
 		return serv_rename(serv_0, from, to);
+	return 0;
 }
 
 /* chmod */
-static int chmod_local(const char *path, mode_t mode)
+static int chmod_local(serv_t serv, const char *path, mode_t mode)
 {
-	int res;
-
-	res = chmod(path, mode);
+	char *realpath = serv_add_path(serv, path);
+	int res = chmod(realpath, mode);
+	g_free(realpath);
 	if (res == -1)
 		return -errno;
 	return res;
 }
 
-static int chmod_remote(struct serv *srv, const char *path,
+static int chmod_remote(serv_t serv, const char *path,
 	mode_t mode)
 {
 	int err;
 	struct buffer buf;
 
 	buf_init(&buf, 0);
-	buf_add_path(srv, &buf, path);
+	buf_add_path(serv, &buf, path);
 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_PERMISSIONS);
 	buf_add_uint32(&buf, mode);
-	err = sftp_request(srv, SSH_FXP_SETSTAT, &buf, SSH_FXP_STATUS, NULL);
+	err = sftp_request(serv, SSH_FXP_SETSTAT, &buf, SSH_FXP_STATUS, NULL);
 	buf_free(&buf);
 	return err;
 }
 
-static int serv_chmod(struct serv *srv, const char *path,
+static int serv_chmod(serv_t serv, const char *path,
 	mode_t mode)
 {
-	if (srv->local) {
-		char *realpath = serv_add_path(srv, path);
-		int res = chmod_local(realpath, mode);
-		g_free(realpath);
-		return res;
-	}
-
-	return chmod_remote(srv, path, mode);
+	return serv->local ? chmod_local(serv, path, mode) : 
+		chmod_remote(serv, path, mode);
 }
 
 static int sshfsm_chmod(const char *path, mode_t mode)
 {
 	if (serv_num == 1)
 		return serv_chmod(serv_0, path, mode);
+	return 0;
 }
 
 /* chown */
-static int chown_local(const char *path, uid_t uid, gid_t gid)
+static int chown_local(serv_t serv, const char *path, uid_t uid, gid_t gid)
 {
 	int res;
-	
+	char *realpath = serv_add_path(serv, path);
 	if (sshfsm.follow_symlinks)
-		res = chown(path, uid, gid);
+		res = chown(realpath, uid, gid);
 	else
-		res = lchown(path, uid, gid);
+		res = lchown(realpath, uid, gid);
+	g_free(realpath);
 	if (res == -1)
 		return -errno;
 	return res;
 }
 
 
-static int chown_remote(struct serv *srv, const char *path, 
+static int chown_remote(serv_t serv, const char *path, 
 	uid_t uid, gid_t gid)
 {
 	int err;
 	struct buffer buf;
 	
 	buf_init(&buf, 0);
-	buf_add_path(srv, &buf, path);
+	buf_add_path(serv, &buf, path);
 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_UIDGID);
 	buf_add_uint32(&buf, uid);
 	buf_add_uint32(&buf, gid);
-	err = sftp_request(srv, SSH_FXP_SETSTAT, &buf, SSH_FXP_STATUS, NULL);
+	err = sftp_request(serv, SSH_FXP_SETSTAT, &buf, SSH_FXP_STATUS, NULL);
 	buf_free(&buf);
 	return err;
 }
 
-static int serv_chown(struct serv *srv, const char *path, 
+static int serv_chown(serv_t serv, const char *path, 
 	uid_t uid, gid_t gid)
 {
-	if (srv->local) {
-		char *realpath = serv_add_path(srv, path);
-		int res = chown_local(realpath, uid, gid);
-		g_free(realpath);
-		return res;
-	}
-
-	return chown_remote(srv, path, uid, gid);
+	return serv->local ? chown_local(serv, path, uid, gid) : 
+		chown_remote(serv, path, uid, gid);
 }
 
 static int sshfsm_chown(const char *path, uid_t uid, gid_t gid)
 {
 	if (serv_num == 1)
 		return serv_chown(serv_0, path, uid, gid);
+	return 0;
 }
 
 /* truncate */
-static int truncate_local(const char *path, off_t size)
+static int truncate_local(serv_t serv, const char *path, off_t size)
 {
-	int res;
-
-	res = truncate(path, size);
+	char *realpath = serv_add_path(serv, path);
+	int res = truncate(realpath, size);
+	g_free(realpath);
 	if (res == -1)
 		return -errno;
 	return res;
 }
 
-static int truncate_remote_workaround(struct serv *srv, 
+static int truncate_remote_workaround(serv_t serv, 
 	const char *path, off_t size, struct fuse_file_info *fi);
 
-static int truncate_remote(struct serv *srv, const char *path, 
+static int truncate_remote(serv_t serv, const char *path, 
 	off_t size)
 {
 	int err;
 	struct buffer buf;
 
-	srv->modifver ++;
+	serv->modifver ++;
 	if (size == 0 || sshfsm.truncate_workaround)
-		return truncate_remote_workaround(srv, path, size, NULL);
+		return truncate_remote_workaround(serv, path, size, NULL);
 
 	buf_init(&buf, 0);
-	buf_add_path(srv, &buf, path);
+	buf_add_path(serv, &buf, path);
 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_SIZE);
 	buf_add_uint64(&buf, size);
-	err = sftp_request(srv, SSH_FXP_SETSTAT, &buf, SSH_FXP_STATUS, NULL);
+	err = sftp_request(serv, SSH_FXP_SETSTAT, &buf, SSH_FXP_STATUS, NULL);
 	buf_free(&buf);
 	return err;
 }
 
-static int serv_truncate(struct serv *srv, const char *path, off_t size)
+static int serv_truncate(serv_t serv, const char *path, off_t size)
 {
-	if (srv->local) {
-		char *realpath = serv_add_path(srv, path);
-		int res = truncate_local(realpath, size);
-		g_free(realpath);
-		return res;
-	}
-
-	return truncate_remote(srv, path, size);
+	return serv->local ? truncate_local(serv, path, size) : 
+		truncate_remote(serv, path, size);
 }
 
 static int sshfsm_truncate(const char *path, off_t size)
 {
 	if (serv_num == 1)
 		return serv_truncate(serv_0, path, size);
+	return 0;
 }
 
 /* utime */
-static int utime_local(const char *path, struct utimbuf *ubuf)
+static int utime_local(serv_t serv, const char *path, struct utimbuf *ubuf)
 {
-	int res;
-
-	res = utime(path, ubuf);
+	char *realpath = serv_add_path(serv, path);
+	int res = utime(realpath, ubuf);
+	g_free(realpath);
 	if (res == -1)
 		return -errno;
 	return res;
 }
 
-static int utime_remote(struct serv *srv, const char *path, 
+static int utime_remote(serv_t serv, const char *path, 
 	struct utimbuf *ubuf)
 {
 	int err;
 	struct buffer buf;
 	buf_init(&buf, 0);
-	buf_add_path(srv, &buf, path);
+	buf_add_path(serv, &buf, path);
 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_ACMODTIME);
 	buf_add_uint32(&buf, ubuf->actime);
 	buf_add_uint32(&buf, ubuf->modtime);
-	err = sftp_request(srv, SSH_FXP_SETSTAT, &buf, SSH_FXP_STATUS, NULL);
+	err = sftp_request(serv, SSH_FXP_SETSTAT, &buf, SSH_FXP_STATUS, NULL);
 	buf_free(&buf);
 	return err;
 }
 
-static int serv_utime(struct serv *srv, const char *path, 
+static int serv_utime(serv_t serv, const char *path, 
 	struct utimbuf *ubuf)
 {
-	if (srv->local) {
-		char *realpath = serv_add_path(srv, path);
-		int res = utime_local(realpath, ubuf);
-		g_free(realpath);
-		return res;
-	}
-
-	return utime_remote(srv, path, ubuf);
+	return serv->local ? utime_local(serv, path, ubuf) : 
+		utime_remote(serv, path, ubuf);
 }
 
 static int sshfsm_utime(const char *path, struct utimbuf *ubuf)
 {
 	if (serv_num == 1)
 		return serv_utime(serv_0, path, ubuf);
+	return 0;
 }
 
 /* open */
 static inline int serv_file_is_conn(struct sshfsm_file *sf)
 {
-	return sf->connver == sf->srv->connver;
+	return sf->connver == sf->serv->connver;
 }
 
-static int open_local(struct serv *srv, const char *path, mode_t mode, 
+static int open_local(serv_t serv, const char *path, mode_t mode, 
 	struct fuse_file_info *fi)
 {
 	struct stat stbuf;
 	struct sshfsm_file *sf;
 	uint64_t wrctr = cache_get_write_ctr();
+	char *realpath = serv_add_path(serv, path);
 	
 	if (sshfsm.sync_write)
 		fi->flags |= O_SYNC;
 	sf = g_new0(struct sshfsm_file, 1);
-	sf->srv = srv;
-	sf->local_fd = open(path, fi->flags, mode);
+	sf->serv = serv;
+	sf->local_fd = open(realpath, fi->flags, mode);
 	if (sf->local_fd == -1) {
 		cache_invalidate(path);
 		g_free(sf);
+		g_free(realpath);
 		return -errno;
 	}
 	int res = lstat(path, &stbuf);
 	if (res == -1) {
 		cache_invalidate(path);
 		g_free(sf);
+		g_free(realpath);
 		return -errno;
 	}
 	cache_add_attr(path, &stbuf, wrctr);
 	fi->fh = (unsigned long) sf;
+	g_free(realpath);
 	return res;
 }
 
-static int open_remote(struct serv *srv, const char *path, 
+static int open_remote(serv_t serv, const char *path, 
 	mode_t mode, struct fuse_file_info *fi)
 {
 	int err;
@@ -3032,31 +2961,31 @@ static int open_remote(struct serv *srv, const char *path,
 	sf->is_seq = 0;
 	sf->refs = 1;
 	sf->next_pos = 0;
-	sf->srv = srv;
-	sf->modifver= srv->modifver;
-	sf->connver = srv->connver;
+	sf->serv = serv;
+	sf->modifver= serv->modifver;
+	sf->connver = serv->connver;
 	buf_init(&buf, 0);
-	buf_add_path(srv, &buf, path);
+	buf_add_path(serv, &buf, path);
 	buf_add_uint32(&buf, pflags);
 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_PERMISSIONS);
 	buf_add_uint32(&buf, mode);
 	buf_to_iov(&buf, &iov);
-	sftp_request_send(srv, SSH_FXP_OPEN, &iov, 1, NULL, NULL, 1, NULL,
+	sftp_request_send(serv, SSH_FXP_OPEN, &iov, 1, NULL, NULL, 1, NULL,
 			  &open_req);
 	buf_clear(&buf);
-	buf_add_path(srv, &buf, path);
+	buf_add_path(serv, &buf, path);
 	type = sshfsm.follow_symlinks ? SSH_FXP_STAT : SSH_FXP_LSTAT;
-	err2 = sftp_request(srv, type, &buf, SSH_FXP_ATTRS, &outbuf);
+	err2 = sftp_request(serv, type, &buf, SSH_FXP_ATTRS, &outbuf);
 	if (!err2) {
-		if (buf_get_attrs(srv, &outbuf, &stbuf, NULL) == -1)
+		if (buf_get_attrs(serv, &outbuf, &stbuf, NULL) == -1)
 			err2 = -EIO;
 		buf_free(&outbuf);
 	}
-	err = sftp_request_wait(srv, open_req, SSH_FXP_OPEN, SSH_FXP_HANDLE,
+	err = sftp_request_wait(serv, open_req, SSH_FXP_OPEN, SSH_FXP_HANDLE,
 				&sf->handle);
 	if (!err && err2) {
 		buf_finish(&sf->handle);
-		sftp_request(srv, SSH_FXP_CLOSE, &sf->handle, 0, NULL);
+		sftp_request(serv, SSH_FXP_CLOSE, &sf->handle, 0, NULL);
 		buf_free(&sf->handle);
 		err = err2;
 	}
@@ -3073,17 +3002,11 @@ static int open_remote(struct serv *srv, const char *path,
 	return err;
 }
 
-static int serv_open_common(struct serv *srv, const char *path, 
+static int serv_open_common(serv_t serv, const char *path, 
 	mode_t mode, struct fuse_file_info *fi)
 {
-	if (srv->local) {
-		char *realpath = serv_add_path(srv, path);
-		int res = open_local(srv, realpath, mode, fi);
-		g_free(realpath);
-		return res;
-	}
-
-	return open_remote(srv, path, mode, fi);
+	return serv->local ? open_local(serv, path, mode, fi) : 
+		open_remote(serv, path, mode, fi);
 
 }
 
@@ -3091,6 +3014,7 @@ static int sshfsm_open(const char *path, struct fuse_file_info *fi)
 {
 	if (serv_num == 1)
 		return serv_open_common(0, path, 0, fi);
+	return 0;
 }
 
 /* flush */
@@ -3099,16 +3023,25 @@ static inline struct sshfsm_file *get_sshfsm_file(struct fuse_file_info *fi)
 	return (struct sshfsm_file *) (uintptr_t) fi->fh;
 }
 
+static int flush_local(int fd)
+{
+	int res = fsync(fd);
+	if (res == -1)
+		return -errno;
+	return res;
+}
+
 static int sshfsm_flush(const char *path, struct fuse_file_info *fi)
 {
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
-	struct serv *srv = sf->srv;
-	if (srv->local) /* TODO: flush_local() using fsync() */
-		return 0;
+	serv_t serv = sf->serv;
+	if (serv->local)
+		return flush_local(sf->local_fd);
 	
 	int err;
 	struct list_head write_reqs;
 	struct list_head *curr_list;
+	(void) path;
 
 	if (!serv_file_is_conn(sf))
 		return -EIO;
@@ -3116,19 +3049,18 @@ static int sshfsm_flush(const char *path, struct fuse_file_info *fi)
 	if (sshfsm.sync_write)
 		return 0;
 
-	(void) path;
-	pthread_mutex_lock(&srv->lock);
+	pthread_mutex_lock(&serv->lock);
 	if (!list_empty(&sf->write_reqs)) {
 		curr_list = sf->write_reqs.prev;
 		list_del(&sf->write_reqs);
 		list_init(&sf->write_reqs);
 		list_add(&write_reqs, curr_list);
 		while (!list_empty(&write_reqs))
-			pthread_cond_wait(&sf->write_finished, &srv->lock);
+			pthread_cond_wait(&sf->write_finished, &serv->lock);
 	}
 	err = sf->write_error;
 	sf->write_error = 0;
-	pthread_mutex_unlock(&srv->lock);
+	pthread_mutex_unlock(&serv->lock);
 	return err;
 }
 
@@ -3156,8 +3088,8 @@ static void sshfsm_file_get(struct sshfsm_file *sf)
 static int sshfsm_release(const char *path, struct fuse_file_info *fi)
 {
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
-	struct serv *srv = sf->srv;
-	if (srv->local) {
+	serv_t serv = sf->serv;
+	if (serv->local) {
 		close(sf->local_fd);
 		return 0;
 	}
@@ -3165,10 +3097,10 @@ static int sshfsm_release(const char *path, struct fuse_file_info *fi)
 	struct buffer *handle = &sf->handle;
 	if (serv_file_is_conn(sf)) {
 		sshfsm_flush(path, fi);
-		sftp_request(srv, SSH_FXP_CLOSE, handle, 0, NULL);
+		sftp_request(serv, SSH_FXP_CLOSE, handle, 0, NULL);
 	}
 	buf_free(handle);
-	chunk_put_locked(srv, sf->readahead);
+	chunk_put_locked(serv, sf->readahead);
 	sshfsm_file_put(sf);
 	return 0;
 }
@@ -3176,8 +3108,7 @@ static int sshfsm_release(const char *path, struct fuse_file_info *fi)
 /* read */
 static int read_local(int fd, char *rbuf, size_t size, off_t offset)
 {
-	int res;
-	res = pread(fd, rbuf, size, offset);
+	int res = pread(fd, rbuf, size, offset);
 	if (res == -1)
 		return -errno;
 	return res;
@@ -3190,12 +3121,12 @@ static int serv_sync_read(struct sshfsm_file *sf, char *rbuf, size_t size,
 	struct buffer buf;
 	struct buffer data;
 	struct buffer *handle = &sf->handle;
-	struct serv *srv = sf->srv;
+	serv_t serv = sf->serv;
 	buf_init(&buf, 0);
 	buf_add_buf(&buf, handle);
 	buf_add_uint64(&buf, offset);
 	buf_add_uint32(&buf, size);
-	err = sftp_request(srv, SSH_FXP_READ, &buf, SSH_FXP_DATA, &data);
+	err = sftp_request(serv, SSH_FXP_READ, &buf, SSH_FXP_DATA, &data);
 	if (!err) {
 		uint32_t retsize;
 		err = -EIO;
@@ -3260,13 +3191,13 @@ static void serv_send_async_read(struct sshfsm_file *sf,
 	struct buffer buf;
 	struct buffer *handle = &sf->handle;
 	struct iovec iov;
-	struct serv *srv = sf->srv;
+	serv_t serv = sf->serv;
 	buf_init(&buf, 0);
 	buf_add_buf(&buf, handle);
 	buf_add_uint64(&buf, chunk->offset);
 	buf_add_uint32(&buf, chunk->size);
 	buf_to_iov(&buf, &iov);
-	sftp_request_send(srv, SSH_FXP_READ, &iov, 1, serv_read_begin,
+	sftp_request_send(serv, SSH_FXP_READ, &iov, 1, serv_read_begin,
 			  serv_read_end, 0, chunk, NULL);
 	buf_free(&buf);
 }
@@ -3275,22 +3206,22 @@ static void submit_read(struct sshfsm_file *sf, size_t size, off_t offset,
                         struct read_chunk **chunkp)
 {
 	struct read_chunk *chunk = g_new0(struct read_chunk, 1);
-	struct serv *srv = sf->srv;
+	serv_t serv = sf->serv;
 
 	sem_init(&chunk->ready, 0, 0);
 	buf_init(&chunk->data, 0);
 	chunk->offset = offset;
 	chunk->size = size;
 	chunk->refs = 1;
-	chunk->modifver = srv->modifver;
+	chunk->modifver = serv->modifver;
 	serv_send_async_read(sf, chunk);
-	pthread_mutex_lock(&srv->lock);
+	pthread_mutex_lock(&serv->lock);
 	chunk_put(*chunkp);
 	*chunkp = chunk;
-	pthread_mutex_unlock(&srv->lock);
+	pthread_mutex_unlock(&serv->lock);
 }
 
-static int wait_chunk(struct serv *srv, struct read_chunk *chunk, 
+static int wait_chunk(serv_t serv, struct read_chunk *chunk, 
 	char *buf, size_t size)
 {
 	int res;
@@ -3305,15 +3236,15 @@ static int wait_chunk(struct serv *srv, struct read_chunk *chunk,
 		chunk->res -= res;
 	}
 	sem_post(&chunk->ready);
-	chunk_put_locked(srv, chunk);
+	chunk_put_locked(serv, chunk);
 	return res;
 }
 
 static struct read_chunk *search_read_chunk(struct sshfsm_file *sf, off_t offset)
 {
 	struct read_chunk *ch = sf->readahead;
-	struct serv *srv = sf->srv;
-	if (ch && ch->offset == offset && ch->modifver == srv->modifver) {
+	serv_t serv = sf->serv;
+	if (ch && ch->offset == offset && ch->modifver == serv->modifver) {
 		ch->refs++;
 		return ch;
 	} else
@@ -3329,15 +3260,15 @@ static int serv_async_read(struct sshfsm_file *sf, char *rbuf, size_t size,
 	struct read_chunk *chunk_prev = NULL;
 	size_t origsize = size;
 	int curr_is_seq;
-	struct serv *srv = sf->srv;
+	serv_t serv = sf->serv;
 
-	pthread_mutex_lock(&srv->lock);
+	pthread_mutex_lock(&serv->lock);
 	curr_is_seq = sf->is_seq;
-	sf->is_seq = (sf->next_pos == offset && sf->modifver == sshfsm.modifver);
+	sf->is_seq = (sf->next_pos == offset && sf->modifver == serv->modifver);
 	sf->next_pos = offset + size;
-	sf->modifver = srv->modifver;
+	sf->modifver = serv->modifver;
 	chunk = search_read_chunk(sf, offset);
-	pthread_mutex_unlock(&srv->lock);
+	pthread_mutex_unlock(&serv->lock);
 
 	if (chunk && chunk->size < size) {
 		chunk_prev = chunk;
@@ -3354,15 +3285,15 @@ static int serv_async_read(struct sshfsm_file *sf, char *rbuf, size_t size,
 
 	if (chunk_prev) {
 		size_t prev_size = chunk_prev->size;
-		res = wait_chunk(srv, chunk_prev, rbuf, prev_size);
+		res = wait_chunk(serv, chunk_prev, rbuf, prev_size);
 		if (res < (int) prev_size) {
-			chunk_put_locked(srv, chunk);
+			chunk_put_locked(serv, chunk);
 			return res;
 		}
 		rbuf += res;
 		total += res;
 	}
-	res = wait_chunk(srv, chunk, rbuf, size);
+	res = wait_chunk(serv, chunk, rbuf, size);
 	if (res > 0)
 		total += res;
 	if (res < 0)
@@ -3377,7 +3308,7 @@ static int sshfsm_read(const char *path, char *rbuf, size_t size, off_t offset,
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
 	(void) path;
 
-	if (sf->srv->local)
+	if (sf->serv->local)
 		return read_local(sf->local_fd, rbuf, size, offset);
 
 	if (!serv_file_is_conn(sf))
@@ -3392,9 +3323,7 @@ static int sshfsm_read(const char *path, char *rbuf, size_t size, off_t offset,
 /* write */
 static int write_local(int fd, const char *wbuf, size_t size, off_t offset)
 {
-	int res;
-
-	res = pwrite(fd, wbuf, size, offset);
+	int res = pwrite(fd, wbuf, size, offset);
 	if (res == -1)
 		return -errno;
 	return res;
@@ -3432,20 +3361,20 @@ static int sshfsm_write(const char *path, const char *wbuf, size_t size,
                        off_t offset, struct fuse_file_info *fi)
 {
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
-	if (sf->srv->local)
+	if (sf->serv->local)
 		return write_local(sf->local_fd, wbuf, size, offset);
 
 	int err;
 	struct buffer buf;
 	struct buffer *handle = &sf->handle;
 	struct iovec iov[2];
-	struct serv *srv = sf->srv;
+	serv_t serv = sf->serv;
 	(void) path;
 
 	if (!serv_file_is_conn(sf))
 		return -EIO;
 
-	srv->modifver ++;
+	serv->modifver ++;
 	buf_init(&buf, 0);
 	buf_add_buf(&buf, handle);
 	buf_add_uint64(&buf, offset);
@@ -3454,11 +3383,11 @@ static int sshfsm_write(const char *path, const char *wbuf, size_t size,
 	iov[1].iov_base = (void *) wbuf;
 	iov[1].iov_len = size;
 	if (!sshfsm.sync_write && !sf->write_error) {
-		err = sftp_request_send(srv, SSH_FXP_WRITE, iov, 2,
+		err = sftp_request_send(serv, SSH_FXP_WRITE, iov, 2,
 					serv_write_begin, serv_write_end,
 					0, sf, NULL);
 	} else {
-		err = sftp_request_iov(srv, SSH_FXP_WRITE, iov, 2, SSH_FXP_STATUS,
+		err = sftp_request_iov(serv, SSH_FXP_WRITE, iov, 2, SSH_FXP_STATUS,
 				       NULL);
 	}
 	buf_free(&buf);
@@ -3466,16 +3395,17 @@ static int sshfsm_write(const char *path, const char *wbuf, size_t size,
 }
 
 /* statfs & statvfs */
-static int statvfs_local(const char *path, struct statvfs *stbuf)
+static int statvfs_local(serv_t serv, const char *path, struct statvfs *stbuf)
 {
-	int res;
-	res = statvfs(path, stbuf);
+	char *realpath = serv_add_path(serv, path);
+	int res = statvfs(realpath, stbuf);
+	g_free(realpath);
 	if (res == -1)
 		return -errno;
 	return res;
 }
 
-static int statvfs_remote_ext(struct serv *srv, const char *path,
+static int statvfs_remote_ext(serv_t serv, const char *path,
 	struct statvfs *stbuf)
 {
 	int err;
@@ -3483,8 +3413,8 @@ static int statvfs_remote_ext(struct serv *srv, const char *path,
 	struct buffer outbuf;
 	buf_init(&buf, 0);
 	buf_add_string(&buf, SFTP_EXT_STATVFS);
-	buf_add_path(srv, &buf, path);
-	err = sftp_request(srv, SSH_FXP_EXTENDED, &buf, SSH_FXP_EXTENDED_REPLY,
+	buf_add_path(serv, &buf, path);
+	err = sftp_request(serv, SSH_FXP_EXTENDED, &buf, SSH_FXP_EXTENDED_REPLY,
 			   &outbuf);
 	if (!err) {
 		if (buf_get_statvfs(&outbuf, stbuf) == -1)
@@ -3495,17 +3425,11 @@ static int statvfs_remote_ext(struct serv *srv, const char *path,
 	return err;
 }
 
-static int serv_ext_statvfs(struct serv *srv, const char *path, 
+static int serv_ext_statvfs(serv_t serv, const char *path, 
 	struct statvfs *stbuf)
 {
-	if (srv->local) {
-		char *realpath = serv_add_path(srv, path);
-		int res = statvfs_local(realpath, stbuf);
-		g_free(realpath);
-		return res;
-	}
-
-	return statvfs_remote_ext(srv, path, stbuf);
+	return serv->local ? statvfs_local(serv, path, stbuf) : 
+		statvfs_remote_ext(serv, path, stbuf);
 }
 
 static int sshfsm_ext_statvfs(const char *path, struct statvfs *stbuf)
@@ -3571,6 +3495,7 @@ static int sshfsm_create(const char *path, mode_t mode,
 {
 	if (serv_num == 1)
 		return serv_open_common(serv_0, path, mode, fi);
+	return 0;
 
 	/* TODO: see 1.2 */
 }
@@ -3580,14 +3505,10 @@ static int sshfsm_ftruncate(const char *path, off_t size,
                            struct fuse_file_info *fi)
 {
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
-	struct serv *srv = sf->srv;
+	serv_t serv = sf->serv;
 
-	if (srv->local) {
-		char *realpath = serv_add_path(srv, path);
-		int res = truncate_local(realpath, size);
-		g_free(realpath);
-		return res;
-	}
+	if (serv->local)
+		return truncate_local(serv, path, size);
 
 	int err;
 	struct buffer buf;
@@ -3596,15 +3517,15 @@ static int sshfsm_ftruncate(const char *path, off_t size,
 	if (!serv_file_is_conn(sf))
 		return -EIO;
 
-	srv->modifver ++;
+	serv->modifver ++;
 	if (sshfsm.truncate_workaround)
-		return truncate_remote_workaround(srv, path, size, fi);
+		return truncate_remote_workaround(serv, path, size, fi);
 
 	buf_init(&buf, 0);
 	buf_add_buf(&buf, &sf->handle);
 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_SIZE);
 	buf_add_uint64(&buf, size);
-	err = sftp_request(srv, SSH_FXP_FSETSTAT, &buf, SSH_FXP_STATUS, NULL);
+	err = sftp_request(serv, SSH_FXP_FSETSTAT, &buf, SSH_FXP_STATUS, NULL);
 	buf_free(&buf);
 
 	return err;
@@ -3614,8 +3535,7 @@ static int sshfsm_ftruncate(const char *path, off_t size,
 /* fgetattr */
 static int fgetattr_local(int fd, struct stat *stbuf)
 {
-	int res;
-	res = fstat(fd, stbuf);
+	int res = fstat(fd, stbuf);
 	if (res == -1)
 		return -errno;
 	return 0;
@@ -3625,9 +3545,9 @@ static int sshfsm_fgetattr(const char *path, struct stat *stbuf,
 			  struct fuse_file_info *fi)
 {
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
-	struct serv *srv = sf->srv;
+	serv_t serv = sf->serv;
 
-	if (srv->local)
+	if (serv->local)
 		return fgetattr_local(sf->local_fd, stbuf);
 
 	int err;
@@ -3640,9 +3560,9 @@ static int sshfsm_fgetattr(const char *path, struct stat *stbuf,
 
 	buf_init(&buf, 0);
 	buf_add_buf(&buf, &sf->handle);
-	err = sftp_request(srv, SSH_FXP_FSTAT, &buf, SSH_FXP_ATTRS, &outbuf);
+	err = sftp_request(serv, SSH_FXP_FSTAT, &buf, SSH_FXP_ATTRS, &outbuf);
 	if (!err) {
-		if (buf_get_attrs(srv, &outbuf, stbuf, NULL) == -1)
+		if (buf_get_attrs(serv, &outbuf, stbuf, NULL) == -1)
 			err = -EIO;
 		buf_free(&outbuf);
 	}
@@ -3650,13 +3570,13 @@ static int sshfsm_fgetattr(const char *path, struct stat *stbuf,
 	return err;
 }
 
-static int serv_truncate_zero(struct serv *srv, const char *path)
+static int serv_truncate_zero(serv_t serv, const char *path)
 {
 	int err;
 	struct fuse_file_info fi;
 
 	fi.flags = O_WRONLY | O_TRUNC;
-	err = serv_open_common(srv, path, 0, &fi);
+	err = serv_open_common(serv, path, 0, &fi);
 	if (!err)
 		sshfsm_release(path, &fi);
 
@@ -3668,7 +3588,7 @@ static size_t calc_buf_size(off_t size, off_t offset)
 	return offset + sshfsm.max_read < size ? sshfsm.max_read : size - offset;
 }
 
-static int serv_truncate_shrink(struct serv *srv, const char *path, 
+static int serv_truncate_shrink(serv_t serv, const char *path, 
 	off_t size)
 {
 	int res;
@@ -3681,7 +3601,7 @@ static int serv_truncate_shrink(struct serv *srv, const char *path,
 		return -ENOMEM;
 
 	fi.flags = O_RDONLY;
-	res = serv_open_common(srv, path, 0, &fi);
+	res = serv_open_common(serv, path, 0, &fi);
 	if (res)
 		goto out;
 
@@ -3696,7 +3616,7 @@ static int serv_truncate_shrink(struct serv *srv, const char *path,
 		goto out;
 
 	fi.flags = O_WRONLY | O_TRUNC;
-	res = serv_open_common(srv, path, 0, &fi);
+	res = serv_open_common(serv, path, 0, &fi);
 	if (res)
 		goto out;
 
@@ -3715,7 +3635,7 @@ out:
 	return res;
 }
 
-static int serv_truncate_extend(struct serv *srv,
+static int serv_truncate_extend(serv_t serv,
 	const char *path, off_t size, struct fuse_file_info *fi)
 {
 	int res;
@@ -3725,7 +3645,7 @@ static int serv_truncate_extend(struct serv *srv,
 	if (!fi) {
 		openfi = &tmpfi;
 		openfi->flags = O_WRONLY;
-		res = serv_open_common(srv, path, 0, openfi);
+		res = serv_open_common(serv, path, 0, openfi);
 		if (res)
 			return res;
 	}
@@ -3750,45 +3670,51 @@ static int serv_truncate_extend(struct serv *srv,
  * If new size is greater than current size, then write a zero byte to
  * the new end of the file.
  */
-static int truncate_remote_workaround(struct serv *srv, 
+static int truncate_remote_workaround(serv_t serv, 
 	const char *path, off_t size, struct fuse_file_info *fi)
 {
 	if (size == 0)
-		return serv_truncate_zero(srv, path);
+		return serv_truncate_zero(serv, path);
 	else {
 		struct stat stbuf;
 		int err;
 		if (fi)
 			err = sshfsm_fgetattr(path, &stbuf, fi);
 		else
-			err = serv_getattr(srv, path, &stbuf);
+			err = serv_getattr(serv, path, &stbuf);
 		if (err)
 			return err;
 		if (stbuf.st_size == size)
 			return 0;
 		else if (stbuf.st_size > size)
-			return serv_truncate_shrink(srv, path, size);
+			return serv_truncate_shrink(serv, path, size);
 		else
-			return serv_truncate_extend(srv, path, size, fi);
+			return serv_truncate_extend(serv, path, size, fi);
 	}
 }
 
 static int processing_init(void)
 {
+	unsigned int i;
+	serv_t serv;
 	signal(SIGPIPE, SIG_IGN);
-
-	pthread_mutex_init(&sshfsm.lock, NULL);
-	pthread_mutex_init(&sshfsm.lock_write, NULL);
-	pthread_cond_init(&sshfsm.outstanding_cond, NULL);
-	sshfsm.reqtab = g_hash_table_new(NULL, NULL);
-	if (!sshfsm.reqtab) {
-		fprintf(stderr, "failed to create hash table\n");
-		return -1;
+	
+	for (i = 0; i < serv_num; i++) {
+		serv = serv_i(i);
+		pthread_mutex_init(&serv->lock, NULL);
+		pthread_mutex_init(&serv->lock_write, NULL);
+		pthread_cond_init(&serv->outstanding_cond, NULL);
+		serv->reqtab = g_hash_table_new(NULL, NULL);
+		if (!serv->reqtab) {
+			error3("failed to create hash table");
+			return -1;
+		}
 	}
+	pthread_mutex_init(&sshfsm.lock_serv_arr, NULL);
 	return 0;
 }
 
-static int sftp_local_connect(void)
+static int sftp_local_connect(serv_t serv)
 {
 	pid_t pid;
 	int sockpair[2];
@@ -3818,7 +3744,7 @@ static int sftp_local_connect(void)
 		_exit(0);
 	} else {
 		close(sockpair[1]);
-		sshfsm.fd = sockpair[0];
+		serv->fd = sockpair[0];
 	}
 	
 	return 0;
@@ -3954,7 +3880,7 @@ static int sftp_proxy_auth_response(int sockfd, const char *key)
 	return code == SFTP_CONN_OK ? 0 : 1;
 }
 
-static int sftp_proxy_connect(char *host, char *port)
+static int sftp_proxy_connect(serv_t serv, char *port)
 {
 	int err;
 	int sock;
@@ -3967,14 +3893,15 @@ static int sftp_proxy_connect(char *host, char *port)
 	if (sftp_proxy_chk_psk() == -1)
 		return -1;
 	
-	debug("direct connect to %s:%s", host, port);
+	debug("direct connect to %s:%s", serv->hostname, port);
 
 	memset(&hint, 0, sizeof(hint));
 	hint.ai_family = PF_INET;
 	hint.ai_socktype = SOCK_STREAM;
-	err = getaddrinfo(host, port, &hint, &ai);
+	/* TODO: use serv->inaddr */
+	err = getaddrinfo(serv->hostname, port, &hint, &ai);
 	if (err) {
-		fprintf(stderr, "failed to resolve %s:%s: %s\n", host, port,
+		error3("failed to resolve %s:%s: %s\n", serv->hostname, port,
 			gai_strerror(err));
 		return -1;
 	}
@@ -4015,7 +3942,7 @@ static int sftp_proxy_connect(char *host, char *port)
 		return -1;
 	}
 
-	sshfsm.fd = sock;
+	serv->fd = sock;
 	return 0;
 }
 
@@ -4263,7 +4190,7 @@ static void usage(const char *progname)
 #ifdef SSH_NODELAY_WORKAROUND
 "             [no]nodelay      set nodelay tcp flag in ssh (default: on)\n"
 #endif
-"             [no]nodelaysrv   set nodelay tcp flag in sshd (default: off)\n"
+"             [no]nodelayserv   set nodelay tcp flag in sshd (default: off)\n"
 "             [no]truncate     fix truncate for old servers (default: off)\n"
 "             [no]buflimit     fix buffer fillup bug in server (default: on)\n"
 "    -o idmap=TYPE          user/group ID mapping, possible types are:\n"
@@ -4315,30 +4242,33 @@ static int parse_serv_args(const char *arg)
 	if (!strchr(arg, ':'))
 		return 1;
 
-	char *basepath, *tmp, *cp;
-	struct serv *servp = g_new0(struct serv, 1);
+	char *basepath, *tmp, *cp, *port;
+	struct serv *serv = g_new0(struct serv, 1);
 	GPtrArray *arr = (GPtrArray *) sshfsm.tree->data;
 	tmp = g_strdup(arg);
 	basepath = find_base_path(tmp);
+	port = sshfsm.directport ? sshfsm.directport : "22";
 	
 	/* Get mount option */
 	if ((cp = strchr(basepath, '='))) {
 		if (strchr(cp + 1, 'l'))
-			servp->local = 1;
+			serv->local = 1;
 		/* Other options can be appended here */
 		*cp = '\0';
 	} else
-		servp->local = 0;
+		serv->local = 0;
 
 	if (basepath[0] && basepath[strlen(basepath)-1] != '/')
-		servp->basepath = g_strdup_printf("%s/", basepath);
+		serv->basepath = g_strdup_printf("%s/", basepath);
 	else
-		servp->basepath = g_strdup(basepath);
-	servp->hostname = g_strdup(tmp);	
-	servp->rank = arr->len;
-	debug("add \'/\' arr[%d]: %s:%s:rank=%d:local=%d", arr->len,
-		  servp->hostname, servp->basepath, servp->rank, servp->local);
-	g_ptr_array_add(arr, (gpointer) servp);
+		serv->basepath = g_strdup(basepath);
+	serv->hostname = g_strdup(tmp);	
+	get_hostinfo(serv->hostname, port, &serv->inaddr);
+	serv->rank = 10000 - arr->len * 50;
+	debug("add \'/\' arr[%d]: %s(%s):%s:%s,local=%d,rank=%d,", arr->len,
+		  serv->hostname, inet_ntoa(serv->inaddr), port, serv->basepath, 
+		  serv->local, serv->rank);
+	g_ptr_array_add(arr, (gpointer) serv);
 	
 	g_free(tmp);
 	return 0;
@@ -4608,17 +4538,21 @@ static char *fsname_escape_commas(char *fsnameold)
 
 static int ssh_connect(void)
 {
-	if (processing_init() == -1)
-		return -1;
-
-	if (!sshfsm.delay_connect) {
-		if (connect_remote(srv) == -1)
+	if (serv_num == 1) {
+		if (processing_init() == -1)
 			return -1;
 
-		if (!sshfsm.no_check_root &&
-		    sftp_check_root(srv) == -1)
-			return -1;
+		if (!sshfsm.delay_connect) {
+			if (connect_remote(serv_0) == -1)
+				return -1;
+
+			if (!sshfsm.no_check_root &&
+				sftp_check_root(serv_0) == -1)
+				return -1;
+		}
+		return 0;
 	}
+
 	return 0;
 }
 
@@ -4638,15 +4572,12 @@ int main(int argc, char *argv[])
 	sshfsm.max_read = MAX_REQ_SIZE;
 	sshfsm.max_write = MAX_REQ_SIZE;
 	sshfsm.nodelay_workaround = 1;
-	sshfsm.nodelaysrv_workaround = 0;
+	sshfsm.nodelayserv_workaround = 0;
 	sshfsm.rename_workaround = 0;
 	sshfsm.truncate_workaround = 0;
 	sshfsm.buflimit_workaround = 1;
 	sshfsm.ssh_ver = 2;
 	sshfsm.progname = argv[0];
-	sshfsm.fd = -1;
-	sshfsm.ptyfd = -1;
-	sshfsm.ptyslavefd = -1;
 	sshfsm.delay_connect = 0;
 	sshfsm.port = 5285;
 	sshfsm.backlog = 20;
@@ -4726,8 +4657,7 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
-	fsname = g_strdup(sshfsm.host);
-	sshfsm.base_path = g_strdup(find_base_path(sshfsm.host));
+	fsname = g_strdup_printf("[%dhosts]", serv_num);
 
 	if (sshfsm.ssh_command)
 		set_ssh_command();
@@ -4735,7 +4665,7 @@ int main(int argc, char *argv[])
 	tmp = g_strdup_printf("-%i", sshfsm.ssh_ver);
 	ssh_add_arg(tmp);
 	g_free(tmp);
-	ssh_add_arg(sshfsm.host);
+	
 	if (sshfsm.sftp_server)
 		sftp_server = sshfsm.sftp_server;
 	else if (sshfsm.ssh_ver == 1)
