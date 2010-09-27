@@ -134,7 +134,6 @@
 #define INADDR_FLAG 0x1234000000000000LLU
 #define INADDR_MASK 0xffff000000000000LLU
 #define INADDR_HOPS 0x0000ffff00000000LLU
-#define INADDR_HOPS_1 0x0000000100000000LLU
 #define INADDR_ADDR 0x00000000ffffffffLLU
 
 #define PROTO_VERSION 3
@@ -204,6 +203,7 @@ struct sshfsm_file {
 	int connver;
 	int modifver;
 	int refs;
+	struct in_addr inaddr;
 };
 
 struct sshfsm {
@@ -266,7 +266,7 @@ struct sshfsm {
 	char *psk_path;
 	char *sftp_local_server;
 	int inaddr_ino;
-	unsigned int inaddr_hops;
+	unsigned int inaddr_nth;
 
 	/* statistics */
 	uint64_t bytes_sent;
@@ -382,7 +382,7 @@ static struct fuse_opt sshfsm_opts[] = {
 	SSHFSM_OPT("session_dir=%s",    session_dir, 0),
 	SSHFSM_OPT("dump",              dump, 1),
 	SSHFSM_OPT("inaddr_ino",        inaddr_ino, 1),
-	SSHFSM_OPT("inaddr_hops=%u",    inaddr_hops, 0),
+	SSHFSM_OPT("inaddr_nth=%u",     inaddr_nth, 0),
 	
 	/* Append a space if the option takes an argument */
 	FUSE_OPT_KEY("-p ",             KEY_PORT),
@@ -872,9 +872,9 @@ static int buf_get_attrs(struct buffer *buf, struct stat *stbuf, int *flagsp)
 	if (sshfsm.inaddr_ino) { 
 		if ((ino & INADDR_MASK) != INADDR_FLAG)
 			ino = INADDR_FLAG + sshfsm.host_addr.s_addr;
-		else if (get_ino_hops(ino) <= sshfsm.inaddr_hops)
+		else if (get_ino_hops(ino) <= sshfsm.inaddr_nth)
 			ino = (ino & 0xffffffff00000000LLU) + sshfsm.host_addr.s_addr;
-		ino += INADDR_HOPS_1;
+		ino += 0x0000000100000000LLU;
 	}
 	stbuf->st_ino = ino;
 
@@ -3562,8 +3562,8 @@ static void usage(const char *progname)
 "    -o ssh_protocol=N      ssh protocol to use (default: 2)\n"
 "    -o sftp_server=SERV    path to sftp server or subsystem (default: sftp)\n"
 "    -o directport=PORT     directly connect to PORT bypassing ssh\n"
-"    -o inaddr_ino          piggybacking ip address using inode numbers"
-"    -o inaddr_hops=N       hops of the Nth ip address (default: 0)"
+"    -o inaddr_ino          piggybacking ip address using inode numbers\n"
+"    -o inaddr_nth=N        piggybacking the Nth ip address (default: 0)\n"
 "    -o transform_symlinks  transform absolute symlinks to relative\n"
 "    -o follow_symlinks     follow symlinks on the server\n"
 "    -o no_check_root       don't check for existence of 'dir' on server\n"
@@ -3917,7 +3917,7 @@ int main(int argc, char *argv[])
 	sshfsm.backlog = 20;
 	sshfsm.sndbuf = 0;
 	sshfsm.rcvbuf = 0;
-	sshfsm.inaddr_hops = 0;
+	sshfsm.inaddr_nth = 0;
 	sshfsm.errlog = stderr;
 	ssh_add_arg("ssh");
 	ssh_add_arg("-x");
