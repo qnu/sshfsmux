@@ -2,7 +2,7 @@
 
 bin_PROGRAMS = sshfsm
 
-sshfsm_SOURCES = sshfsm.c cache.c cache.h table.c table.h #oper.c oper.h
+sshfsm_SOURCES = sshfsm.c cache.c cache.h
 if FUSE_OPT_COMPAT
 sshfsm_SOURCES += compat/fuse_opt.c compat/fuse_opt.h
 endif

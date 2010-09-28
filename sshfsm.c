@@ -488,6 +488,7 @@ static int serv_arr_init(void);
 static void serv_arr_destroy(void);
 static int tree_init(void);
 static void tree_destroy(void);
+static inline void tree_print(void);
 
 static char * find_base_path(char *);
 
@@ -1895,9 +1896,6 @@ static int start_processing_thread(serv_t serv)
 			return -EIO;
 	}
 
-	if (sshfsm.detect_uid)
-		sftp_detect_uid(serv);
-	
 	serv_t *data = g_new(serv_t, 1);
 	*data = serv;
 	sigemptyset(&newset);
@@ -1923,13 +1921,14 @@ static int start_processing_thread_all(void)
 	int err;
 	unsigned int i;
 	serv_t serv;
-	for (i = 0; i < serv_num; i++)
+	for (i = 0; i < serv_num; i++) {
 		serv = serv_i(i);
 		if ((err = start_processing_thread(serv)) != 0) {
 			error2(err, "%s: starting processing thread failed: %s", 
 					serv->hostname);
 			return -EIO;
 		}
+	}
 	return 0;
 }
 
@@ -2021,6 +2020,9 @@ static void *sshfsm_init(void)
 static void sshfsm_destroy(void *data_)
 {
 	(void) data_;
+
+	if (sshfsm.debug)
+		tree_print();
 	
 	cache_destroy();
 	serv_arr_destroy();
@@ -2209,7 +2211,6 @@ static void serv_arr_destroy(void)
 		g_free(serv->basepath);
 		if (serv->local)
 			continue;
-		pthread_cancel(serv->thread_id);
 		pthread_mutex_destroy(&serv->lock);
 		pthread_mutex_destroy(&serv->lock_write);
 		pthread_cond_destroy(&serv->outstanding_cond);
@@ -2262,21 +2263,20 @@ static int tree_node_free(GNode *node, gpointer data)
 
 static void tree_destroy(void)
 {	
-	g_node_traverse(sshfsm.tree, G_PRE_ORDER, G_TRAVERSE_ALL, -1,
+	g_node_traverse(sshfsm.tree, G_POST_ORDER, G_TRAVERSE_ALL, -1,
 		(GNodeTraverseFunc) tree_node_free, NULL);
 	g_node_destroy(sshfsm.tree);
 }
 
 static inline GNode * tree_find_child(GNode *node, const char *dirname)
 {
-	GNode *first = g_node_first_child(node);
-	GNode *last = g_node_last_child(node);
-	GNode *curr;
 	trnode_t curr_node;
-	for (curr = first; curr != last; curr = curr->next) {
-		curr_node = (trnode_t) curr;
+	GNode *curr = g_node_first_child(node);
+	while (curr != NULL) {
+		curr_node = (trnode_t) curr->data;
 		if (strcmp(curr_node->dirname, dirname) == 0)
 			return curr;
+		curr = curr->next;
 	}
 	return NULL;
 }
@@ -2288,8 +2288,6 @@ static GPtrArray * tree_lookup(const char *path)
 	trnode_t curr_data;
 	GPtrArray *curr_arr;
 
-	assert(path[0] == '/');
-	
 	curr = strv = g_strsplit(path, "/", -1);
 	curr_node = sshfsm.tree;
 	curr_data = (trnode_t) curr_node->data;
@@ -2300,8 +2298,10 @@ static GPtrArray * tree_lookup(const char *path)
 		curr_child = tree_find_child(curr_node, *curr);
 		if (curr_child == NULL)
 			break;
-		else
+		else {
 			curr_node = curr_child;
+			curr_data = (trnode_t) curr_node->data;
+		}
 	}
 	
 	curr_data = (trnode_t) curr_node->data;
@@ -2317,8 +2317,6 @@ static void tree_insert(const char *path, serv_t serv)
 	trnode_t curr_data;
 	GPtrArray *curr_arr;
 
-	assert(path[0] == '/');
-	
 	curr = strv = g_strsplit(path, "/", -1);
 	curr_node = sshfsm.tree;
 	curr_data = (trnode_t) curr_node->data;
@@ -2341,6 +2339,30 @@ static void tree_insert(const char *path, serv_t serv)
 		}
 		curr_node = curr_child;
 	}
+}
+
+static int tree_node_print(GNode *node, gpointer data)
+{
+	unsigned int i;
+	serv_t serv;
+	(void) data;
+	trnode_t p = (trnode_t) node->data;
+	fprintf(stderr, "[%02d:%10s]", g_node_depth(node), p->dirname);
+	for (i = 0; i < p->servarr->len; i++) {
+		serv = (serv_t) g_ptr_array_index(p->servarr, i);
+		fprintf(stderr, "%s ",serv->hostname);
+	}
+	fprintf(stderr, "\n");
+	return 0;
+}
+
+static inline void tree_print(void)
+{
+	fprintf(stderr, "Directory tree:\n");
+	g_node_traverse(sshfsm.tree, G_PRE_ORDER, G_TRAVERSE_ALL, -1,
+		(GNodeTraverseFunc) tree_node_print, NULL);
+	fflush(stderr);
+	fflush(stdout);
 }
 
 /* 
@@ -2394,7 +2416,7 @@ static int sshfsm_getattr(const char *path, struct stat *stbuf)
 	if (serv_num == 1)
 		return serv_getattr(serv_0, path, stbuf);
 	
-	int err = 0;
+	int err = 0, err2 = 1, firsterr = 0;
 	unsigned int i;
 	serv_t serv;
 	GPtrArray *serv_arr = tree_lookup(path);
@@ -2402,12 +2424,20 @@ static int sshfsm_getattr(const char *path, struct stat *stbuf)
 		serv = g_ptr_array_index(serv_arr, i);
 		err = serv_getattr(serv, path, stbuf);
 		if (!err) {
-			if (strcmp(path, "/") != 0 && S_ISDIR(stbuf->st_mode))
+			if (strcmp(path, "/") != 0 && S_ISDIR(stbuf->st_mode)) {
+				/* For directory, check every possible branches */
 				tree_insert(path, serv);
-			return 0;
+			} else {
+				/* For regular file, return the file found in branch
+				   with highest rank */
+				return 0;
+			}
 		}
+		if (!firsterr)
+			firsterr = err;
+		err2 *= err;
 	}
-	return err;
+	return err2 ? firsterr : 0;;
 }
 
 /* readlink */
@@ -2533,7 +2563,20 @@ static int sshfsm_readlink(const char *path, char *linkbuf, size_t size)
 {
 	if (serv_num == 1)
 		return serv_readlink(serv_0, path, linkbuf, size);
-	return 0;
+	
+	int err = 0, firsterr = 0;
+	unsigned int i;
+	serv_t serv;
+	GPtrArray *serv_arr = tree_lookup(path);
+	for (i = 0; i < serv_arr->len; i++) {
+		serv = g_ptr_array_index(serv_arr, i);
+		err = serv_readlink(serv, path, linkbuf, size);
+		if (!err)
+			return err;
+		if (!firsterr)
+			firsterr = err;
+	}
+	return firsterr;
 }
 
 /* getdir */
@@ -2718,7 +2761,7 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 	if (serv_num == 1)
 		return serv_getdir_0(serv_0, path, h, filler);
 
-	int err = 0, err2, err3 = 1;
+	int err = 0, err2, err3 = 1, firsterr = 0;
 	unsigned int i;
 	pthread_t *threads;
 	pthread_attr_t attr;
@@ -2735,7 +2778,7 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 	for (i = 0; i < serv_arr->len; i++) {
 		sets[i] = g_hash_table_new_full(g_str_hash, g_str_equal,
 			g_free, g_free);
-		thread_dat[i].serv = g_ptr_array_index(serv_arr, i);
+		thread_dat[i].serv = (serv_t) g_ptr_array_index(serv_arr, i);
 		thread_dat[i].path = path;
 		thread_dat[i].set = sets[i];
 		err = pthread_create(&threads[i], &attr,
@@ -2754,11 +2797,13 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 			err = -EIO;
 			goto out;
 		}
+		if (!firsterr)
+			firsterr = thread_dat[i].err;
 		err3 *= err2;
 	}
-	err = err3 ? thread_dat[0].err : 0;
+	err = err3 ? firsterr : 0;
 	
-	/* Aggregte results */
+	/* Aggregte all directory entires */
 	GHashTableIter iter;
 	gpointer key, value;
 	char *d_name;
@@ -2787,6 +2832,7 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 			}
 		}
 	}
+
 out:
 	for (i = 0; i < serv_arr->len; i++)
 		g_hash_table_destroy(sets[i]);
@@ -2834,7 +2880,24 @@ static int sshfsm_mkdir(const char *path, mode_t mode)
 
 	if (serv_num == 1)
 		return serv_mkdir(serv_0, path, mode);
-	return 0;
+	
+	/* TODO: makedirs at all branches */
+
+	int err = 0, firsterr = 0;
+	unsigned int i;
+	serv_t serv;
+	GPtrArray *serv_arr = tree_lookup(path);
+	for (i = 0; i < serv_arr->len; i++) {
+		serv = g_ptr_array_index(serv_arr, i);
+		err = serv_mkdir(serv, path, mode);
+		if (!err) {
+			tree_insert(path, serv);
+			return err;
+		}
+		if (!firsterr)
+			firsterr = err;
+	}
+	return firsterr;
 }
 
 /* mknod */
@@ -2893,7 +2956,24 @@ static int sshfsm_mknod(const char *path, mode_t mode, dev_t rdev)
 {
 	if (serv_num == 1)
 		return serv_mknod(serv_0, path, mode, rdev);
-	return 0;
+
+	/* TODO: mkdirs for all branches */
+	int err = 0, firsterr = 0;
+	unsigned int i;
+	serv_t serv;
+	GPtrArray *serv_arr = tree_lookup(path);
+	for (i = 0; i < serv_arr->len; i++) {
+		serv = g_ptr_array_index(serv_arr, i);
+		err = serv_mknod(serv, path, mode, rdev);
+		if (!err) {
+			if (S_ISDIR(mode))
+				tree_insert(path, serv);
+			return err;
+		}
+		if (!firsterr)
+			firsterr = err;
+	}
+	return firsterr;
 }
 
 /* symlink */
@@ -2939,7 +3019,20 @@ static int sshfsm_symlink(const char *from, const char *to)
 {
 	if (serv_num == 1)
 		return serv_symlink(serv_0, from, to);
-	return 0;
+	
+	int err = 0, firsterr = 0;
+	unsigned int i;
+	serv_t serv;
+	GPtrArray *serv_arr = tree_lookup(from);
+	for (i = 0; i < serv_arr->len; i++) {
+		serv = g_ptr_array_index(serv_arr, i);
+		err = serv_symlink(serv, from, to);
+		if (!err) 
+			return err;
+		if (!firsterr)
+			firsterr = err;
+	}
+	return firsterr;
 }
 
 /* unlink */
@@ -2970,11 +3063,67 @@ static int serv_unlink(serv_t serv, const char *path)
 	return serv->local ? unlink_local(serv, path) : unlink_remote(serv, path);
 }
 
+struct unlink_thread_data {
+	serv_t serv;
+	const char *path;
+	int err;
+};
+
+static void * unlink_thread_func(void *data)
+{
+	struct unlink_thread_data *p = (struct unlink_thread_data *) data;
+	p->err = serv_unlink(p->serv, p->path);
+	p->err ? pthread_exit((void *) -1) : pthread_exit((void *) 0);
+}
+
 static int sshfsm_unlink(const char *path)
 {
 	if (serv_num == 1)
 		return serv_unlink(serv_0, path);
-	return 0;
+	
+	int err = 0, err2, err3 = 1, firsterr = 0;
+	unsigned int i;
+	pthread_t *threads;
+	pthread_attr_t attr;
+	GPtrArray *serv_arr = tree_lookup(path);
+	
+	struct getdir_thread_data *thread_dat = 
+		g_new0(struct getdir_thread_data, serv_arr->len);
+	threads = g_new(pthread_t, serv_arr->len);
+	
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+	
+	for (i = 0; i < serv_arr->len; i++) {
+		thread_dat[i].serv = g_ptr_array_index(serv_arr, i);
+		thread_dat[i].path = path;
+		err = pthread_create(&threads[i], &attr,
+				unlink_thread_func, &thread_dat[i]);
+		if (err) {
+			error2(err, "create thread failed"); 
+			err = -EIO;
+			goto out;
+		}
+	}
+	
+	for (i = 0; i < serv_arr->len; i++) {
+		err = pthread_join(threads[i], (void *) &err2);
+		if (err) {
+			error2(err, "join thread failed");
+			err = -EIO;
+			goto out;
+		}
+		if (!firsterr)
+			firsterr = thread_dat[i].err;
+		err3 *= err2;
+	}
+	err = err3 ? firsterr : 0;
+
+out:
+	pthread_attr_destroy(&attr);
+	g_free(thread_dat);
+	g_free(threads);
+	return err;
 }
 
 /* rmdir */
@@ -4923,24 +5072,76 @@ static char *fsname_escape_commas(char *fsnameold)
 }
 #endif
 
-static int ssh_connect(void)
+static void * connect_thread_func(void *data)
+{
+	serv_t serv = (serv_t) data;
+	if (connect_remote(serv) == -1)
+		pthread_exit((void *) -1);
+	if (sshfsm.detect_uid)
+		sftp_detect_uid(serv);
+	if (!sshfsm.no_check_root && serv_check_root(serv_0) == -1)
+		pthread_exit((void *) -1);
+	pthread_exit((void *) 0);
+}
+
+static int connect_all(void)
 {
 	if (processing_init() == -1)
 		return -1;
 	
 	if (serv_num == 1) {
-
 		if (!sshfsm.delay_connect) {
 			if (connect_remote(serv_0) == -1)
 				return -1;
+
+			if (sshfsm.detect_uid)
+				sftp_detect_uid(serv_0);
 
 			if (!sshfsm.no_check_root && serv_check_root(serv_0) == -1)
 				return -1;
 		}
 		return 0;
 	}
+	
+	pthread_t *threads = g_new(pthread_t, serv_num);
+	pthread_attr_t attr;
+	serv_t serv;
+	int err, err2, err3 = 0;
+	unsigned int i;
 
-	return 0;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+	
+	for (i = 0; i < serv_num; i++) {
+		serv = serv_i(i);
+		err = pthread_create(&threads[i], &attr, connect_thread_func, serv);
+		if (err) {
+			error2(err, "create thread failed");
+			err = -1;
+			goto out;
+		}
+	}
+
+	for (i = 0; i < serv_num; i++) {
+		err = pthread_join(threads[i], (void *) &err2);
+		if (err) {
+			error2(err, "join thread failed");
+			err = -1;
+			goto out;
+		}
+		if (err2) {
+			serv = serv_i(i);
+			debug("failed to connect to %s", serv->hostname);
+		}
+		err3 += err2;
+	}
+	err = err3 ? -1 : 0;
+	debug("connect: %d", err);
+
+out:
+	pthread_attr_destroy(&attr);
+	g_free(threads);
+	return err;
 }
 
 int main(int argc, char *argv[])
@@ -5143,7 +5344,7 @@ int main(int argc, char *argv[])
 			exit(1);
 		}
 	
-		res = ssh_connect();
+		res = connect_all();
 		if (res == -1) {
 			fuse_unmount(mountpoint, ch);
 			fuse_destroy(fuse);
@@ -5176,7 +5377,7 @@ int main(int argc, char *argv[])
 		free(mountpoint);
 	}
 #else
-	res = ssh_connect();
+	res = connect_all();
 	if (res == -1)
 		exit(1);
 
