@@ -197,6 +197,12 @@ struct read_chunk {
 	long modifver;
 };
 
+struct tree_node {
+	char *dirname;
+	GPtrArray *servarr;
+};
+typedef struct tree_node * trnode_t;
+
 struct serv {
 	char *hostname;
 	struct in_addr inaddr;
@@ -478,6 +484,8 @@ static void perror2(const char *format, ...)
 static int sftp_local_connect(serv_t);
 static int sftp_proxy_connect(serv_t, char *);
 
+static int serv_arr_init(void);
+static void serv_arr_destroy(void);
 static int tree_init(void);
 static void tree_destroy(void);
 
@@ -1512,7 +1520,8 @@ static void close_conn(serv_t serv)
 
 static void *process_requests(void *data)
 {
-	serv_t serv = (struct serv *) data;
+	serv_t *servp = (serv_t *) data;
+	serv_t serv = *servp;
 
 	while (1) {
 		if (process_one_request(serv) == -1)
@@ -1530,6 +1539,7 @@ static void *process_requests(void *data)
 		serv->connver ++;
 		pthread_mutex_unlock(&serv->lock);
 	}
+	g_free(data);
 	return NULL;
 }
 
@@ -1713,13 +1723,15 @@ out:
 	buf_free(&buf);
 }
 
-static int sftp_check_root(serv_t serv)
+static int serv_check_root(serv_t serv)
 {
 	struct stat stbuf;
 	if (serv->local) {
-		char *realpath = serv_add_path(serv, ".");
-		int res = lstat(realpath, &stbuf);
-		g_free(realpath);
+		int res = lstat(serv->basepath, &stbuf);
+		if (res == -1)
+			error2(errno, "failed to check local root: %s", serv->basepath);
+		if (S_ISDIR(sshfsm.mnt_mode) && !S_ISDIR(stbuf.st_mode))
+			error3("%s:%s: Not a directory", serv->hostname, serv->basepath);
 		return res;
 	}
 
@@ -1825,12 +1837,15 @@ static int connect_remote(serv_t serv)
 		close_conn(serv);
 	else
 		serv->num_connect++;
-
+	
 	return err;
 }
 
 static int start_processing_thread(serv_t serv)
 {
+	if (serv->local)
+		return 0;
+
 	int err;
 	pthread_t thread_id;
 	sigset_t oldset;
@@ -1848,14 +1863,15 @@ static int start_processing_thread(serv_t serv)
 	if (sshfsm.detect_uid)
 		sftp_detect_uid(serv);
 	
-	/* TODO:NOW */
+	serv_t *data = g_new(serv_t, 1);
+	*data = serv;
 	sigemptyset(&newset);
 	sigaddset(&newset, SIGTERM);
 	sigaddset(&newset, SIGINT);
 	sigaddset(&newset, SIGHUP);
 	sigaddset(&newset, SIGQUIT);
 	pthread_sigmask(SIG_BLOCK, &newset, &oldset);
-	err = pthread_create(&thread_id, NULL, process_requests, NULL);
+	err = pthread_create(&thread_id, NULL, process_requests, (void *) data);
 	if (err) {
 		error2(err, "create thread");
 		return -EIO;
@@ -1869,7 +1885,6 @@ static int start_processing_thread(serv_t serv)
 
 static int start_processing_thread_all(void)
 {
-	/* TODO: use g_ptr_for_each */
 	int err;
 	unsigned int i;
 	serv_t serv;
@@ -1925,7 +1940,7 @@ static void runtime_destroy(void)
 	if (sshfsm.num_sent)
 		avg_rtt = sshfsm.total_rtt / sshfsm.num_sent;
 
-	debug("destroy\n"
+	debug("runtime statistics\n"
 		  "  sent:               %llu messages, %llu bytes\n"
 		  "  received:           %llu messages, %llu bytes\n"
 		  "  rtt min/max/avg:    %ums/%ums/%ums\n"
@@ -1973,6 +1988,7 @@ static void sshfsm_destroy(void *data_)
 	(void) data_;
 	
 	cache_destroy();
+	serv_arr_destroy();
 	tree_destroy();
 	runtime_destroy();
 }
@@ -2109,9 +2125,8 @@ static int sftp_request_iov(serv_t serv,
 	return sftp_request_wait(serv, req, type, expect_type, outbuf);
 }
 
-static int sftp_request(serv_t serv,
-						uint8_t type, const struct buffer *buf,
-                        uint8_t expect_type, struct buffer *outbuf)
+static int sftp_request(serv_t serv, uint8_t type, const struct buffer *buf,
+	uint8_t expect_type, struct buffer *outbuf)
 {
 	struct iovec iov;
 
@@ -2120,19 +2135,179 @@ static int sftp_request(serv_t serv,
 }
 
 /*
- * Directory Tree
+ * Server Array and Directory Tree
  */
-static int tree_init(void)
+static int serv_arr_init(void)
 {
-	sshfsm.serv_arr = g_ptr_array_new();
-	sshfsm.tree = g_node_new(sshfsm.serv_arr);
-
+	unsigned int i;
+	serv_t serv;
+	for (i = 0; i < serv_num; i++) {
+		serv = serv_i(i);
+		serv->fd = -1;
+		serv->ptyfd = -1;
+		serv->ptyslavefd = -1;
+		if (serv->local)
+			continue;
+		pthread_mutex_init(&serv->lock, NULL);
+		pthread_mutex_init(&serv->lock_write, NULL);
+		pthread_cond_init(&serv->outstanding_cond, NULL);
+		serv->reqtab = g_hash_table_new(NULL, NULL);
+		if (!serv->reqtab) {
+			error3("failed to create hash table");
+			return -1;
+		}
+		serv->connver = 0;
+		serv->processing_thread_started = 0;
+	}
+	pthread_mutex_init(&sshfsm.lock_serv_arr, NULL);
 	return 0;
 }
 
-static void tree_destroy(void)
+static void serv_arr_destroy(void)
 {
+	unsigned int i;
+	serv_t serv;
+	
+	for (i = 0; i < serv_num; i++) {
+		serv = serv_i(i);
+		g_free(serv->hostname);
+		g_free(serv->basepath);
+		if (serv->local)
+			continue;
+		pthread_cancel(serv->thread_id);
+		pthread_mutex_destroy(&serv->lock);
+		pthread_mutex_destroy(&serv->lock_write);
+		pthread_cond_destroy(&serv->outstanding_cond);
+		g_hash_table_destroy(serv->reqtab);
+	}
+	pthread_mutex_destroy(&sshfsm.lock_serv_arr);
+	g_ptr_array_free(sshfsm.serv_arr, TRUE);
+}
+
+static int serv_arr_find(GPtrArray *arr, serv_t serv)
+{
+	unsigned int i;
+	serv_t serv2;
+	for (i = 0; i < arr->len; i++) {
+		serv2 = g_ptr_array_index(arr, i);
+		if (serv == serv2)
+			return i;
+	}
+	return -1;
+}
+
+static inline void serv_arr_insert(GPtrArray *arr, serv_t serv)
+{
+	if (serv_arr_find(arr, serv) == -1)
+		g_ptr_array_add(arr, serv);
+}
+
+static int tree_init(void)
+{
+	trnode_t root = g_new0(struct tree_node, 1);
+	sshfsm.serv_arr = g_ptr_array_new();
+	root->dirname = g_strdup("/");
+	root->servarr = sshfsm.serv_arr;
+	sshfsm.tree = g_node_new((gpointer) root);
+	return 0;
+}
+
+static int tree_node_free(GNode *node, gpointer data)
+{
+	(void) data;
+	trnode_t p = (trnode_t) node->data;
+	/* sshfsm.serv_arr has been handled in serv_arr_destroy() */
+	if (strcmp(p->dirname, "/") != 0)
+		g_ptr_array_free(p->servarr, TRUE);
+	g_free(p->dirname);
+	
+	/* Don't stop traversal */
+	return 1;	
+}
+
+static void tree_destroy(void)
+{	
+	g_node_traverse(sshfsm.tree, G_PRE_ORDER, G_TRAVERSE_ALL, -1,
+		(GNodeTraverseFunc) tree_node_free, NULL);
 	g_node_destroy(sshfsm.tree);
+}
+
+static inline GNode * tree_find_child(GNode *node, const char *dirname)
+{
+	GNode *first = g_node_first_child(node);
+	GNode *last = g_node_last_child(node);
+	GNode *curr;
+	trnode_t curr_node;
+	for (curr = first; curr != last; curr = curr->next) {
+		curr_node = (trnode_t) curr;
+		if (strcmp(curr_node->dirname, dirname) == 0)
+			return curr;
+	}
+	return NULL;
+}
+
+static GPtrArray * tree_lookup(const char *path)
+{
+	char **strv, **curr;
+	GNode *curr_node, *curr_child;
+	trnode_t curr_data;
+	GPtrArray *curr_arr;
+
+	assert(path[0] == '/');
+	
+	curr = strv = g_strsplit(path, "/", -1);
+	curr_node = sshfsm.tree;
+	curr_data = (trnode_t) curr_node->data;
+
+	debug("lookup: %s", path);
+	for (curr = strv; *curr; curr++) {
+		if (strlen(*curr) == 0)
+			continue;
+		debug("curr: %s", *curr);
+		curr_child = tree_find_child(curr_node, *curr);
+		if (curr_child == NULL)
+			break;
+		else
+			curr_node = curr_child;
+	}
+	
+	curr_data = (trnode_t) curr_node->data;
+	curr_arr = curr_data->servarr;
+	g_strfreev(strv);
+	return curr_arr;
+}
+
+static void tree_insert(const char *path, serv_t serv)
+{
+	char **strv, **curr;
+	GNode *curr_node, *curr_child;
+	trnode_t curr_data;
+	GPtrArray *curr_arr;
+
+	assert(path[0] == '/');
+	
+	curr = strv = g_strsplit(path, "/", -1);
+	curr_node = sshfsm.tree;
+	curr_data = (trnode_t) curr_node->data;
+	
+	for (curr = strv; *curr; curr++) {
+		if (strlen(*curr) == 0)
+			continue;
+		curr_child = tree_find_child(curr_node, *curr);
+		if (curr_child) {
+			curr_data = (trnode_t) curr_child->data;
+			curr_arr = curr_data->servarr;
+			serv_arr_insert(curr_arr, serv);
+		} else {
+			trnode_t new_node = g_new0(struct tree_node, 1);
+			new_node->dirname = g_strdup(*curr);
+			new_node->servarr = g_ptr_array_new();
+			g_ptr_array_add(new_node->servarr, (gpointer) serv);
+			curr_child = g_node_new(new_node);
+			g_node_prepend(curr_node, curr_child);
+		}
+		curr_node = curr_child;
+	}
 }
 
 /* 
@@ -2142,9 +2317,7 @@ static void tree_destroy(void)
 static int getattr_local(serv_t serv, const char *path, struct stat *stbuf)
 {
 	int res;
-	char *realpath;
-
-	realpath = serv_add_path(serv, path);
+	char *realpath = serv_add_path(serv, path);
 	if (sshfsm.follow_symlinks)
 		res = stat(realpath, stbuf);
 	else
@@ -2177,7 +2350,7 @@ static int getattr_remote(serv_t serv,
 }
 
 static int serv_getattr(serv_t serv, const char *path,
-						struct stat *stbuf)
+	struct stat *stbuf)
 {
 	return serv->local ? 
 		getattr_local(serv, path, stbuf) : getattr_remote(serv, path, stbuf);
@@ -2187,8 +2360,21 @@ static int sshfsm_getattr(const char *path, struct stat *stbuf)
 {
 	if (serv_num == 1)
 		return serv_getattr(serv_0, path, stbuf);
-
-	return 0;
+	
+	int err = 0;
+	unsigned int i;
+	serv_t serv;
+	GPtrArray *serv_arr = tree_lookup(path);
+	for (i = 0; i < serv_arr->len; i++) {
+		serv = g_ptr_array_index(serv_arr, i);
+		err = serv_getattr(serv, path, stbuf);
+		if (!err) {
+			if (strcmp(path, "/") != 0 && S_ISDIR(stbuf->st_mode))
+				tree_insert(path, serv);
+			return 0;
+		}
+	}
+	return err;
 }
 
 /* readlink */
@@ -2261,11 +2447,8 @@ static void transform_symlink(serv_t serv, const char *path, char **linkp)
 static int readlink_local(serv_t serv, const char *path, char *linkbuf, 
 	size_t size)
 {
-	int res;
-	char *realpath;
-
-	realpath = serv_add_path(serv, path);
-	res = readlink(realpath, linkbuf, size - 1);
+	char *realpath = serv_add_path(serv, path);
+	int res = readlink(realpath, linkbuf, size - 1);
 	g_free(realpath);
 	if (res == -1)
 		return -errno;
@@ -2409,7 +2592,7 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 	if (serv_num == 1)
 		return serv_getdir_0(serv_0, path, h, filler);
 
-	return 0;
+	return -EPERM;
 }
 
 /* mkdir */
@@ -2438,7 +2621,8 @@ static int mkdir_remote(serv_t serv, const char *path, mode_t mode)
 
 static int serv_mkdir(serv_t serv, const char *path, mode_t mode)
 {
-	return serv->local ? mkdir_local(serv, path, mode) : mkdir_remote(serv, path, mode);
+	return serv->local ? mkdir_local(serv, path, mode) 
+		: mkdir_remote(serv, path, mode);
 }
 
 static int sshfsm_mkdir(const char *path, mode_t mode)
@@ -2486,7 +2670,8 @@ static int mknod_remote(serv_t serv, const char *path,
 	if (!err) {
 		int err2;
 		buf_finish(&handle);
-		err2 = sftp_request(serv, SSH_FXP_CLOSE, &handle, SSH_FXP_STATUS, NULL);
+		err2 = sftp_request(serv, SSH_FXP_CLOSE, &handle, 
+			SSH_FXP_STATUS, NULL);
 		if (!err)
 			err = err2;
 		buf_free(&handle);
@@ -2902,13 +3087,14 @@ static int open_local(serv_t serv, const char *path, mode_t mode,
 	sf = g_new0(struct sshfsm_file, 1);
 	sf->serv = serv;
 	sf->local_fd = open(realpath, fi->flags, mode);
+	debug("===========open %s", realpath);
 	if (sf->local_fd == -1) {
 		cache_invalidate(path);
 		g_free(sf);
 		g_free(realpath);
 		return -errno;
 	}
-	int res = lstat(path, &stbuf);
+	int res = lstat(realpath, &stbuf);
 	if (res == -1) {
 		cache_invalidate(path);
 		g_free(sf);
@@ -3013,7 +3199,8 @@ static int serv_open_common(serv_t serv, const char *path,
 static int sshfsm_open(const char *path, struct fuse_file_info *fi)
 {
 	if (serv_num == 1)
-		return serv_open_common(0, path, 0, fi);
+		return serv_open_common(serv_0, path, 0, fi);
+
 	return 0;
 }
 
@@ -3695,22 +3882,11 @@ static int truncate_remote_workaround(serv_t serv,
 
 static int processing_init(void)
 {
-	unsigned int i;
-	serv_t serv;
 	signal(SIGPIPE, SIG_IGN);
-	
-	for (i = 0; i < serv_num; i++) {
-		serv = serv_i(i);
-		pthread_mutex_init(&serv->lock, NULL);
-		pthread_mutex_init(&serv->lock_write, NULL);
-		pthread_cond_init(&serv->outstanding_cond, NULL);
-		serv->reqtab = g_hash_table_new(NULL, NULL);
-		if (!serv->reqtab) {
-			error3("failed to create hash table");
-			return -1;
-		}
-	}
-	pthread_mutex_init(&sshfsm.lock_serv_arr, NULL);
+
+	if (serv_arr_init() == -1)
+		return -1;
+
 	return 0;
 }
 
@@ -3958,7 +4134,7 @@ static void sftp_proxy_process(void)
 	
 	serv_sockfd = socket(AF_INET, SOCK_STREAM, 0);
 	if (serv_sockfd == -1)
-		fatal(1, "failed to create socket", NULL);
+		fatal(1, "***failed to create socket", NULL);
 	
 	res = setsockopt(serv_sockfd, SOL_SOCKET, SO_REUSEADDR, &flag,
 		sizeof(flag)); 
@@ -4244,24 +4420,33 @@ static int parse_serv_args(const char *arg)
 
 	char *basepath, *tmp, *cp, *port;
 	struct serv *serv = g_new0(struct serv, 1);
-	GPtrArray *arr = (GPtrArray *) sshfsm.tree->data;
+	GPtrArray *arr = (GPtrArray *) sshfsm.serv_arr;
 	tmp = g_strdup(arg);
 	basepath = find_base_path(tmp);
 	port = sshfsm.directport ? sshfsm.directport : "22";
 	
 	/* Get mount option */
 	if ((cp = strchr(basepath, '='))) {
-		if (strchr(cp + 1, 'l'))
+		if (strchr(cp+1, 'l'))
 			serv->local = 1;
 		/* Other options can be appended here */
 		*cp = '\0';
 	} else
 		serv->local = 0;
 
-	if (basepath[0] && basepath[strlen(basepath)-1] != '/')
-		serv->basepath = g_strdup_printf("%s/", basepath);
-	else
-		serv->basepath = g_strdup(basepath);
+	if (basepath[0] && basepath[strlen(basepath)-1] != '/') {
+		if (serv->local && basepath[0] != '/')
+			serv->basepath = g_strdup_printf("%s/%s/", sshfsm.userhome,
+				basepath);
+		else
+			serv->basepath = g_strdup_printf("%s/", basepath);
+	} else {
+		if (serv->local && basepath[0] != '/')
+			serv->basepath = g_strdup_printf("%s/%s", sshfsm.userhome,
+				basepath);
+		else
+			serv->basepath = g_strdup(basepath);
+	}
 	serv->hostname = g_strdup(tmp);	
 	get_hostinfo(serv->hostname, port, &serv->inaddr);
 	serv->rank = 10000 - arr->len * 50;
@@ -4538,16 +4723,16 @@ static char *fsname_escape_commas(char *fsnameold)
 
 static int ssh_connect(void)
 {
+	if (processing_init() == -1)
+		return -1;
+	
 	if (serv_num == 1) {
-		if (processing_init() == -1)
-			return -1;
 
 		if (!sshfsm.delay_connect) {
 			if (connect_remote(serv_0) == -1)
 				return -1;
 
-			if (!sshfsm.no_check_root &&
-				sftp_check_root(serv_0) == -1)
+			if (!sshfsm.no_check_root && serv_check_root(serv_0) == -1)
 				return -1;
 		}
 		return 0;
@@ -4657,7 +4842,8 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
-	fsname = g_strdup_printf("[%dhosts]", serv_num);
+	fsname = serv_num == 1 ? g_strdup("sshfsm") : 
+		g_strdup_printf("sshfsm_%dhosts", serv_num);
 
 	if (sshfsm.ssh_command)
 		set_ssh_command();
