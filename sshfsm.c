@@ -2368,6 +2368,7 @@ static inline void tree_print(void)
 /* 
  * FUSE APIs
  */
+
 /* getattr */
 static int getattr_local(serv_t serv, const char *path, struct stat *stbuf)
 {
@@ -3087,8 +3088,8 @@ static int sshfsm_unlink(const char *path)
 	pthread_attr_t attr;
 	GPtrArray *serv_arr = tree_lookup(path);
 	
-	struct getdir_thread_data *thread_dat = 
-		g_new0(struct getdir_thread_data, serv_arr->len);
+	struct unlink_thread_data *thread_dat = 
+		g_new0(struct unlink_thread_data, serv_arr->len);
 	threads = g_new(pthread_t, serv_arr->len);
 	
 	pthread_attr_init(&attr);
@@ -3154,15 +3155,77 @@ static int serv_rmdir(serv_t serv, const char *path)
 	return serv->local ? rmdir_local(serv, path) : rmdir_remote(serv, path);
 }
 
+struct rmdir_thread_data {
+	serv_t serv;
+	const char *path;
+	int err;
+};
+
+static void * rmdir_thread_func(void *data)
+{
+	struct rmdir_thread_data *p = (struct rmdir_thread_data *) data;
+	p->err = serv_rmdir(p->serv, p->path);
+	p->err ? pthread_exit((void *) -1) : pthread_exit((void *) 0);
+}
+
 static int sshfsm_rmdir(const char *path)
 {
 	if (serv_num == 1)
 		return serv_rmdir(serv_0, path);
-	return 0;
+	
+	int err = 0, err2, err3 = 1, firsterr = 0;
+	GPtrArray *serv_arr = tree_lookup(path);
+	if (serv_arr->len == 1) {
+		serv_t serv = g_ptr_array_index(serv_arr, 0);
+		err = serv_rmdir(serv, path);
+		//if (!err) TODO
+		//	tree_remove_path(path);
+		return err;
+	}
+	
+	pthread_t *threads;
+	pthread_attr_t attr;
+	unsigned int i;
+	struct rmdir_thread_data *thread_dat = 
+		g_new0(struct rmdir_thread_data, serv_arr->len);
+	threads = g_new(pthread_t, serv_arr->len);
+	
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+	
+	for (i = 0; i < serv_arr->len; i++) {
+		thread_dat[i].serv = g_ptr_array_index(serv_arr, i);
+		thread_dat[i].path = path;
+		err = pthread_create(&threads[i], &attr,
+				rmdir_thread_func, &thread_dat[i]);
+		if (err) {
+			error2(err, "create thread failed"); 
+			err = -EIO;
+			goto out;
+		}
+	}
+	
+	for (i = 0; i < serv_arr->len; i++) {
+		err = pthread_join(threads[i], (void *) &err2);
+		if (err) {
+			error2(err, "join thread failed");
+			err = -EIO;
+			goto out;
+		}
+		if (!firsterr)
+			firsterr = thread_dat[i].err;
+		err3 *= err2;
+	}
+	err = err3 ? firsterr : 0;
+
+out:
+	pthread_attr_destroy(&attr);
+	g_free(thread_dat);
+	g_free(threads);
+	return err;
 }
 
 /* rename */
-
 static int rename_local(serv_t serv, const char *from, const char *to)
 {
 	char *realfrom = serv_add_path(serv, from);
@@ -3240,11 +3303,76 @@ static int serv_rename(serv_t serv, const char *from, const char *to)
 	return err;
 }
 
+struct rename_thread_data {
+	serv_t serv;
+	const char *from;
+	const char *to;
+	int err;
+};
+
+static void * rename_thread_func(void *data)
+{
+	struct rename_thread_data *p = (struct rename_thread_data *) data;
+	p->err = serv_rename(p->serv, p->from, p->to);
+	p->err ? pthread_exit((void *) -1) : pthread_exit((void *) 0);
+}
+
 static int sshfsm_rename(const char *from, const char *to)
 {
 	if (serv_num == 1)
 		return serv_rename(serv_0, from, to);
-	return 0;
+	
+	int err = 0, err2, err3 = 1, firsterr = 0;
+	GPtrArray *serv_arr = tree_lookup(from);
+	if (serv_arr->len == 1) {
+		serv_t serv = g_ptr_array_index(serv_arr, 0);
+		err = serv_rename(serv, from, to);
+		//if (!err) TODO
+		//	tree_remove_path(from);
+		return err;
+	}
+	
+	pthread_t *threads;
+	pthread_attr_t attr;
+	unsigned int i;
+	struct rename_thread_data *thread_dat = 
+		g_new0(struct rename_thread_data, serv_arr->len);
+	threads = g_new(pthread_t, serv_arr->len);
+	
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+	
+	for (i = 0; i < serv_arr->len; i++) {
+		thread_dat[i].serv = g_ptr_array_index(serv_arr, i);
+		thread_dat[i].from = from;
+		thread_dat[i].to = to;
+		err = pthread_create(&threads[i], &attr,
+				rename_thread_func, &thread_dat[i]);
+		if (err) {
+			error2(err, "create thread failed"); 
+			err = -EIO;
+			goto out;
+		}
+	}
+	
+	for (i = 0; i < serv_arr->len; i++) {
+		err = pthread_join(threads[i], (void *) &err2);
+		if (err) {
+			error2(err, "join thread failed");
+			err = -EIO;
+			goto out;
+		}
+		if (!firsterr)
+			firsterr = thread_dat[i].err;
+		err3 *= err2;
+	}
+	err = err3 ? firsterr : 0;
+
+out:
+	pthread_attr_destroy(&attr);
+	g_free(thread_dat);
+	g_free(threads);
+	return err;
 }
 
 /* chmod */
@@ -3284,7 +3412,20 @@ static int sshfsm_chmod(const char *path, mode_t mode)
 {
 	if (serv_num == 1)
 		return serv_chmod(serv_0, path, mode);
-	return 0;
+	
+	int err = 0, firsterr = 0;
+	unsigned int i;
+	serv_t serv;
+	GPtrArray *serv_arr = tree_lookup(path);
+	for (i = 0; i < serv_arr->len; i++) {
+		serv = g_ptr_array_index(serv_arr, i);
+		err = serv_chmod(serv, path, mode);
+		if (!err)
+			return err;
+		if (!firsterr)
+			firsterr = err;
+	}
+	return firsterr;
 }
 
 /* chown */
@@ -3301,7 +3442,6 @@ static int chown_local(serv_t serv, const char *path, uid_t uid, gid_t gid)
 		return -errno;
 	return res;
 }
-
 
 static int chown_remote(serv_t serv, const char *path, 
 	uid_t uid, gid_t gid)
@@ -3330,7 +3470,20 @@ static int sshfsm_chown(const char *path, uid_t uid, gid_t gid)
 {
 	if (serv_num == 1)
 		return serv_chown(serv_0, path, uid, gid);
-	return 0;
+	
+	int err = 0, firsterr = 0;
+	unsigned int i;
+	serv_t serv;
+	GPtrArray *serv_arr = tree_lookup(path);
+	for (i = 0; i < serv_arr->len; i++) {
+		serv = g_ptr_array_index(serv_arr, i);
+		err = serv_chown(serv, path, uid, gid);
+		if (!err)
+			return err;
+		if (!firsterr)
+			firsterr = err;
+	}
+	return firsterr;
 }
 
 /* truncate */
@@ -3376,7 +3529,21 @@ static int sshfsm_truncate(const char *path, off_t size)
 {
 	if (serv_num == 1)
 		return serv_truncate(serv_0, path, size);
-	return 0;
+	
+	GPtrArray *serv_arr = tree_lookup(path);
+	unsigned int i;
+	serv_t serv;
+	int err = 0, firsterr = 0;
+
+	for (i = 0; i < serv_arr->len; i++) {
+		serv = g_ptr_array_index(serv_arr, 0);
+		err = serv_truncate(serv, path, size);
+		if (!err)
+			return err;
+		if (!firsterr)
+			firsterr = err;
+	}
+	return firsterr;
 }
 
 /* utime */
@@ -3416,7 +3583,21 @@ static int sshfsm_utime(const char *path, struct utimbuf *ubuf)
 {
 	if (serv_num == 1)
 		return serv_utime(serv_0, path, ubuf);
-	return 0;
+	
+	GPtrArray *serv_arr = tree_lookup(path);
+	unsigned int i;
+	serv_t serv;
+	int err = 0, firsterr = 0;
+
+	for (i = 0; i < serv_arr->len; i++) {
+		serv = g_ptr_array_index(serv_arr, 0);
+		err = serv_utime(serv, path, ubuf);
+		if (!err)
+			return err;
+		if (!firsterr)
+			firsterr = err;
+	}
+	return firsterr;
 }
 
 /* open */
@@ -3438,7 +3619,6 @@ static int open_local(serv_t serv, const char *path, mode_t mode,
 	sf = g_new0(struct sshfsm_file, 1);
 	sf->serv = serv;
 	sf->local_fd = open(realpath, fi->flags, mode);
-	debug("===========open %s", realpath);
 	if (sf->local_fd == -1) {
 		cache_invalidate(path);
 		g_free(sf);
