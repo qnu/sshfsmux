@@ -969,7 +969,7 @@ static int buf_get_statvfs(struct buffer *buf, struct statvfs *stbuf)
 	return 0;
 }
 
-static int buf_get_entries_0(serv_t serv, struct buffer *buf, 
+static int buf_get_entries(serv_t serv, struct buffer *buf, 
 	fuse_cache_dirh_t h, fuse_cache_dirfil_t filler)
 {
 	uint32_t count;
@@ -991,6 +991,41 @@ static int buf_get_entries_0(serv_t serv, struct buffer *buf,
 				if (sshfsm.follow_symlinks && S_ISLNK(stbuf.st_mode))
 					stbuf.st_mode = 0;
 				filler(h, name, &stbuf);
+				err = 0;
+			}
+		}
+		free(name);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+static int buf_get_entries_set(serv_t serv, struct buffer *buf,
+	GHashTable *set)
+{
+	uint32_t count;
+	unsigned i;
+	struct stat *st;
+
+	if (buf_get_uint32(buf, &count) == -1)
+		return -1;
+
+	for (i = 0; i < count; i++) {
+		int err = -1;
+		char *name;
+		char *longname;
+		struct stat stbuf;
+		if (buf_get_string(buf, &name) == -1)
+			return -1;
+		if (buf_get_string(buf, &longname) != -1) {
+			free(longname);
+			if (buf_get_attrs(serv, buf, &stbuf, NULL) != -1) {
+				if (sshfsm.follow_symlinks && S_ISLNK(stbuf.st_mode))
+					stbuf.st_mode = 0;
+				st = g_new(struct stat, 1);
+				*st = stbuf;
+				g_hash_table_insert(set, g_strdup(name), (gpointer) st);
 				err = 0;
 			}
 		}
@@ -2259,11 +2294,9 @@ static GPtrArray * tree_lookup(const char *path)
 	curr_node = sshfsm.tree;
 	curr_data = (trnode_t) curr_node->data;
 
-	debug("lookup: %s", path);
 	for (curr = strv; *curr; curr++) {
 		if (strlen(*curr) == 0)
 			continue;
-		debug("curr: %s", *curr);
 		curr_child = tree_find_child(curr_node, *curr);
 		if (curr_child == NULL)
 			break;
@@ -2562,7 +2595,7 @@ static int getdir_remote_0(serv_t serv, const char *path,
 			err = sftp_request(serv, SSH_FXP_READDIR, &handle, 
 				SSH_FXP_NAME, &name);
 			if (!err) {
-				if (buf_get_entries_0(serv, &name, h, filler) == -1)
+				if (buf_get_entries(serv, &name, h, filler) == -1)
 					err = -EIO;
 				buf_free(&name);
 			}
@@ -2586,13 +2619,182 @@ static int serv_getdir_0(serv_t serv, const char *path,
 		getdir_remote_0(serv, path, h, filler);
 }
 
+static int getdir_local(serv_t serv, const char *path, GHashTable* set)
+{
+	char *realpath = serv_add_path(serv, path);
+	DIR *dp = opendir(realpath);
+	if (dp == NULL) {
+		g_free(realpath);
+		return -errno;
+	}
+		
+	union {
+		struct dirent de;
+		char buf[offsetof(struct dirent, d_name) + NAME_MAX + 1];
+	} u;
+	struct dirent *dep;
+	struct stat stbuf, *st;
+	char *filename;
+	int res = 0;
+	
+	while ((readdir_r(dp, &u.de, &dep) == 0) && dep) {
+		memset(&stbuf, 0, sizeof(stbuf));
+		filename = g_strdup_printf("%s/%s", realpath, u.de.d_name);
+		if (sshfsm.follow_symlinks)
+			res = stat(filename, &stbuf);
+		else
+			res = lstat(filename, &stbuf);
+		g_free(filename);
+		if (res == -1) {
+			res = -errno;
+			break;
+		}
+		st = g_new(struct stat, 1);
+		*st = stbuf;
+		g_hash_table_insert(set, g_strdup(u.de.d_name), (gpointer) st);
+	}
+	closedir(dp);
+	g_free(realpath);
+	return res;
+}
+
+static int getdir_remote(serv_t serv, const char *path, GHashTable* set)
+{
+	int err;
+	struct buffer buf;
+	struct buffer handle;
+	buf_init(&buf, 0);
+	buf_add_path(serv, &buf, path);
+	err = sftp_request(serv, SSH_FXP_OPENDIR, &buf, SSH_FXP_HANDLE, &handle);
+	if (!err) {
+		int err2;
+		buf_finish(&handle);
+		do {
+			struct buffer name;
+			err = sftp_request(serv, SSH_FXP_READDIR, &handle, 
+				SSH_FXP_NAME, &name);
+			if (!err) {
+				if (buf_get_entries_set(serv, &name, set) == -1)
+					err = -EIO;
+				buf_free(&name);
+			}
+		} while (!err);
+		if (err == MY_EOF)
+			err = 0;
+
+		err2 = sftp_request(serv, SSH_FXP_CLOSE, &handle, 0, NULL);
+		if (!err)
+			err = err2;
+		buf_free(&handle);
+	}
+	buf_free(&buf);
+	return err;
+}
+
+static int serv_getdir(serv_t serv, const char *path, GHashTable* set)
+{
+	return serv->local ? getdir_local(serv, path, set) 
+		: getdir_remote(serv, path, set);
+}
+
+struct getdir_thread_data {
+	serv_t serv;
+	const char *path;
+	GHashTable *set;
+	int err;
+};
+
+static void * getdir_thread_func(void *data)
+{
+	struct getdir_thread_data *p =
+		(struct getdir_thread_data *) data;
+	p->err = serv_getdir(p->serv, p->path, p->set);
+	p->err ? pthread_exit((void *) -1) : pthread_exit((void *) 0);
+}
+
 static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
                         fuse_cache_dirfil_t filler)
 {
 	if (serv_num == 1)
 		return serv_getdir_0(serv_0, path, h, filler);
 
-	return -EPERM;
+	int err = 0, err2, err3 = 1;
+	unsigned int i;
+	pthread_t *threads;
+	pthread_attr_t attr;
+	GPtrArray *serv_arr = tree_lookup(path);
+	GHashTable **sets = g_new0(GHashTable *, serv_arr->len);
+	
+	struct getdir_thread_data *thread_dat = 
+		g_new0(struct getdir_thread_data, serv_arr->len);
+	threads = g_new(pthread_t, serv_arr->len);
+	
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+
+	for (i = 0; i < serv_arr->len; i++) {
+		sets[i] = g_hash_table_new_full(g_str_hash, g_str_equal,
+			g_free, g_free);
+		thread_dat[i].serv = g_ptr_array_index(serv_arr, i);
+		thread_dat[i].path = path;
+		thread_dat[i].set = sets[i];
+		err = pthread_create(&threads[i], &attr,
+				getdir_thread_func, &thread_dat[i]);
+		if (err) {
+			error2(err, "create thread failed"); 
+			err = -EIO;
+			goto out;
+		}
+	}
+	
+	for (i = 0; i < serv_arr->len; i++) {
+		err = pthread_join(threads[i], (void *) &err2);
+		if (err) {
+			error2(err, "join thread failed");
+			err = -EIO;
+			goto out;
+		}
+		err3 *= err2;
+	}
+	err = err3 ? thread_dat[0].err : 0;
+	
+	/* Aggregte results */
+	GHashTableIter iter;
+	gpointer key, value;
+	char *d_name;
+	struct stat *st;
+	
+	g_hash_table_iter_init(&iter, sets[0]);
+	while (g_hash_table_iter_next(&iter, &key, &value)) {
+		d_name = (char *) key;
+		st = (struct stat *) value;
+		if (filler(h, d_name, st)) {
+			err = -EIO;
+			goto out;
+		}
+	}
+	
+	for (i = 1; i < serv_arr->len; i++) {
+		g_hash_table_iter_init(&iter, sets[i]);
+		while (g_hash_table_iter_next(&iter, &key, &value)) {
+			d_name = (char *) key;
+			st = (struct stat *) value;
+			if (g_hash_table_lookup(sets[0], key))
+				continue;
+			if (filler(h, d_name, st)) {
+				err = -EIO;
+				goto out;
+			}
+		}
+	}
+out:
+	for (i = 0; i < serv_arr->len; i++)
+		g_hash_table_destroy(sets[i]);
+	pthread_attr_destroy(&attr);
+	g_free(sets);
+	g_free(thread_dat);
+	g_free(threads);
+	return err;
 }
 
 /* mkdir */
