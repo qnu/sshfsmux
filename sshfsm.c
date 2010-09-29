@@ -225,6 +225,8 @@ struct serv {
 	unsigned outstanding_len;
 	pthread_cond_t outstanding_cond;
 	uint32_t idctr;
+	int is_forward;
+	int forward_refs;
 	
 	/* statistics */
 	uint64_t bytes_sent;
@@ -251,7 +253,6 @@ struct sshfsm_file {
 	int refs;
 	serv_t serv;
 	int local_fd;
-	struct in_addr inaddr;	/* piggybacked location */
 };
 
 struct sshfsm {
@@ -298,7 +299,11 @@ struct sshfsm {
 	char *sftp_local_server;
 	int inaddr_ino;
 	unsigned int inaddr_nth;
+	char *forward_io;
+	unsigned forward_timeout;
 	GPtrArray *serv_arr;
+	GPtrArray *fwd_serv_arr;
+	time_t fwd_serv_arr_last_cleaned;
 	GNode *tree;
 	pthread_mutex_t lock_serv_arr;
 
@@ -417,6 +422,8 @@ static struct fuse_opt sshfsm_opts[] = {
 	SSHFSM_OPT("dump",              dump, 1),
 	SSHFSM_OPT("inaddr_ino",        inaddr_ino, 1),
 	SSHFSM_OPT("inaddr_nth=%u",     inaddr_nth, 0),
+	SSHFSM_OPT("forward_io=%s",   	forward_io, 0),
+	SSHFSM_OPT("forward_timeout=%u",forward_timeout, 0),
 	
 	/* Append a space if the option takes an argument */
 	FUSE_OPT_KEY("-p ",             KEY_PORT),
@@ -489,6 +496,7 @@ static void serv_arr_destroy(void);
 static int tree_init(void);
 static void tree_destroy(void);
 static inline void tree_print(void);
+static void fwd_serv_arr_cleanup(time_t timeout);
 
 static char * find_base_path(char *);
 
@@ -571,6 +579,19 @@ static char * get_file(const char *path, size_t *len, int escape)
 	}
 	
 	return buf;
+}
+
+static int get_cmd_output(const char *cmd, char *buf, size_t buflen)
+{
+	FILE *fp;
+	fp = popen(cmd, "r");
+	if (fp == NULL) {
+		error3("failed to popen");
+		return -1;
+	}
+	while (fgets(buf, buflen - 1, fp) != NULL);
+	pclose(fp);
+	return 0;
 }
 
 static void set_nodelay(int sockfd)
@@ -852,8 +873,8 @@ static inline int buf_get_string(struct buffer *buf, char **str)
 	return 0;
 }
 
-static int buf_get_attrs(serv_t serv, struct buffer *buf, 
-						 struct stat *stbuf, int *flagsp)
+static int buf_get_attrs(serv_t serv, struct buffer *buf, struct stat *stbuf, 
+	int *flagsp)
 {
 	uint32_t flags;
 	uint64_t size = 0;
@@ -1831,24 +1852,61 @@ out:
 	return err;
 }
 
-static int get_hostinfo(char *host, char *port, struct in_addr *addr)
+static int get_hostinfo(char *host, char *port, struct in_addr *addr, 
+	char *fqdnbuf)
 {	
 	int err;
 	struct addrinfo *ai;
 	struct addrinfo hint;
+	struct hostent *hostent;
 
 	memset(&hint, 0, sizeof(hint));
 	hint.ai_family = AF_INET;
 	hint.ai_socktype = SOCK_STREAM;
 	err = getaddrinfo(host, port, &hint, &ai);
+	if (!err) {
+		hostent = gethostbyaddr(ai, sizeof(struct addrinfo), AF_INET);
+		if (hostent == NULL) {
+			debug("failed to get host entry")
+		} else {
+			g_snprintf(fqdnbuf, 128, "%s", hostent->h_name);
+			goto out;
+		}
+	}
+	debug("failed to resolve %s: %s", host, gai_strerror(err));
+	
+	/* Get FQDN and try again */
+	char *cmd, fqdn[128];
+	memset(fqdn, 0x0, 128);
+	cmd = g_strdup_printf("ssh %s 'hostname -f'", host);
+	err = get_cmd_output(cmd, fqdn, 128);
+	fqdn[strlen(fqdn)-1] = '\0';
+	g_free(cmd);
 	if (err) {
-		debug("failed to resolve %s: %s", host, gai_strerror(err));
+		debug("failed to get fqdn via ssh");
 		addr->s_addr = 0;
 		return -1;
 	}
+	g_snprintf(fqdnbuf, 128, "%s", fqdn);
+	err = getaddrinfo(fqdn, port, &hint, &ai);
+	if (err) {
+		debug("failed to resolve fqdn %s (%lu)", fqdn, strlen(fqdn));
+		addr->s_addr = 0;
+		return -1;
+	}
+
+out:
 	addr->s_addr = ((struct sockaddr_in *) (ai->ai_addr))->sin_addr.s_addr;
-	
 	freeaddrinfo(ai);
+	return 0;
+}
+
+static int get_inaddr(uint64_t ino, struct in_addr *inaddr)
+{
+	if ((ino & INADDR_MASK) != INADDR_MASK)
+		return -1;
+
+	inaddr->s_addr = ino & INADDR_ADDR;
 	return 0;
 }
 
@@ -1995,6 +2053,8 @@ static void runtime_destroy(void)
 	g_free(sshfsm.session_dir);
 	if (sshfsm.sftp_local_server)
 		g_free(sshfsm.sftp_local_server);
+	if (sshfsm.forward_io)
+		g_free(sshfsm.forward_io);
 }
 
 #if FUSE_VERSION >= 26
@@ -2183,6 +2243,7 @@ static int serv_arr_init(void)
 		serv->fd = -1;
 		serv->ptyfd = -1;
 		serv->ptyslavefd = -1;
+		serv->is_forward = 0;
 		if (serv->local)
 			continue;
 		pthread_mutex_init(&serv->lock, NULL);
@@ -2217,7 +2278,6 @@ static void serv_arr_destroy(void)
 		g_hash_table_destroy(serv->reqtab);
 	}
 	pthread_mutex_destroy(&sshfsm.lock_serv_arr);
-	g_ptr_array_free(sshfsm.serv_arr, TRUE);
 }
 
 static int serv_arr_find(GPtrArray *arr, serv_t serv)
@@ -2245,6 +2305,8 @@ static int tree_init(void)
 	data->dirname = g_strdup("/");
 	data->servarr = sshfsm.serv_arr;
 	sshfsm.tree = g_node_new((gpointer) data);
+	if (sshfsm.forward_io)
+		sshfsm.fwd_serv_arr = g_ptr_array_new();
 	return 0;
 }
 
@@ -2266,6 +2328,11 @@ static void tree_destroy(void)
 	g_node_traverse(sshfsm.tree, G_POST_ORDER, G_TRAVERSE_ALL, -1,
 		(GNodeTraverseFunc) tree_node_free, NULL);
 	g_node_destroy(sshfsm.tree);
+	g_ptr_array_free(sshfsm.serv_arr, TRUE);
+	if (sshfsm.forward_io) {
+		fwd_serv_arr_cleanup(0);
+		g_ptr_array_free(sshfsm.fwd_serv_arr, TRUE);
+	}
 }
 
 static void tree_node_destroy(GNode *node)
@@ -3793,12 +3860,127 @@ static int open_remote(serv_t serv, const char *path,
 	return err;
 }
 
+static void fwd_serv_arr_cleanup(time_t timeout)
+{
+	time_t now = time(NULL);
+	unsigned int i;
+	serv_t serv;
+	GPtrArray *arr;
+	
+	arr = sshfsm.fwd_serv_arr;
+	if (now > sshfsm.fwd_serv_arr_last_cleaned + timeout) {
+		for (i = 0; i < arr->len; i++) {
+			serv = (serv_t) g_ptr_array_index(arr, i);
+			if (serv->forward_refs > 0)
+				continue;
+			close_conn(serv);
+			g_free(serv->hostname);
+			g_free(serv->basepath);
+			pthread_mutex_destroy(&serv->lock);
+			pthread_mutex_destroy(&serv->lock_write);
+			pthread_cond_destroy(&serv->outstanding_cond);
+			g_hash_table_destroy(serv->reqtab);
+			g_ptr_array_remove_fast(arr, serv);
+		}
+	}
+}
+
+static serv_t fwd_serv_arr_lookup(const struct in_addr *inaddr)
+{
+	fwd_serv_arr_cleanup(sshfsm.forward_timeout);
+	
+	unsigned int i;
+	serv_t serv;
+	GPtrArray *arr;
+	
+	arr = sshfsm.fwd_serv_arr;
+
+	for (i = 0; i < arr->len; i++) {
+		serv = (serv_t) g_ptr_array_index(arr, i);
+		if (serv->inaddr.s_addr == inaddr->s_addr)
+			return serv;
+	}
+
+	/* Create a new server */
+	serv = g_new0(struct serv, 1);
+	serv->hostname = g_strdup(inet_ntoa(*inaddr));
+	serv->basepath = g_strdup(sshfsm.forward_io);
+	serv->inaddr = *inaddr;
+	serv->fd = -1;
+	serv->ptyfd = -1;
+	serv->ptyslavefd = -1;
+	serv->local = 0;
+	serv->is_forward = 1;
+	serv->forward_refs = 0;
+	pthread_mutex_init(&serv->lock, NULL);
+	pthread_mutex_init(&serv->lock_write, NULL);
+	pthread_cond_init(&serv->outstanding_cond, NULL);
+	serv->reqtab = g_hash_table_new(NULL, NULL);
+	if (!serv->reqtab) {
+		error3("failed to create hash table");
+		return NULL;
+	}
+	serv->connver = 0;
+	serv->processing_thread_started = 0;
+	debug("add \'/\' arr[%d]: %s(%s):%s,local=%d,rank=%d,", arr->len,
+		  serv->hostname, inet_ntoa(serv->inaddr), serv->basepath, 
+		  serv->local, serv->rank);
+	g_ptr_array_add(arr, (gpointer) serv);
+
+	return serv;
+}
+
+static int open_forward(serv_t serv, const char *path, mode_t mode,
+	struct fuse_file_info *fi)
+{
+	struct stat stbuf;
+	struct in_addr inaddr;
+	int err;
+	memset(&stbuf, 0, sizeof(struct stat));
+	if (cache_get_attr(path, &stbuf)) {
+		err = serv_getattr(serv, path, &stbuf);
+		if (err)
+			return err;
+	}
+	
+	err = get_inaddr(stbuf.st_ino, &inaddr);
+	if (err)
+		return -EIO;
+
+	serv_t fwd_serv = fwd_serv_arr_lookup(&inaddr);
+	if (fwd_serv == NULL)
+		return -EIO;
+
+	if (!sshfsm.delay_connect) {
+		if (connect_remote(fwd_serv) == -1)
+			return -1;
+
+		if (sshfsm.detect_uid)
+			sftp_detect_uid(fwd_serv);
+
+		if (!sshfsm.no_check_root && serv_check_root(fwd_serv) == -1)
+			return -1;
+	}
+	
+	err = open_remote(fwd_serv, path, mode, fi);
+	if (!err)
+		fwd_serv->forward_refs ++;
+	return err;
+}
+
 static int serv_open_common(serv_t serv, const char *path, 
 	mode_t mode, struct fuse_file_info *fi)
 {
-	return serv->local ? open_local(serv, path, mode, fi) : 
+	int err;
+	if (sshfsm.forward_io) {
+		err = open_forward(serv, path, mode, fi);
+		if (!err)
+			return 0;
+		/* If failed to open_forward(), fall to ordinary routines */
+	}
+	
+	return serv->local ? open_local(serv, path, mode, fi) :
 		open_remote(serv, path, mode, fi);
-
 }
 
 static int sshfsm_open(const char *path, struct fuse_file_info *fi)
@@ -3906,6 +4088,8 @@ static int sshfsm_release(const char *path, struct fuse_file_info *fi)
 	buf_free(handle);
 	chunk_put_locked(serv, sf->readahead);
 	sshfsm_file_put(sf);
+	if (serv->is_forward)
+		serv->forward_refs --;
 	return 0;
 }
 
@@ -5091,8 +5275,10 @@ static void usage(const char *progname)
 "    -o ssh_protocol=N      ssh protocol to use (default: 2)\n"
 "    -o sftp_server=SERV    path to sftp server or subsystem (default: sftp)\n"
 "    -o directport=PORT     directly connect to PORT bypassing ssh\n"
-"    -o inaddr_ino          piggybacking ip address using inode numbers\n"
-"    -o inaddr_nth=N        piggybacking the Nth ip address (default: 0)\n"
+"    -o inaddr_ino          piggyback ip address using inode numbers\n"
+"    -o inaddr_nth=N        piggyback the Nth ip address (default: 0)\n"
+"    -o forward_io=BASEPATH use ip address to forward direct I/O to server\n"
+"    -o forward_timeout=N   sets timeout for connections in seconds (default: 60)\n"
 "    -o transform_symlinks  transform absolute symlinks to relative\n"
 "    -o follow_symlinks     follow symlinks on the server\n"
 "    -o no_check_root       don't check for existence of 'dir' on server\n"
@@ -5135,7 +5321,7 @@ static int parse_serv_args(const char *arg)
 
 	char *basepath, *tmp, *cp, *port;
 	struct serv *serv = g_new0(struct serv, 1);
-	GPtrArray *arr = (GPtrArray *) sshfsm.serv_arr;
+	GPtrArray *arr = sshfsm.serv_arr;
 	tmp = g_strdup(arg);
 	basepath = find_base_path(tmp);
 	port = sshfsm.directport ? sshfsm.directport : "22";
@@ -5162,10 +5348,14 @@ static int parse_serv_args(const char *arg)
 		else
 			serv->basepath = g_strdup(basepath);
 	}
-	serv->hostname = g_strdup(tmp);	
-	get_hostinfo(serv->hostname, port, &serv->inaddr);
+	char fqdn[256];
+	memset(fqdn, 0x0, 256);
+	if (get_hostinfo(tmp, port, &serv->inaddr, fqdn) == -1)
+		warning("failed to resolve %s, try use IP or FQDN if using GMount", 
+			serv->hostname);
+	serv->hostname = strlen(fqdn) ? g_strdup(fqdn) : g_strdup(tmp);
 	serv->rank = 10000 - arr->len * 50;
-	debug("add \'/\' arr[%d]: %s(%s):%s:%s,local=%d,rank=%d,", arr->len,
+	debug("add \'/\' arr[%d]: %s (%s):%s:%s,local=%d,rank=%d,", arr->len,
 		  serv->hostname, inet_ntoa(serv->inaddr), port, serv->basepath, 
 		  serv->local, serv->rank);
 	g_ptr_array_add(arr, (gpointer) serv);
@@ -5537,6 +5727,7 @@ int main(int argc, char *argv[])
 	sshfsm.sndbuf = 0;
 	sshfsm.rcvbuf = 0;
 	sshfsm.inaddr_nth = 0;
+	sshfsm.forward_timeout = 0;
 	sshfsm.errlog = stderr;
 	ssh_add_arg("ssh");
 	ssh_add_arg("-x");
@@ -5652,7 +5843,10 @@ int main(int argc, char *argv[])
 	tmp = g_strdup_printf("-omax_write=%u", sshfsm.max_write);
 	fuse_opt_insert_arg(&args, 1, tmp);
 	g_free(tmp);
-
+	
+	if (sshfsm.forward_io)
+		sshfsm.inaddr_ino = 1;
+		
 	if (sshfsm.inaddr_ino)
 		fuse_opt_insert_arg(&args, 1, "-ouse_ino");
 
