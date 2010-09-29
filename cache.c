@@ -1,10 +1,23 @@
-/*
-  Caching file system proxy
-  Copyright (C) 2008, 2009  Nan Dun <dunnan@yl.is.s.u-tokyo.ac.jp>
-
-  This program can be distributed under the terms of the GNU GPL.
-  See the file COPYING.
-*/
+/****************************************************************************
+ * SSHFS Mutiplex Filesystem Cache Subsystem
+ * Copyright (C) 2008,2009,2010  Nan Dun <dunnan@yl.is.s.u-tokyo.ac.jp>
+ * Department of Computer Science, The University of Tokyo
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * This program can be distributed under the terms of the GNU GPL.
+ * See the file COPYING.
+ ***************************************************************************/
 
 #include "cache.h"
 #include <stdio.h>
@@ -41,6 +54,7 @@ struct node {
 	char *link;
 	time_t link_valid;
 	time_t valid;
+	void *data;
 };
 
 struct fuse_cache_dirhandle {
@@ -223,10 +237,12 @@ static void cache_add_link(const char *path, const char *link, size_t size)
 	pthread_mutex_unlock(&cache.lock);
 }
 
-static int cache_get_attr(const char *path, struct stat *stbuf)
+int cache_get_attr(const char *path, struct stat *stbuf)
 {
 	struct node *node;
 	int err = -EAGAIN;
+	if (!cache.on)
+		return err;
 	pthread_mutex_lock(&cache.lock);
 	node = cache_lookup(path);
 	if (node != NULL) {
