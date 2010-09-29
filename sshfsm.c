@@ -64,6 +64,10 @@
 
 #include "cache.h"
 
+#if GLIB_CHECK_VERSION(2, 16, 0)
+#define G_HASH_TABLE_HAS_ITER
+#endif
+
 #ifndef MAP_LOCKED
 #define MAP_LOCKED 0
 #endif
@@ -582,6 +586,7 @@ static char * get_file(const char *path, size_t *len, int escape)
 	return buf;
 }
 
+#if 0
 static int get_cmd_output(const char *cmd, char *buf, size_t buflen)
 {
 	FILE *fp;
@@ -594,6 +599,7 @@ static int get_cmd_output(const char *cmd, char *buf, size_t buflen)
 	pclose(fp);
 	return 0;
 }
+#endif
 
 static void set_nodelay(int sockfd)
 {
@@ -1855,6 +1861,30 @@ out:
 
 static int get_hostinfo(char *host, char *port, struct in_addr *addr, 
 	char *fqdnbuf)
+{
+	int err;
+	struct addrinfo *ai;
+	struct addrinfo hint;
+	(void) fqdnbuf;
+	
+	memset(&hint, 0, sizeof(hint));
+	hint.ai_family = AF_INET;
+	hint.ai_socktype = SOCK_STREAM;
+	err = getaddrinfo(host, port, &hint, &ai);
+	if (err) {
+		debug("failed to resolve %s: %s", host, gai_strerror(err));
+		addr->s_addr = 0;
+		return -1;
+	}
+	addr->s_addr = ((struct sockaddr_in *) (ai->ai_addr))->sin_addr.s_addr;
+
+	freeaddrinfo(ai);
+	return 0;
+}
+
+#if 0
+static int get_hostinfo2(char *host, char *port, struct in_addr *addr, 
+	char *fqdnbuf)
 {	
 	int err;
 	struct addrinfo *ai;
@@ -1901,6 +1931,7 @@ out:
 	freeaddrinfo(ai);
 	return 0;
 }
+#endif
 
 static int get_inaddr(uint64_t ino, struct in_addr *inaddr)
 {
@@ -2886,6 +2917,45 @@ static void * getdir_thread_func(void *data)
 	p->err ? pthread_exit((void *) -1) : pthread_exit((void *) 0);
 }
 
+#ifndef G_HASH_TABLE_HAS_ITER
+struct getdir_fill_data {
+	fuse_cache_dirh_t h;
+	fuse_cache_dirfil_t filler;
+	int err;
+};
+
+static void getdir_fill_func(gpointer key, gpointer value, gpointer data)
+{
+	char *d_name = (char *) key;
+	struct stat *st = (struct stat *) value;
+	struct getdir_fill_data *p = (struct getdir_fill_data *) data;
+	if (!p->err) {
+		if(p->filler(p->h, d_name, st))
+			p->err = -EIO;
+	}
+}
+
+struct getdir_merge_data {
+	fuse_cache_dirh_t h;
+	fuse_cache_dirfil_t filler;
+	GHashTable *table;
+	int err;
+};
+
+static void getdir_merge_func(gpointer key, gpointer value, gpointer data)
+{
+	char *d_name = (char *) key;
+	struct stat *st = (struct stat *) value;
+	struct getdir_merge_data *p = (struct getdir_merge_data *) data;
+	if (!p->err) {
+		if (g_hash_table_lookup(p->table, d_name))
+			return;
+		if(p->filler(p->h, d_name, st))
+			p->err = -EIO;
+	}
+}
+#endif
+
 static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
                         fuse_cache_dirfil_t filler)
 {
@@ -2937,6 +3007,7 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 	err = err3 ? firsterr : 0;
 	
 	/* Aggregte all directory entires */
+#ifdef G_HASH_TABLE_HAS_ITER
 	GHashTableIter iter;
 	gpointer key, value;
 	char *d_name;
@@ -2957,7 +3028,7 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 		while (g_hash_table_iter_next(&iter, &key, &value)) {
 			d_name = (char *) key;
 			st = (struct stat *) value;
-			if (g_hash_table_lookup(sets[0], key))
+			if (g_hash_table_lookup(sets[0], d_name))
 				continue;
 			if (filler(h, d_name, st)) {
 				err = -EIO;
@@ -2965,6 +3036,30 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 			}
 		}
 	}
+#else
+	struct getdir_fill_data fdata;
+	fdata.h = h;
+	fdata.filler = filler;
+	fdata.err = 0;
+	g_hash_table_foreach(sets[0], getdir_fill_func, &fdata);
+	if (fdata.err) {
+		err = -EIO;
+		goto out;
+	}
+	
+	struct getdir_merge_data mdata;
+	mdata.h = h;
+	mdata.filler = filler;
+	mdata.table = sets[0];
+	mdata.err = 0;
+	for (i = 1; i < nthreads; i++) {
+		g_hash_table_foreach(sets[i], getdir_merge_func, &mdata);
+		if (mdata.err) {
+			err = -EIO;
+			goto out;
+		}
+	}
+#endif
 
 out:
 	for (i = 0; i < nthreads; i++)
@@ -3014,7 +3109,7 @@ static int sshfsm_mkdir(const char *path, mode_t mode)
 	if (serv_num == 1)
 		return serv_mkdir(serv_0, path, mode);
 	
-	/* TODO: makedirs at all branches */
+	/* TODO: optional makedirs at all branches */
 
 	int err = 0, firsterr = 0;
 	unsigned int i;
