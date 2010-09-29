@@ -227,6 +227,7 @@ struct serv {
 	uint32_t idctr;
 	int is_forward;
 	int forward_refs;
+	time_t forward_valid;
 	
 	/* statistics */
 	uint64_t bytes_sent;
@@ -1867,7 +1868,7 @@ static int get_hostinfo(char *host, char *port, struct in_addr *addr,
 	if (!err) {
 		hostent = gethostbyaddr(ai, sizeof(struct addrinfo), AF_INET);
 		if (hostent == NULL) {
-			debug("failed to get host entry")
+			debug("failed to get host entry: %s", gai_strerror(h_errno))
 		} else {
 			g_snprintf(fqdnbuf, 128, "%s", hostent->h_name);
 			goto out;
@@ -1903,7 +1904,7 @@ out:
 
 static int get_inaddr(uint64_t ino, struct in_addr *inaddr)
 {
-	if ((ino & INADDR_MASK) != INADDR_MASK)
+	if ((ino & INADDR_MASK) != INADDR_FLAG)
 		return -1;
 
 	inaddr->s_addr = ino & INADDR_ADDR;
@@ -2298,6 +2299,21 @@ static inline void serv_arr_insert(GPtrArray *arr, serv_t serv)
 		g_ptr_array_add(arr, serv);
 }
 
+static serv_t serv_arr_lookup(struct in_addr *inaddr)
+{
+	unsigned int i;
+	serv_t serv;
+	GPtrArray *arr;
+	
+	arr = sshfsm.serv_arr;
+	for (i = 0; i < arr->len; i++) {
+		serv = (serv_t) g_ptr_array_index(arr, i);
+		if (serv->inaddr.s_addr == inaddr->s_addr)
+			return serv;
+	}
+	return NULL;
+}
+
 static int tree_init(void)
 {
 	ndata_t data = g_new0(struct tree_node_data, 1);
@@ -2305,8 +2321,7 @@ static int tree_init(void)
 	data->dirname = g_strdup("/");
 	data->servarr = sshfsm.serv_arr;
 	sshfsm.tree = g_node_new((gpointer) data);
-	if (sshfsm.forward_io)
-		sshfsm.fwd_serv_arr = g_ptr_array_new();
+	sshfsm.fwd_serv_arr = g_ptr_array_new();
 	return 0;
 }
 
@@ -2329,10 +2344,8 @@ static void tree_destroy(void)
 		(GNodeTraverseFunc) tree_node_free, NULL);
 	g_node_destroy(sshfsm.tree);
 	g_ptr_array_free(sshfsm.serv_arr, TRUE);
-	if (sshfsm.forward_io) {
-		fwd_serv_arr_cleanup(0);
-		g_ptr_array_free(sshfsm.fwd_serv_arr, TRUE);
-	}
+	fwd_serv_arr_cleanup(0);
+	g_ptr_array_free(sshfsm.fwd_serv_arr, TRUE);
 }
 
 static void tree_node_destroy(GNode *node)
@@ -3871,7 +3884,8 @@ static void fwd_serv_arr_cleanup(time_t timeout)
 	if (now > sshfsm.fwd_serv_arr_last_cleaned + timeout) {
 		for (i = 0; i < arr->len; i++) {
 			serv = (serv_t) g_ptr_array_index(arr, i);
-			if (serv->forward_refs > 0)
+			if (serv->forward_refs > 0 || 
+				now > serv->forward_valid + timeout)
 				continue;
 			close_conn(serv);
 			g_free(serv->hostname);
@@ -3882,36 +3896,40 @@ static void fwd_serv_arr_cleanup(time_t timeout)
 			g_hash_table_destroy(serv->reqtab);
 			g_ptr_array_remove_fast(arr, serv);
 		}
+		sshfsm.fwd_serv_arr_last_cleaned = now;
 	}
 }
 
 static serv_t fwd_serv_arr_lookup(const struct in_addr *inaddr)
 {
-	fwd_serv_arr_cleanup(sshfsm.forward_timeout);
 	
 	unsigned int i;
 	serv_t serv;
 	GPtrArray *arr;
 	
+	fwd_serv_arr_cleanup(sshfsm.forward_timeout);
+	
 	arr = sshfsm.fwd_serv_arr;
-
 	for (i = 0; i < arr->len; i++) {
 		serv = (serv_t) g_ptr_array_index(arr, i);
-		if (serv->inaddr.s_addr == inaddr->s_addr)
+		if (serv->inaddr.s_addr == inaddr->s_addr) {
+			serv->forward_valid = time(NULL);
 			return serv;
+		}
 	}
 
 	/* Create a new server */
 	serv = g_new0(struct serv, 1);
 	serv->hostname = g_strdup(inet_ntoa(*inaddr));
 	serv->basepath = g_strdup(sshfsm.forward_io);
-	serv->inaddr = *inaddr;
+	serv->inaddr.s_addr = inaddr->s_addr;
 	serv->fd = -1;
 	serv->ptyfd = -1;
 	serv->ptyslavefd = -1;
 	serv->local = 0;
 	serv->is_forward = 1;
 	serv->forward_refs = 0;
+	serv->forward_valid = time(NULL);
 	pthread_mutex_init(&serv->lock, NULL);
 	pthread_mutex_init(&serv->lock_write, NULL);
 	pthread_cond_init(&serv->outstanding_cond, NULL);
@@ -3922,7 +3940,7 @@ static serv_t fwd_serv_arr_lookup(const struct in_addr *inaddr)
 	}
 	serv->connver = 0;
 	serv->processing_thread_started = 0;
-	debug("add \'/\' arr[%d]: %s(%s):%s,local=%d,rank=%d,", arr->len,
+	debug("forward I/O: add arr[%d]: %s(%s):%s,local=%d,rank=%d,", arr->len,
 		  serv->hostname, inet_ntoa(serv->inaddr), serv->basepath, 
 		  serv->local, serv->rank);
 	g_ptr_array_add(arr, (gpointer) serv);
@@ -3933,6 +3951,7 @@ static serv_t fwd_serv_arr_lookup(const struct in_addr *inaddr)
 static int open_forward(serv_t serv, const char *path, mode_t mode,
 	struct fuse_file_info *fi)
 {
+	serv_t fwd_serv;
 	struct stat stbuf;
 	struct in_addr inaddr;
 	int err;
@@ -3946,11 +3965,19 @@ static int open_forward(serv_t serv, const char *path, mode_t mode,
 	err = get_inaddr(stbuf.st_ino, &inaddr);
 	if (err)
 		return -EIO;
-
-	serv_t fwd_serv = fwd_serv_arr_lookup(&inaddr);
-	if (fwd_serv == NULL)
-		return -EIO;
-
+	
+	/* Already connected to the server */
+	if (get_ino_hops(stbuf.st_ino) <= 1)
+		return open_remote(serv, path, mode, fi);
+	fwd_serv = serv_arr_lookup(&inaddr);
+	if (fwd_serv)
+		return open_remote(fwd_serv, path, mode, fi);
+	fwd_serv = fwd_serv_arr_lookup(&inaddr);
+	if (fwd_serv)
+		return open_remote(fwd_serv, path, mode, fi);
+	
+	/* Not yet */
+	debug("forward I/O: connecting %s ...", fwd_serv->hostname);
 	if (!sshfsm.delay_connect) {
 		if (connect_remote(fwd_serv) == -1)
 			return -1;
@@ -4345,23 +4372,19 @@ static void serv_write_end(struct request *req)
 	sshfsm_file_put(sf);
 }
 
-static int sshfsm_write(const char *path, const char *wbuf, size_t size,
-                       off_t offset, struct fuse_file_info *fi)
+static int write_remote(const char* wbuf, size_t size,
+	off_t offset, struct fuse_file_info *fi)
 {
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
-	if (sf->serv->local)
-		return write_local(sf->local_fd, wbuf, size, offset);
-
 	int err;
 	struct buffer buf;
 	struct buffer *handle = &sf->handle;
 	struct iovec iov[2];
 	serv_t serv = sf->serv;
-	(void) path;
 
 	if (!serv_file_is_conn(sf))
 		return -EIO;
-
+	
 	serv->modifver ++;
 	buf_init(&buf, 0);
 	buf_add_buf(&buf, handle);
@@ -4380,6 +4403,17 @@ static int sshfsm_write(const char *path, const char *wbuf, size_t size,
 	}
 	buf_free(&buf);
 	return err ? err : (int) size;
+}
+
+static int sshfsm_write(const char *path, const char *wbuf, size_t size,
+	off_t offset, struct fuse_file_info *fi)
+{
+	(void) path;
+	struct sshfsm_file *sf = get_sshfsm_file(fi);
+	if (sf->serv->local)
+		return write_local(sf->local_fd, wbuf, size, offset);
+
+	return write_remote(wbuf, size, offset, fi);
 }
 
 /* statfs & statvfs */
@@ -4973,7 +5007,7 @@ static int sftp_proxy_connect(serv_t serv, char *port)
 	memset(&hint, 0, sizeof(hint));
 	hint.ai_family = PF_INET;
 	hint.ai_socktype = SOCK_STREAM;
-	/* TODO: use serv->inaddr */
+	
 	err = getaddrinfo(serv->hostname, port, &hint, &ai);
 	if (err) {
 		error3("failed to resolve %s:%s: %s\n", serv->hostname, port,
