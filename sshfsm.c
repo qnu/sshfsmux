@@ -211,7 +211,9 @@ struct serv {
 	char *hostname;
 	struct in_addr inaddr;
 	char *basepath;
+	char mode;
 	int local;
+	int local_sftp;
 	int rank;
 	int version;
 	int connver;
@@ -301,7 +303,6 @@ struct sshfsm {
 	int sndbuf;
 	int rcvbuf;
 	char *psk_path;
-	char *sftp_local_server;
 	int inaddr_ino;
 	unsigned int inaddr_nth;
 	char *forward_io;
@@ -444,7 +445,6 @@ static struct fuse_opt sshfsm_opts[] = {
 	FUSE_OPT_KEY("-f",              KEY_FOREGROUND),
 	FUSE_OPT_KEY("-F ",             KEY_CONFIGFILE),
 	FUSE_OPT_KEY("-D",              KEY_DAEMON),
-	FUSE_OPT_KEY("-P ",             KEY_LOCALSRV),
 	FUSE_OPT_END
 };
 
@@ -525,7 +525,7 @@ static char * find_base_path(char *);
 #define serv_0 g_ptr_array_index(sshfsm.serv_arr, 0)
 #define serv_i(idx) g_ptr_array_index(sshfsm.serv_arr, idx)
 #define serv_add_path(serv, path) \
-	g_strdup_printf("%s%s", serv->basepath, path[1] ? path+1 : ".")
+	g_strdup_printf("%s%s", serv->basepath, path[1] ? path+1 : "")
 
 static inline char * g_strdup_and_free(char *s)
 {
@@ -1951,7 +1951,7 @@ static int connect_remote(serv_t serv)
 
 	int err;
 	
-	if (sshfsm.sftp_local_server)
+	if (serv->local_sftp)
 		err = sftp_local_connect(serv);
 	else if (sshfsm.directport)
 		err = sftp_proxy_connect(serv, sshfsm.directport);
@@ -2085,8 +2085,8 @@ static void runtime_destroy(void)
 	g_free(sshfsm.username);
 	g_free(sshfsm.userhome);
 	g_free(sshfsm.session_dir);
-	if (sshfsm.sftp_local_server)
-		g_free(sshfsm.sftp_local_server);
+	if (sshfsm.sftp_server)
+		free(sshfsm.sftp_server);
 	if (sshfsm.forward_io)
 		g_free(sshfsm.forward_io);
 }
@@ -2765,7 +2765,7 @@ static int getdir_local_0(serv_t serv, const char *path, fuse_cache_dirh_t h,
 	int res = 0;
 	while ((readdir_r(dp, &u.de, &dep) == 0) && dep) {
 		memset(&stbuf, 0, sizeof(stbuf));
-		filename = g_strdup_printf("%s/%s", realpath, u.de.d_name);
+		filename = g_strdup_printf("%s%s", realpath, u.de.d_name);
 		if (sshfsm.follow_symlinks)
 			res = stat(filename, &stbuf);
 		else
@@ -4974,12 +4974,20 @@ static int sftp_local_connect(serv_t serv)
 {
 	pid_t pid;
 	int sockpair[2];
+	char *server;
 
-	if (access(sshfsm.sftp_local_server, R_OK | X_OK) == -1)
-		fatal(1, "access \"%s\"", sshfsm.sftp_local_server);
+	if (sshfsm.sftp_server)
+		server = sshfsm.sftp_server;
+	else
+		server = SFTP_SERVER_PATH;
+	
+	if (access(server, R_OK | X_OK) == -1)
+		fatal(1, "access \"%s\"", server);
 
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockpair) == -1)
 		fatal(1, "socketpair", NULL);
+	
+	debug("starting local sftp server %s", server);
 	
 	pid = fork();
 	if (pid == -1) {
@@ -4995,8 +5003,8 @@ static int sftp_local_connect(serv_t serv)
 		close(sockpair[0]);
 		close(sockpair[1]);
 		signal(SIGINT, SIG_IGN);
-		execl(sshfsm.sftp_local_server, "sftp.local.sshfsm", NULL);
-		perror2("failed to exec \"%s\"", sshfsm.sftp_local_server);
+		execl(server, "sftp.local.sshfsm", NULL);
+		perror2("failed to exec \"%s\"", server);
 		_exit(0);
 	} else {
 		close(sockpair[1]);
@@ -5426,7 +5434,6 @@ static void usage(const char *progname)
 "    -C                     equivalent to '-o compression=yes'\n"
 "    -F ssh_configfile      specifies alternative ssh configuration file\n"
 "    -1                     equivalent to '-o ssh_protocol=1'\n"
-"    -P sftp_server_path    connect directly to local sftp server\n"
 "    -D                     sftp directport proxy daemon (default port: 5285)\n"
 "    -o backlog=N           sftp proxy backlog (default: 20)\n"
 "    -o psk=PATH            sftp proxy pre-shared key (default: ~/.sshfsm/key)\n"
@@ -5509,9 +5516,16 @@ static int parse_serv_args(const char *arg)
 	port = sshfsm.directport ? sshfsm.directport : "22";
 	
 	/* Get mount option */
+	serv->mode = 'r';
 	if ((cp = strchr(basepath, '='))) {
-		if (strchr(cp+1, 'l'))
+		if (strchr(cp+1, 'l')) {
 			serv->local = 1;
+			serv->mode = 'l' ;
+		}
+		if (!serv->local && strchr(cp+1, 'p')) {
+			serv->local_sftp = 1;
+			serv->mode = 'p';
+		}
 		/* Other options can be appended here */
 		*cp = '\0';
 	} else
@@ -5537,9 +5551,9 @@ static int parse_serv_args(const char *arg)
 			serv->hostname);
 	serv->hostname = strlen(fqdn) ? g_strdup(fqdn) : g_strdup(tmp);
 	serv->rank = 10000 - arr->len * 50;
-	debug("add \'/\' arr[%d]: %s (%s):%s:%s,local=%d,rank=%d,", arr->len,
+	debug("add \'/\' arr[%d]: %s (%s):%s:%s,mode=%c,rank=%d,", arr->len,
 		  serv->hostname, inet_ntoa(serv->inaddr), port, serv->basepath, 
-		  serv->local, serv->rank);
+		  serv->mode, serv->rank);
 	g_ptr_array_add(arr, (gpointer) serv);
 	
 	g_free(tmp);
@@ -5603,10 +5617,6 @@ static int sshfsm_opt_proc(void *data, const char *arg, int key,
 	case KEY_DAEMON:
 		sshfsm.sftp_proxy = 1;
 		return 1;
-
-	case KEY_LOCALSRV:
-		sshfsm.sftp_local_server = g_strdup(arg + 2);
-		return 0;
 
 	default:
 		error3("internal error");
@@ -6005,7 +6015,6 @@ int main(int argc, char *argv[])
 		ssh_add_arg("-s");
 
 	ssh_add_arg(sftp_server);
-	free(sshfsm.sftp_server);
 
 	res = cache_parse_options(&args);
 	if (res == -1)
