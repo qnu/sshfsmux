@@ -1,0 +1,4 @@
+* How to create patch
+  1. diff -crB old new > new.patch
+  2. patch --dry-run -p1 -i /path/to/new.patch
+  3. patch -p1 -i /path/to/new.patch
