@@ -2765,7 +2765,7 @@ static int getdir_local_0(serv_t serv, const char *path, fuse_cache_dirh_t h,
 	int res = 0;
 	while ((readdir_r(dp, &u.de, &dep) == 0) && dep) {
 		memset(&stbuf, 0, sizeof(stbuf));
-		filename = g_strdup_printf("%s%s", realpath, u.de.d_name);
+		filename = g_strdup_printf("%s/%s", realpath, u.de.d_name);
 		if (sshfsm.follow_symlinks)
 			res = stat(filename, &stbuf);
 		else
