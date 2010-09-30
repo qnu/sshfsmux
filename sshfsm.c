@@ -4132,23 +4132,24 @@ static inline struct sshfsm_file *get_sshfsm_file(struct fuse_file_info *fi)
 
 static int flush_local(int fd)
 {
-	int res = fsync(fd);
+	/* This is called from every close on an open file, so call the
+	   close on the underlying filesystem.	But since flush may be
+	   called multiple times for an open file, this must not really
+	   close the file.  This is important if used on a network
+	   filesystem like NFS which flush the data/metadata on close() */
+	int res = close(dup(fd));
 	if (res == -1)
 		return -errno;
 	return res;
 }
 
-static int sshfsm_flush(const char *path, struct fuse_file_info *fi)
+static int flush_remote(struct fuse_file_info *fi)
 {
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
-	serv_t serv = sf->serv;
-	if (serv->local)
-		return flush_local(sf->local_fd);
-	
-	int err;
 	struct list_head write_reqs;
 	struct list_head *curr_list;
-	(void) path;
+	serv_t serv = sf->serv;
+	int err;
 
 	if (!serv_file_is_conn(sf))
 		return -EIO;
@@ -4171,12 +4172,45 @@ static int sshfsm_flush(const char *path, struct fuse_file_info *fi)
 	return err;
 }
 
-/* fsync */
-static int sshfsm_fsync(const char *path, int isdatasync,
-                       struct fuse_file_info *fi)
+static int sshfsm_flush(const char *path, struct fuse_file_info *fi)
 {
+	struct sshfsm_file *sf = get_sshfsm_file(fi);
+	serv_t serv = sf->serv;
+	(void) path;
+	if (serv->local)
+		return flush_local(sf->local_fd);
+
+	return flush_remote(fi);
+}
+
+/* fsync */
+static int fsync_local(int fd, int isdatasync)
+{
+	int res;
+#ifndef HAVE_FDATASYNC
 	(void) isdatasync;
-	return sshfsm_flush(path, fi);
+#else
+	if (isdatasync)
+		res = fsdatasync(fd);
+	else
+#endif
+		res = fsync(fd);
+	if (res == -1)
+		return -errno;
+	return 0;
+}
+
+static int sshfsm_fsync(const char *path, int isdatasync,
+	struct fuse_file_info *fi)
+{
+	
+	struct sshfsm_file *sf = get_sshfsm_file(fi);
+	serv_t serv = sf->serv;
+	(void) path;
+	if (serv->local)
+		return fsync_local(sf->local_fd, isdatasync);
+	
+	return flush_remote(fi);
 }
 
 /* release */
@@ -4192,18 +4226,19 @@ static void sshfsm_file_get(struct sshfsm_file *sf)
 	sf->refs++;
 }
 
-static int sshfsm_release(const char *path, struct fuse_file_info *fi)
+static inline int release_local(int fd)
+{
+	close(fd);
+	return 0;
+}
+
+static int release_remote(struct fuse_file_info *fi)
 {
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
-	serv_t serv = sf->serv;
-	if (serv->local) {
-		close(sf->local_fd);
-		return 0;
-	}
-
 	struct buffer *handle = &sf->handle;
+	serv_t serv = sf->serv;
 	if (serv_file_is_conn(sf)) {
-		sshfsm_flush(path, fi);
+		flush_remote(fi);
 		sftp_request(serv, SSH_FXP_CLOSE, handle, 0, NULL);
 	}
 	buf_free(handle);
@@ -4212,6 +4247,17 @@ static int sshfsm_release(const char *path, struct fuse_file_info *fi)
 	if (serv->is_forward)
 		serv->forward_refs --;
 	return 0;
+}
+
+static int sshfsm_release(const char *path, struct fuse_file_info *fi)
+{
+	struct sshfsm_file *sf = get_sshfsm_file(fi);
+	serv_t serv = sf->serv;
+	(void) path;
+	if (serv->local)
+		return release_local(sf->local_fd);
+
+	return release_remote(fi);
 }
 
 /* read */
@@ -4411,15 +4457,10 @@ static int serv_async_read(struct sshfsm_file *sf, char *rbuf, size_t size,
 	return total;
 }
 
-static int sshfsm_read(const char *path, char *rbuf, size_t size, off_t offset,
-                      struct fuse_file_info *fi)
+static int read_remote(char *rbuf, size_t size, off_t offset, 
+	struct fuse_file_info *fi)
 {
 	struct sshfsm_file *sf = get_sshfsm_file(fi);
-	(void) path;
-
-	if (sf->serv->local)
-		return read_local(sf->local_fd, rbuf, size, offset);
-
 	if (!serv_file_is_conn(sf))
 		return -EIO;
 
@@ -4427,6 +4468,18 @@ static int sshfsm_read(const char *path, char *rbuf, size_t size, off_t offset,
 		return serv_sync_read(sf, rbuf, size, offset);
 	else
 		return serv_async_read(sf, rbuf, size, offset);
+}
+
+static int sshfsm_read(const char *path, char *rbuf, size_t size, 
+	off_t offset, struct fuse_file_info *fi)
+{
+	struct sshfsm_file *sf = get_sshfsm_file(fi);
+	(void) path;
+
+	if (sf->serv->local)
+		return read_local(sf->local_fd, rbuf, size, offset);
+
+	return read_remote(rbuf, size, offset, fi);
 }
 
 /* write */
@@ -4792,7 +4845,7 @@ static int serv_truncate_zero(serv_t serv, const char *path)
 	fi.flags = O_WRONLY | O_TRUNC;
 	err = serv_open_common(serv, path, 0, &fi);
 	if (!err)
-		sshfsm_release(path, &fi);
+		release_remote(&fi);
 
 	return err;
 }
@@ -4821,11 +4874,11 @@ static int serv_truncate_shrink(serv_t serv, const char *path,
 
 	for (offset = 0; offset < size; offset += res) {
 		size_t bufsize = calc_buf_size(size, offset);
-		res = sshfsm_read(path, data + offset, bufsize, offset, &fi);
+		res = read_remote(data + offset, bufsize, offset, &fi);
 		if (res <= 0)
 			break;
 	}
-	sshfsm_release(path, &fi);
+	release_remote(&fi);
 	if (res < 0)
 		goto out;
 
@@ -4841,8 +4894,8 @@ static int serv_truncate_shrink(serv_t serv, const char *path,
 			break;
 	}
 	if (res >= 0)
-		res = sshfsm_flush(path, &fi);
-	sshfsm_release(path, &fi);
+		res = flush_remote(&fi);
+	release_remote(&fi);
 
 out:
 	free(data);
@@ -4865,9 +4918,9 @@ static int serv_truncate_extend(serv_t serv,
 	}
 	res = sshfsm_write(path, &c, 1, size - 1, openfi);
 	if (res == 1)
-		res = sshfsm_flush(path, openfi);
+		res = flush_remote(openfi);
 	if (!fi)
-		sshfsm_release(path, openfi);
+		release_remote(openfi);
 
 	return res;
 }
