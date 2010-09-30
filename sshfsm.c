@@ -1365,12 +1365,6 @@ static int do_write(serv_t serv, struct iovec *iov, size_t count)
 	return 0;
 }
 
-static uint32_t sftp_get_id(void)
-{
-	static uint32_t idctr;
-	return idctr++;
-}
-
 static void buf_to_iov(const struct buffer *buf, struct iovec *iov)
 {
 	iov->iov_base = buf->p;
@@ -1740,13 +1734,14 @@ static void sftp_detect_uid(serv_t serv)
 	}
 
 	int flags;
-	uint32_t id = sftp_get_id();
+	uint32_t id;
 	uint32_t replid;
 	uint8_t type;
 	struct buffer buf;
 	struct stat stbuf;
 	struct iovec iov[1];
-
+	
+	id = serv->idctr++;
 	buf_init(&buf, 5);
 	buf_add_string(&buf, ".");
 	buf_to_iov(&buf, &iov[0]);
@@ -1804,14 +1799,15 @@ static int serv_check_root(serv_t serv)
 	}
 
 	int flags;
-	uint32_t id = sftp_get_id();
+	uint32_t id;
 	uint32_t replid;
 	uint8_t type;
 	struct buffer buf;
 	struct iovec iov[1];
 	int err = -1;
 	const char *remote_dir = serv->basepath[0] ? serv->basepath : ".";
-
+	
+	id = serv->idctr++;
 	buf_init(&buf, 0);
 	buf_add_string(&buf, remote_dir);
 	buf_to_iov(&buf, &iov[0]);
@@ -2202,7 +2198,7 @@ static int sftp_request_send(serv_t serv,
 	pthread_mutex_lock(&serv->lock);
 	if (begin_func)
 		begin_func(req);
-	id = sftp_get_id();
+	id = serv->idctr++;
 	err = start_processing_thread(serv);
 	if (err) {
 		pthread_mutex_unlock(&serv->lock);
@@ -2279,6 +2275,7 @@ static int serv_arr_init(void)
 		serv->fd = -1;
 		serv->ptyfd = -1;
 		serv->ptyslavefd = -1;
+		serv->idctr = 0;
 		serv->is_forward = 0;
 		if (serv->local)
 			continue;
@@ -3405,7 +3402,7 @@ static int sshfsm_rmdir(const char *path)
 	if (serv_num == 1)
 		return serv_rmdir(serv_0, path);
 	
-	int err = 0, err2, err3 = 0, firsterr = 0;
+	int err = 0, err2, err3 = 1, firsterr = 0;
 	GPtrArray *serv_arr;
 
 	serv_arr = get_serv_arr(tree_lookup(path));
@@ -3447,11 +3444,13 @@ static int sshfsm_rmdir(const char *path)
 			err = -EIO;
 			goto out;
 		}
-		if (!err2)
+		if (!err2) {
 			tree_remove_serv(path, thread_dat[i].serv);
+			cache_invalidate(path);
+		}
 		if (!firsterr)
 			firsterr = thread_dat[i].err;
-		err3 += err2;
+		err3 *= err2;
 	}
 	err = err3 ? firsterr : 0;
 
@@ -4025,6 +4024,7 @@ static serv_t fwd_serv_arr_lookup(const struct in_addr *inaddr)
 	serv->fd = -1;
 	serv->ptyfd = -1;
 	serv->ptyslavefd = -1;
+	serv->idctr = 0;
 	serv->local = 0;
 	serv->is_forward = 1;
 	serv->forward_refs = 0;
