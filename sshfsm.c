@@ -305,6 +305,7 @@ struct sshfsm {
 	int inaddr_ino;
 	unsigned int inaddr_nth;
 	char *forward_io;
+	unsigned forward_allow;
 	unsigned forward_timeout;
 	GPtrArray *serv_arr;
 	GPtrArray *fwd_serv_arr;
@@ -428,6 +429,7 @@ static struct fuse_opt sshfsm_opts[] = {
 	SSHFSM_OPT("inaddr_ino",        inaddr_ino, 1),
 	SSHFSM_OPT("inaddr_nth=%u",     inaddr_nth, 0),
 	SSHFSM_OPT("forward_io=%s",   	forward_io, 0),
+	SSHFSM_OPT("forward_allow=%u",  forward_allow, 0),
 	SSHFSM_OPT("forward_timeout=%u",forward_timeout, 0),
 	
 	/* Append a space if the option takes an argument */
@@ -4057,12 +4059,13 @@ static int open_forward(serv_t serv, const char *path, mode_t mode,
 			return err;
 	}
 	
-	err = get_inaddr(stbuf.st_ino, &inaddr);
-	if (err)
-		return -EIO;
+	if (get_inaddr(stbuf.st_ino, &inaddr)) {
+		debug("open_forward: failed to get inaddr %016lX", stbuf.st_ino);
+		return -1;
+	}
 	
 	/* Already connected to the server */
-	if (get_ino_hops(stbuf.st_ino) <= 1)
+	if (get_ino_hops(stbuf.st_ino) <= sshfsm.forward_allow)
 		return open_remote(serv, path, mode, fi);
 	fwd_serv = serv_arr_lookup(&inaddr);
 	if (fwd_serv)
@@ -4093,14 +4096,10 @@ static int open_forward(serv_t serv, const char *path, mode_t mode,
 static int serv_open_common(serv_t serv, const char *path, 
 	mode_t mode, struct fuse_file_info *fi)
 {
-	int err;
-	if (sshfsm.forward_io) {
-		err = open_forward(serv, path, mode, fi);
-		if (!err)
-			return 0;
-		/* If failed to open_forward(), fall to ordinary routines */
-	}
+	if (sshfsm.forward_io && open_forward(serv, path, mode, fi) == 0)
+		return 0;
 	
+	/* If failed to open_forward(), fall to ordinary routines */
 	return serv->local ? open_local(serv, path, mode, fi) :
 		open_remote(serv, path, mode, fi);
 }
@@ -5407,6 +5406,7 @@ static void usage(const char *progname)
 "    -o inaddr_ino          piggyback ip address using inode numbers\n"
 "    -o inaddr_nth=N        piggyback the Nth ip address (default: 0)\n"
 "    -o forward_io=BASEPATH use ip address to forward direct I/O to server\n"
+"    -o forward_allow=N     forward only for more than N hops (default: 1)\n"
 "    -o forward_timeout=N   sets timeout for connections in seconds (default: 60)\n"
 "    -o transform_symlinks  transform absolute symlinks to relative\n"
 "    -o follow_symlinks     follow symlinks on the server\n"
@@ -5856,6 +5856,7 @@ int main(int argc, char *argv[])
 	sshfsm.sndbuf = 0;
 	sshfsm.rcvbuf = 0;
 	sshfsm.inaddr_nth = 0;
+	sshfsm.forward_allow = 1;
 	sshfsm.forward_timeout = 0;
 	sshfsm.errlog = stderr;
 	ssh_add_arg("ssh");
