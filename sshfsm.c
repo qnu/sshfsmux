@@ -162,7 +162,6 @@
 
 #define MAX_REQ_SIZE 65536
 
-
 struct buffer {
 	uint8_t *p;
 	size_t len;
@@ -305,7 +304,7 @@ struct sshfsm {
 	char *psk_path;
 	int inaddr_ino;
 	unsigned int inaddr_nth;
-	char *forward_io;
+	char *forward;
 	unsigned forward_allow;
 	unsigned forward_timeout;
 	GPtrArray *serv_arr;
@@ -430,7 +429,7 @@ static struct fuse_opt sshfsm_opts[] = {
 	SSHFSM_OPT("dump",              dump, 1),
 	SSHFSM_OPT("inaddr_ino",        inaddr_ino, 1),
 	SSHFSM_OPT("inaddr_nth=%u",     inaddr_nth, 0),
-	SSHFSM_OPT("forward_io=%s",   	forward_io, 0),
+	SSHFSM_OPT("forward=%s",   	    forward, 0),
 	SSHFSM_OPT("forward_allow=%u",  forward_allow, 0),
 	SSHFSM_OPT("forward_timeout=%u",forward_timeout, 0),
 	SSHFSM_OPT("no_auth",           no_auth, 1),
@@ -505,6 +504,7 @@ static void serv_arr_destroy(void);
 static int tree_init(void);
 static void tree_destroy(void);
 static inline void tree_print(void);
+static serv_t fwd_serv_arr_lookup(const struct in_addr *inaddr);
 static void fwd_serv_arr_cleanup(time_t timeout);
 
 static char * find_base_path(char *);
@@ -2085,8 +2085,8 @@ static void runtime_destroy(void)
 	g_free(sshfsm.session_dir);
 	if (sshfsm.sftp_server)
 		free(sshfsm.sftp_server);
-	if (sshfsm.forward_io)
-		g_free(sshfsm.forward_io);
+	if (sshfsm.forward)
+		g_free(sshfsm.forward);
 }
 
 #if FUSE_VERSION >= 26
@@ -3509,6 +3509,49 @@ static void random_string(char *str, int length)
 	*str = '\0';
 }
 
+static int serv_rename(serv_t serv, const char *from, const char *to);
+
+static int rename_forward(serv_t serv, const char *from, const char *to)
+{
+	serv_t fwd_serv;
+	struct stat stbuf;
+	struct in_addr inaddr;
+	int err;
+	memset(&stbuf, 0, sizeof(struct stat));
+	if (cache_get_attr(from, &stbuf)) {
+		err = serv_getattr(serv, from, &stbuf);
+		if (err)
+			return err;
+	}
+	
+	if (get_inaddr(stbuf.st_ino, &inaddr)) {
+		debug("rename_forward: failed to get inaddr %016lX", stbuf.st_ino);
+		return -1;
+	}
+	
+	fwd_serv = serv_arr_lookup(&inaddr);
+	if (fwd_serv)
+		return rename_remote(fwd_serv, from, to);
+	fwd_serv = fwd_serv_arr_lookup(&inaddr);
+	if (fwd_serv)
+		return rename_remote(fwd_serv, from, to);
+	
+	debug("forward rename: connecting %s ...", fwd_serv->hostname);
+	if (!sshfsm.delay_connect) {
+		if (connect_remote(fwd_serv) == -1)
+			return -1;
+
+		if (sshfsm.detect_uid)
+			sftp_detect_uid(fwd_serv);
+
+		if (!sshfsm.no_check_root && serv_check_root(fwd_serv) == -1)
+			return -1;
+	}
+	
+	err = rename_remote(fwd_serv, from, to);
+	return err;
+}
+
 static int serv_rename(serv_t serv, const char *from, const char *to)
 {
 	if (serv->local)
@@ -3535,6 +3578,12 @@ static int serv_rename(serv_t serv, const char *from, const char *to)
 					rename_remote(serv, totmp, to);
 			}
 		}
+	}
+	
+	if (err == -EPERM && sshfsm.forward) {
+		err = rename_forward(serv, from, to);
+		if (err == -1)
+			return -EPERM;
 	}
 	return err;
 }
@@ -4019,7 +4068,7 @@ static serv_t fwd_serv_arr_lookup(const struct in_addr *inaddr)
 	/* Create a new server */
 	serv = g_new0(struct serv, 1);
 	serv->hostname = g_strdup(inet_ntoa(*inaddr));
-	serv->basepath = g_strdup(sshfsm.forward_io);
+	serv->basepath = g_strdup(sshfsm.forward);
 	serv->inaddr.s_addr = inaddr->s_addr;
 	serv->fd = -1;
 	serv->ptyfd = -1;
@@ -4098,7 +4147,7 @@ static int open_forward(serv_t serv, const char *path, mode_t mode,
 static int serv_open_common(serv_t serv, const char *path, 
 	mode_t mode, struct fuse_file_info *fi)
 {
-	if (sshfsm.forward_io && open_forward(serv, path, mode, fi) == 0)
+	if (sshfsm.forward && open_forward(serv, path, mode, fi) == 0)
 		return 0;
 	
 	/* If failed to open_forward(), fall to ordinary routines */
@@ -5471,7 +5520,7 @@ static void usage(const char *progname)
 "    -o directport=PORT     directly connect to PORT bypassing ssh\n"
 "    -o inaddr_ino          piggyback ip address using inode numbers\n"
 "    -o inaddr_nth=N        piggyback the Nth ip address (default: 0)\n"
-"    -o forward_io=BASEPATH use ip address to forward direct I/O to server\n"
+"    -o forward=BASEPATH use ip address to forward direct I/O to server\n"
 "    -o forward_allow=N     forward only for more than N hops (default: 1)\n"
 "    -o forward_timeout=N   sets timeout for connections in seconds (default: 60)\n"
 "    -o transform_symlinks  transform absolute symlinks to relative\n"
@@ -6043,7 +6092,7 @@ int main(int argc, char *argv[])
 	fuse_opt_insert_arg(&args, 1, tmp);
 	g_free(tmp);
 	
-	if (sshfsm.forward_io)
+	if (sshfsm.forward)
 		sshfsm.inaddr_ino = 1;
 		
 	if (sshfsm.inaddr_ino)

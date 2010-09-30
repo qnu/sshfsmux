@@ -2,3 +2,6 @@
   1. diff -crB old new > new.patch
   2. patch --dry-run -p1 -i /path/to/new.patch
   3. patch -p1 -i /path/to/new.patch
+
+* Error: protocol error, bad reply ID, reply len too large
+  1. Set -o no_check_root to see if it disappears
