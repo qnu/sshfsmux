@@ -313,6 +313,7 @@ struct sshfsm {
 	time_t fwd_serv_arr_last_cleaned;
 	GNode *tree;
 	pthread_mutex_t lock_serv_arr;
+	int no_auth;
 
 	/* statistics */
 	uint64_t bytes_sent;
@@ -432,6 +433,7 @@ static struct fuse_opt sshfsm_opts[] = {
 	SSHFSM_OPT("forward_io=%s",   	forward_io, 0),
 	SSHFSM_OPT("forward_allow=%u",  forward_allow, 0),
 	SSHFSM_OPT("forward_timeout=%u",forward_timeout, 0),
+	SSHFSM_OPT("no_auth",           no_auth, 1),
 	
 	/* Append a space if the option takes an argument */
 	FUSE_OPT_KEY("-p ",             KEY_PORT),
@@ -5154,7 +5156,7 @@ static int sftp_proxy_connect(serv_t serv, char *port)
 	char *key;
 	size_t key_len;
 	
-	if (sftp_proxy_chk_psk() == -1)
+	if (!sshfsm.no_auth && sftp_proxy_chk_psk() == -1)
 		return -1;
 	
 	debug("direct connect to %s:%s", serv->hostname, port);
@@ -5198,12 +5200,14 @@ static int sftp_proxy_connect(serv_t serv, char *port)
 
 	freeaddrinfo(ai);
 	
-	key = sftp_proxy_get_psk(&key_len);
+	if (!sshfsm.no_auth) {
+		key = sftp_proxy_get_psk(&key_len);
 
-	err = sftp_proxy_auth_challenge(sock, key);
-	if (err != 0) {
-		close(sock);
-		return -1;
+		err = sftp_proxy_auth_challenge(sock, key);
+		if (err != 0) {
+			close(sock);
+			return -1;
+		}
 	}
 
 	serv->fd = sock;
@@ -5255,14 +5259,16 @@ static void sftp_proxy_process(void)
 
 		debug("accept connection from %d", clnt_sockfd);
 		
-		res = sftp_proxy_auth_response(clnt_sockfd, key); 
-		if (res != 0) {
-			close(clnt_sockfd);
-			debug("authentication failed from %d", clnt_sockfd);
-			continue;
+		if (!sshfsm.no_auth) {
+			res = sftp_proxy_auth_response(clnt_sockfd, key); 
+			if (res != 0) {
+				close(clnt_sockfd);
+				debug("authentication failed from %d", clnt_sockfd);
+				continue;
+			}
+			debug("authentication success from %d", clnt_sockfd);
+			fflush(sshfsm.errlog);
 		}
-		debug("authentication success from %d", clnt_sockfd);
-		fflush(sshfsm.errlog);
 		
 		set_nodelay(clnt_sockfd);
 		
@@ -5325,7 +5331,7 @@ static void sftp_proxy_init(void)
 	if (access(sshfsm.sftp_server, R_OK | X_OK) == -1)
 		fatal(1, "failed to access \"%s\"", sshfsm.sftp_server);
 	
-	if (sftp_proxy_chk_psk() == -1)
+	if (!sshfsm.no_auth && sftp_proxy_chk_psk() == -1)
 		exit(1);
 	
 	if (!sshfsm.session_dir)
@@ -5921,6 +5927,7 @@ int main(int argc, char *argv[])
 	sshfsm.inaddr_nth = 0;
 	sshfsm.forward_allow = 1;
 	sshfsm.forward_timeout = 0;
+	sshfsm.no_auth = 0;
 	sshfsm.errlog = stderr;
 	ssh_add_arg("ssh");
 	ssh_add_arg("-x");
