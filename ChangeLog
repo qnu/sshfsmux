@@ -1,3 +1,7 @@
+2010-10-11 Nan Dun
+	* Modify manual page sshfsm.1
+	* Add thread processing for sftp proxy server
+
 2010-09-29  Nan Dun
 	* Add "forward_io" by using piggybacked ip address
 	* Add compatibility for directories merge for glib < 2.16

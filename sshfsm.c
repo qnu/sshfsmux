@@ -65,7 +65,7 @@
 #include "cache.h"
 
 #if GLIB_CHECK_VERSION(2, 16, 0)
-#define G_HASH_TABLE_HAS_ITER
+#define GLIB_HASH_TABLE_HAS_ITER
 #endif
 
 #ifndef MAP_LOCKED
@@ -312,7 +312,6 @@ struct sshfsm {
 	time_t fwd_serv_arr_last_cleaned;
 	GNode *tree;
 	pthread_mutex_t lock_serv_arr;
-	int no_auth;
 
 	/* statistics */
 	uint64_t bytes_sent;
@@ -432,7 +431,6 @@ static struct fuse_opt sshfsm_opts[] = {
 	SSHFSM_OPT("forward=%s",   	    forward, 0),
 	SSHFSM_OPT("forward_allow=%u",  forward_allow, 0),
 	SSHFSM_OPT("forward_timeout=%u",forward_timeout, 0),
-	SSHFSM_OPT("no_auth",           no_auth, 1),
 	
 	/* Append a space if the option takes an argument */
 	FUSE_OPT_KEY("-p ",             KEY_PORT),
@@ -450,26 +448,26 @@ static struct fuse_opt sshfsm_opts[] = {
 };
 
 static struct fuse_opt workaround_opts[] = {
-	SSHFSM_OPT("none",       rename_workaround, 0),
-	SSHFSM_OPT("none",       nodelay_workaround, 0),
-	SSHFSM_OPT("none",       nodelayserv_workaround, 0),
-	SSHFSM_OPT("none",       truncate_workaround, 0),
-	SSHFSM_OPT("none",       buflimit_workaround, 0),
-	SSHFSM_OPT("all",        rename_workaround, 1),
-	SSHFSM_OPT("all",        nodelay_workaround, 1),
-	SSHFSM_OPT("all",        nodelayserv_workaround, 1),
-	SSHFSM_OPT("all",        truncate_workaround, 1),
-	SSHFSM_OPT("all",        buflimit_workaround, 1),
-	SSHFSM_OPT("rename",     rename_workaround, 1),
-	SSHFSM_OPT("norename",   rename_workaround, 0),
-	SSHFSM_OPT("nodelay",    nodelay_workaround, 1),
-	SSHFSM_OPT("nonodelay",  nodelay_workaround, 0),
-	SSHFSM_OPT("nodelayserv", nodelayserv_workaround, 1),
+	SSHFSM_OPT("none",          rename_workaround, 0),
+	SSHFSM_OPT("none",          nodelay_workaround, 0),
+	SSHFSM_OPT("none",          nodelayserv_workaround, 0),
+	SSHFSM_OPT("none",          truncate_workaround, 0),
+	SSHFSM_OPT("none",          buflimit_workaround, 0),
+	SSHFSM_OPT("all",           rename_workaround, 1),
+	SSHFSM_OPT("all",           nodelay_workaround, 1),
+	SSHFSM_OPT("all",           nodelayserv_workaround, 1),
+	SSHFSM_OPT("all",           truncate_workaround, 1),
+	SSHFSM_OPT("all",           buflimit_workaround, 1),
+	SSHFSM_OPT("rename",        rename_workaround, 1),
+	SSHFSM_OPT("norename",      rename_workaround, 0),
+	SSHFSM_OPT("nodelay",       nodelay_workaround, 1),
+	SSHFSM_OPT("nonodelay",     nodelay_workaround, 0),
+	SSHFSM_OPT("nodelayserv",   nodelayserv_workaround, 1),
 	SSHFSM_OPT("nonodelayserv", nodelayserv_workaround, 0),
-	SSHFSM_OPT("truncate",   truncate_workaround, 1),
-	SSHFSM_OPT("notruncate", truncate_workaround, 0),
-	SSHFSM_OPT("buflimit",   buflimit_workaround, 1),
-	SSHFSM_OPT("nobuflimit", buflimit_workaround, 0),
+	SSHFSM_OPT("truncate",      truncate_workaround, 1),
+	SSHFSM_OPT("notruncate",    truncate_workaround, 0),
+	SSHFSM_OPT("buflimit",      buflimit_workaround, 1),
+	SSHFSM_OPT("nobuflimit",    buflimit_workaround, 0),
 	FUSE_OPT_END
 };
 
@@ -495,7 +493,6 @@ static void perror2(const char *format, ...)
 	fprintf(stderr, ": %s\n", strerror(errno));
 }
 
-/* forward all function declarations here */
 static int sftp_local_connect(serv_t);
 static int sftp_proxy_connect(serv_t, char *);
 
@@ -528,6 +525,16 @@ static char * find_base_path(char *);
 #define serv_i(idx) g_ptr_array_index(sshfsm.serv_arr, idx)
 #define serv_add_path(serv, path) \
 	g_strdup_printf("%s%s", serv->basepath, path[1] ? path+1 : "")
+
+/* djb2 hash function */
+static unsigned long string_hash(const char *str)
+{
+	unsigned long hash = 5381;
+	int c;
+	while ((c = *str++))
+		hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
+	return hash;
+}
 
 static inline char * g_strdup_and_free(char *s)
 {
@@ -1262,7 +1269,7 @@ static int start_ssh(serv_t serv)
 #ifdef SSH_NODELAY_WORKAROUND
 		if (sshfsm.nodelay_workaround &&
 		    do_ssh_nodelay_workaround() == -1) {
-			warning("warning: ssh nodelay workaround disabled");
+			warning("ssh nodelay workaround disabled");
 		}
 #endif
 
@@ -1881,57 +1888,6 @@ static int get_hostinfo(char *host, char *port, struct in_addr *addr,
 	freeaddrinfo(ai);
 	return 0;
 }
-
-#if 0
-static int get_hostinfo2(char *host, char *port, struct in_addr *addr, 
-	char *fqdnbuf)
-{	
-	int err;
-	struct addrinfo *ai;
-	struct addrinfo hint;
-	struct hostent *hostent;
-
-	memset(&hint, 0, sizeof(hint));
-	hint.ai_family = AF_INET;
-	hint.ai_socktype = SOCK_STREAM;
-	err = getaddrinfo(host, port, &hint, &ai);
-	if (!err) {
-		hostent = gethostbyaddr(ai, sizeof(struct addrinfo), AF_INET);
-		if (hostent == NULL) {
-			debug("failed to get host entry: %s", gai_strerror(h_errno))
-		} else {
-			g_snprintf(fqdnbuf, 128, "%s", hostent->h_name);
-			goto out;
-		}
-	}
-	debug("failed to resolve %s: %s", host, gai_strerror(err));
-	
-	/* Get FQDN and try again */
-	char *cmd, fqdn[128];
-	memset(fqdn, 0x0, 128);
-	cmd = g_strdup_printf("ssh %s 'hostname -f'", host);
-	err = get_cmd_output(cmd, fqdn, 128);
-	fqdn[strlen(fqdn)-1] = '\0';
-	g_free(cmd);
-	if (err) {
-		debug("failed to get fqdn via ssh");
-		addr->s_addr = 0;
-		return -1;
-	}
-	g_snprintf(fqdnbuf, 128, "%s", fqdn);
-	err = getaddrinfo(fqdn, port, &hint, &ai);
-	if (err) {
-		debug("failed to resolve fqdn %s (%lu)", fqdn, strlen(fqdn));
-		addr->s_addr = 0;
-		return -1;
-	}
-
-out:
-	addr->s_addr = ((struct sockaddr_in *) (ai->ai_addr))->sin_addr.s_addr;
-	freeaddrinfo(ai);
-	return 0;
-}
-#endif
 
 static int get_inaddr(uint64_t ino, struct in_addr *inaddr)
 {
@@ -2918,7 +2874,7 @@ static void * getdir_thread_func(void *data)
 	p->err ? pthread_exit((void *) -1) : pthread_exit((void *) 0);
 }
 
-#ifndef G_HASH_TABLE_HAS_ITER
+#ifndef GLIB_HASH_TABLE_HAS_ITER
 struct getdir_fill_data {
 	fuse_cache_dirh_t h;
 	fuse_cache_dirfil_t filler;
@@ -3008,7 +2964,7 @@ static int sshfsm_getdir(const char *path, fuse_cache_dirh_t h,
 	err = err3 ? firsterr : 0;
 	
 	/* Aggregte all directory entires */
-#ifdef G_HASH_TABLE_HAS_ITER
+#ifdef GLIB_HASH_TABLE_HAS_ITER
 	GHashTableIter iter;
 	gpointer key, value;
 	char *d_name;
@@ -5069,130 +5025,94 @@ static int sftp_local_connect(serv_t serv)
  * SFTP direct connection bypassing ssh
  * inspired by Kenjiro Taura
  */
-enum {
-	SFTP_CONN_FAILED = -1,
-	SFTP_CONN_OK = 0,
-	SFTP_CONN_REQ = 1,
-	SFTP_CONN_REFUSE = 2,
-};
 
-static char * sftp_proxy_get_psk(size_t *len)
+static int sftp_proxy_get_psk(const char *psk_path, unsigned long *hash)
 {
-	if (sshfsm.psk_path)
-		sshfsm.psk_path = g_strdup_and_free(sshfsm.psk_path);
- 	else
-		sshfsm.psk_path = g_strdup_printf("%s/key",
-			sshfsm.config_dir);
-
-	return get_file(sshfsm.psk_path, len, 0);
-}
-
-static int sftp_proxy_chk_psk(void)
-{
+	size_t len;
+	char *key;
 	struct stat stbuf;
-
-	if (sshfsm.psk_path)
-		sshfsm.psk_path = g_strdup_and_free(sshfsm.psk_path);
-	else
-		sshfsm.psk_path = g_strdup_printf("%s/key",
-			sshfsm.config_dir);
 	
-	if (stat(sshfsm.psk_path, &stbuf) == -1) {
-		perror2("failed to stat \"%s\"", sshfsm.psk_path);
+	if (stat(psk_path, &stbuf) == -1) {
+		perror2("failed to stat \"%s\"", psk_path);
 		return -1;
 	}
 
 	if (!S_ISREG(stbuf.st_mode)) {
-		error3("psk file \"%s\" is not a regular file",
-			sshfsm.psk_path);
+		error3("psk file \"%s\" is not a regular file", psk_path);
 		return -1;
 	}
 
 	if ((stbuf.st_mode & 0177) != 0 || 
 		(stbuf.st_mode & 0600) != 0600) {
-		error3("mode of psk file \"%s\" should be 0600", 
-			sshfsm.psk_path);
+		error3("mode of psk file \"%s\" should be 0600", psk_path);
 		return -1;
 	}
+	
+	key = get_file(psk_path, &len, 0);
+	*hash = string_hash(key);
 
+	g_free(key);
 	return 0;
 }
 
-static int sftp_proxy_auth_challenge(int sockfd, const char *key)
+/* A simple challenge-handshake authentication protocol */
+static int sftp_proxy_auth_response(int servfd, unsigned long key)
 {
-	char *ptr, *msg, buf[MAX_BUF_LEN];
+	char buf[MAX_BUF_LEN];
 	int res;
 	
 	memset(buf, 0x0, MAX_BUF_LEN);
-	snprintf(buf, MAX_BUF_LEN, "%d:%s", SFTP_CONN_REQ, key);
-	res = write(sockfd, buf, strlen(buf));
+	snprintf(buf, MAX_BUF_LEN, "%lu", key);
+	res = write(servfd, buf, strlen(buf));
 	if (res < 0) {
-		perror2("failed to write to socket");
-		return SFTP_CONN_FAILED;
+		perror2("failed to write to server");
+		return -1;
 	}
-	debug("sftp auth send %s", buf);
-	
+
 	memset(buf, 0x0, MAX_BUF_LEN);
-	res = read(sockfd, buf, MAX_BUF_LEN);
+	res = read(servfd, buf, MAX_BUF_LEN);
 	if (res < 0) {
-		perror2("failed to read socket");
-		return SFTP_CONN_FAILED;
+		perror2("failed to read from server");
+		return -1;
 	}
-	debug("sftp auth recv %s", buf);
-	
-	ptr = strchr(buf, ':');
-	*ptr = '\0';
-	res = atoi(buf);
-	msg = ptr + 1;
-
-	if (res != SFTP_CONN_OK)
-		error3("authentication: %s", msg);
-
-	return res;
+	return atoi(buf) ? -1 : 0;
 }
 
-static int sftp_proxy_auth_response(int sockfd, const char *key)
+static int sftp_proxy_auth_challenge(int clntfd, unsigned long key)
 {
-	char *ptr, *msg, buf[1024];
-	int res, code;
-
-	code = SFTP_CONN_REFUSE;
-	
-	memset(buf, 0x0, MAX_BUF_LEN);
-	res = read(sockfd, buf, MAX_BUF_LEN);
-	if (res < 0) {
-		perror2("failed to read from socket");
-		return -1;
-	}
-		
-	ptr = strchr(buf, ':');
-	*ptr = '\0';
-	res = atoi(buf);
-	msg = ptr + 1;
-	
-	debug("recv authenticate msg %s", msg);
-
-	if (res == SFTP_CONN_REQ) {
-		switch (strcmp(msg, key)) {
-			case 0:
-				code = SFTP_CONN_OK;
-				msg = "OK";
-				break;
-			default:
-				code = SFTP_CONN_REFUSE;
-				msg = "Connection refused";
-		}
-	}
+	char buf[MAX_BUF_LEN];
+	int res;
+	unsigned long recv_key;
 
 	memset(buf, 0x0, MAX_BUF_LEN);
-	snprintf(buf, MAX_BUF_LEN, "%d:%s", code, msg);
-	res = write(sockfd, buf, MAX_BUF_LEN);
+	res = read(clntfd, buf, MAX_BUF_LEN);
 	if (res < 0) {
-		perror2("failed to write to socket");
+		perror2("failed to read from client");
+		return -1; 
+	}
+
+	debug("sftp proxy server received key %s", buf);
+	
+	errno = 0;	/* according to manual, clean errno first */
+	recv_key = strtoul(buf, NULL, 0);
+	if (errno) {
+		perror2("Authentication key overflow");
 		return -1;
 	}
 
-	return code == SFTP_CONN_OK ? 0 : 1;
+	memset(buf, 0x0, MAX_BUF_LEN);
+	if (recv_key == key)
+		snprintf(buf, MAX_BUF_LEN, "0");
+	else
+		snprintf(buf, MAX_BUF_LEN, "-1");
+	
+	res = write(clntfd, buf, MAX_BUF_LEN);
+	if (res < 0) {
+		perror2("failed to write to client");
+		return -1;
+	}
+	
+	return recv_key == key ? 0 : -1;
 }
 
 static int sftp_proxy_connect(serv_t serv, char *port)
@@ -5202,10 +5122,9 @@ static int sftp_proxy_connect(serv_t serv, char *port)
 	socklen_t len;
 	struct addrinfo *ai;
 	struct addrinfo hint;
-	char *key;
-	size_t key_len;
+	unsigned long key;
 	
-	if (!sshfsm.no_auth && sftp_proxy_chk_psk() == -1)
+	if (sftp_proxy_get_psk(sshfsm.psk_path, &key) == -1)
 		return -1;
 	
 	debug("direct connect to %s:%s", serv->hostname, port);
@@ -5227,7 +5146,7 @@ static int sftp_proxy_connect(serv_t serv, char *port)
 	}
 	err = connect(sock, ai->ai_addr, ai->ai_addrlen);
 	if (err == -1) {
-		perror2("failed to connect");
+		perror2("failed to connect to %s", serv->hostname);
 		return -1;
 	}
 
@@ -5249,33 +5168,88 @@ static int sftp_proxy_connect(serv_t serv, char *port)
 
 	freeaddrinfo(ai);
 	
-	if (!sshfsm.no_auth) {
-		key = sftp_proxy_get_psk(&key_len);
-
-		err = sftp_proxy_auth_challenge(sock, key);
-		if (err != 0) {
-			close(sock);
-			return -1;
-		}
+	err = sftp_proxy_auth_response(sock, key);
+	if (err != 0) {
+		close(sock);
+		return -1;
 	}
 
 	serv->fd = sock;
 	return 0;
 }
 
-static void sftp_proxy_process(void)
+struct proxy_process_thread_data {
+	int serv_sockfd;
+	int clnt_sockfd;
+	unsigned long key;
+};
+
+static void * proxy_process_thread_func(void *data)
+{
+	struct proxy_process_thread_data *p =
+		(struct proxy_process_thread_data *) data;
+	int serv_sockfd = p->serv_sockfd;
+	int clnt_sockfd = p->clnt_sockfd;
+	unsigned long key = p->key;
+	pid_t pid;
+	int res;
+
+	g_free(p);
+
+	res = sftp_proxy_auth_challenge(clnt_sockfd, key); 
+	if (res != 0) {
+		close(clnt_sockfd);
+		debug("authentication failed from %d", clnt_sockfd);
+		pthread_exit((void *) -1);
+	}
+	debug("authentication success from %d", clnt_sockfd);
+	fflush(sshfsm.errlog);
+	
+	set_nodelay(clnt_sockfd);
+	
+	pid = fork();
+	if (pid < 0) {
+		perror2("fork failed");
+		_exit(1);
+	} else if (pid == 0) {
+		switch (fork()) {
+			case -1:
+				perror2("failed to fork");
+				_exit(1);
+			case 0:
+				break;
+			default:
+				_exit(0);
+		}
+		setsid();
+		res = chdir(sshfsm.userhome);
+		umask(0);
+		close(serv_sockfd);
+		dup2(clnt_sockfd, 0);
+		dup2(clnt_sockfd, 1);
+		execl(sshfsm.sftp_server, "sftp.sshfsm", NULL);
+		perror2("failed to execute \"%s\"", sshfsm.sftp_server);
+		_exit(1);
+	}
+	waitpid(pid, NULL, 0);
+	close(clnt_sockfd);
+	pthread_exit((void *) 0);
+}
+
+static void sftp_proxy_process(unsigned long key)
 {
 	int serv_sockfd, clnt_sockfd;
 	struct sockaddr_in serv_addr, clnt_addr;
 	socklen_t clnt_len = sizeof(clnt_addr);
-	pid_t pid;
-	char *key;
-	size_t key_len;
+	pthread_t thread;
+	sigset_t oldset;
+	sigset_t newset;
+	struct proxy_process_thread_data *thread_dat;
 	int res, flag = 1;
 	
 	serv_sockfd = socket(AF_INET, SOCK_STREAM, 0);
 	if (serv_sockfd == -1)
-		fatal(1, "***failed to create socket", NULL);
+		fatal(1, "failed to create socket", NULL);
 	
 	res = setsockopt(serv_sockfd, SOL_SOCKET, SO_REUSEADDR, &flag,
 		sizeof(flag)); 
@@ -5298,55 +5272,29 @@ static void sftp_proxy_process(void)
 	debug("start listen from %d with backlog=%d", 
 		serv_sockfd, sshfsm.backlog);
 	
-	key = sftp_proxy_get_psk(&key_len);
-	
 	while (1) {
 		clnt_sockfd = accept(serv_sockfd, (struct sockaddr *) &clnt_addr,
 			&clnt_len);
 		if (clnt_sockfd == -1)
 			fatal(1, "failed to accept", NULL);
-
+		
 		debug("accept connection from %d", clnt_sockfd);
-		
-		if (!sshfsm.no_auth) {
-			res = sftp_proxy_auth_response(clnt_sockfd, key); 
-			if (res != 0) {
-				close(clnt_sockfd);
-				debug("authentication failed from %d", clnt_sockfd);
-				continue;
-			}
-			debug("authentication success from %d", clnt_sockfd);
-			fflush(sshfsm.errlog);
-		}
-		
-		set_nodelay(clnt_sockfd);
-		
-		pid = fork();
-		if (pid < 0) {
-			perror2("fork failed");
-			_exit(1);
-		} else if (pid == 0) {
-			switch (fork()) {
-				case -1:
-					perror2("failed to fork");
-					_exit(1);
-				case 0:
-					break;
-				default:
-					_exit(0);
-			}
-			setsid();
-			res = chdir(sshfsm.userhome);
-			umask(0);
-			close(serv_sockfd);
-			dup2(clnt_sockfd, 0);
-			dup2(clnt_sockfd, 1);
-			execl(sshfsm.sftp_server, "sftp.sshfsm", NULL);
-			perror2("failed to execute \"%s\"", sshfsm.sftp_server);
-			_exit(1);
-		}
-		waitpid(pid, NULL, 0);
-		close(clnt_sockfd);
+
+		thread_dat = g_new(struct proxy_process_thread_data, 1);
+		thread_dat->clnt_sockfd = clnt_sockfd;
+		thread_dat->key = key;
+		sigemptyset(&newset);
+		sigaddset(&newset, SIGTERM);
+		sigaddset(&newset, SIGINT);
+		sigaddset(&newset, SIGHUP);
+		sigaddset(&newset, SIGQUIT);
+		pthread_sigmask(SIG_BLOCK, &newset, &oldset);
+		res = pthread_create(&thread, NULL, proxy_process_thread_func, 
+			(void *) thread_dat);
+		if (res)
+			fatal(1, "failed to create thread", NULL);
+		pthread_detach(thread);
+		pthread_sigmask(SIG_SETMASK, &oldset, NULL);
 	}
 
 	exit(0);
@@ -5373,6 +5321,7 @@ static void sftp_proxy_init(void)
 {
 	char path[PATH_MAX];
 	int res;
+	unsigned long key;
 
 	if (!sshfsm.sftp_server)
 		sshfsm.sftp_server = SFTP_SERVER_PATH;
@@ -5380,7 +5329,7 @@ static void sftp_proxy_init(void)
 	if (access(sshfsm.sftp_server, R_OK | X_OK) == -1)
 		fatal(1, "failed to access \"%s\"", sshfsm.sftp_server);
 	
-	if (!sshfsm.no_auth && sftp_proxy_chk_psk() == -1)
+	if (sftp_proxy_get_psk(sshfsm.psk_path, &key) == -1)
 		exit(1);
 	
 	if (!sshfsm.session_dir)
@@ -5401,6 +5350,11 @@ static void sftp_proxy_init(void)
 	if (lockf(sshfsm.sftp_proxy_lockfd, F_TEST, 0) < 0) {
 		warning("Another proxy daemon is running?");
 		close(sshfsm.sftp_proxy_lockfd);
+		exit(0);
+	}
+
+	if (sshfsm.debug) {
+		sftp_proxy_process(key);
 		exit(0);
 	}
 	
@@ -5439,7 +5393,7 @@ static void sftp_proxy_init(void)
 	if (lockf(sshfsm.sftp_proxy_lockfd, F_TLOCK, 0) < 0)
 		fatal(1, "failed to acquire lock", NULL);
 	
-	sftp_proxy_process();
+	sftp_proxy_process(key);
 }
 
 static struct fuse_cache_operations sshfsm_oper = {
@@ -5520,9 +5474,9 @@ static void usage(const char *progname)
 "    -o directport=PORT     directly connect to PORT bypassing ssh\n"
 "    -o inaddr_ino          piggyback ip address using inode numbers\n"
 "    -o inaddr_nth=N        piggyback the Nth ip address (default: 0)\n"
-"    -o forward=BASEPATH use ip address to forward direct I/O to server\n"
+"    -o forward=BASEPATH    use ip address to forward direct I/O to server\n"
 "    -o forward_allow=N     forward only for more than N hops (default: 1)\n"
-"    -o forward_timeout=N   sets timeout for connections in seconds (default: 60)\n"
+"    -o forward_timeout=N   set timeout for connections (default: 60)\n"
 "    -o transform_symlinks  transform absolute symlinks to relative\n"
 "    -o follow_symlinks     follow symlinks on the server\n"
 "    -o no_check_root       don't check for existence of 'dir' on server\n"
@@ -5976,7 +5930,6 @@ int main(int argc, char *argv[])
 	sshfsm.inaddr_nth = 0;
 	sshfsm.forward_allow = 1;
 	sshfsm.forward_timeout = 0;
-	sshfsm.no_auth = 0;
 	sshfsm.errlog = stderr;
 	ssh_add_arg("ssh");
 	ssh_add_arg("-x");
@@ -6006,6 +5959,10 @@ int main(int argc, char *argv[])
 	res = mkdir(sshfsm.config_dir, S_IRUSR | S_IWUSR | S_IXUSR);
 	if (res == -1 && errno != EEXIST)
 		fatal(1, "failed to create directory \"%s\"", sshfsm.config_dir);
+	if (sshfsm.psk_path)
+		sshfsm.psk_path = g_strdup_and_free(sshfsm.psk_path);
+	else
+		sshfsm.psk_path = g_strdup_printf("%s/key", sshfsm.config_dir);
 
 	if (sshfsm.sftp_proxy == 1) {
 		sftp_proxy_init();
@@ -6072,8 +6029,7 @@ int main(int argc, char *argv[])
 
 	ssh_add_arg(sftp_server);
 
-	res = cache_parse_options(&args);
-	if (res == -1)
+	if (cache_parse_options(&args) == -1)
 		exit(1);
 
 	sshfsm.randseed = time(0);
@@ -6172,11 +6128,8 @@ int main(int argc, char *argv[])
 			res = fuse_loop_mt(fuse);
 		else
 			res = fuse_loop(fuse);
-
-		if (res == -1)
-			res = 1;
-		else
-			res = 0;
+		
+		res = res == -1 ? 1 : 0;
 
 		fuse_remove_signal_handlers(fuse_get_session(fuse));
 		fuse_unmount(mountpoint, ch);
