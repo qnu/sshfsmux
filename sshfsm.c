@@ -5452,6 +5452,7 @@ static void usage(const char *progname)
 "    -o delay_connect       delay connection to server\n"
 "    -o sshfsm_sync         synchronous writes\n"
 "    -o no_readahead        synchronous reads (no speculative readahead)\n"
+"    -o sshfsm_debug        print some debugging information\n"
 "    -o cache=BOOL          enable caching {yes,no} (default: yes)\n"
 "    -o cache_timeout=N     sets timeout for caches in seconds (default: 20)\n"
 "    -o cache_X_timeout=N   sets timeout for {stat,dir,link} cache\n"
@@ -5482,9 +5483,8 @@ static void usage(const char *progname)
 "    -o no_check_root       don't check for existence of 'dir' on server\n"
 "    -o password_stdin      read password from stdin (only for pam_mount!)\n"
 "    -o SSHOPT=VAL          ssh options (see man ssh_config)\n"
-"    -o session_dir         session directory\n"
-"    -o sshfsm_debug        print some debugging information\n"
-"    -o dump                dump error/debug information to log file\n"
+"    -o session_dir=PATH    session directory\n"
+"    -o dump                dump error/debug messages to a log file\n"
 "\n", progname);
 }
 

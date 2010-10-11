@@ -21,11 +21,32 @@ equivalent to '\-o port=PORT'
 \fB\-C\fR
 equivalent to '\-o compression=yes'
 .TP
+\fB\-F\fR ssh_configfile
+specify alternative ssh configuration file
+.TP
 \fB\-1\fR
 equivalent to '\-o ssh_protocol=1'
 .TP
+\fB\-D\fR
+start sftp directport daemon for raw socket transferring
+.TP
+\fB\-o\fR backlog=N
+set number of allowed pending connections of sftp proxy
+.TP
+\fB\-o\fR psk=PATH
+specify path of pre-shared key of sftp proxy authentication
+.TP
+\fB\-o\fR sndbuf=N
+set send buffer size of raw socket transferring
+.TP
+\fB\-o\fR rcvbuf=N
+set receive buffer size of raw socket transferring
+.TP
 \fB\-o\fR reconnect
 reconnect to server
+.TP
+\fB\-o\fR delay_connect 
+delay connect to server
 .TP
 \fB\-o\fR sshfsm_sync
 synchronous writes
@@ -40,10 +61,10 @@ print some debugging information
 enable caching {yes,no} (default: yes)
 .TP
 \fB\-o\fR cache_timeout=N
-sets timeout for caches in seconds (default: 20)
+set timeout for caches in seconds (default: 20)
 .TP
 \fB\-o\fR cache_X_timeout=N
-sets timeout for {stat,dir,link} cache
+set timeout for {stat,dir,link} cache
 .TP
 \fB\-o\fR workaround=LIST
 colon separated list of workarounds
@@ -87,6 +108,18 @@ path to sftp server or subsystem (default: sftp)
 \fB\-o\fR directport=PORT
 directly connect to PORT bypassing ssh
 .TP
+\fB\-o\fR inaddr_ino
+set IP address in inode number
+.TP
+\fB\-o\fR inaddr_nth=N
+set the Nth IP address in piggybacking
+.TP
+\fB\-o\fR forward=PATH
+specify the destination path of forwarded I/O
+.TP
+\fB\-o\fR forward_allow=N
+sepecify the number of hops to be allowed to forward
+.TP
 \fB\-o\fR transform_symlinks
 transform absolute symlinks to relative
 .TP
@@ -101,6 +134,12 @@ read password from stdin (only for pam_mount!)
 .TP
 \fB\-o\fR SSHOPT=VAL
 ssh options (see man ssh_config)
+.TP
+\fB\-o\fR session_dir=PATH
+set session directory of SSHFSM
+.TP
+\fB\-o\fR dump
+dum error/debug messages to a log file
 .SS "FUSE options:"
 .TP
 \fB\-d\fR   \fB\-o\fR debug
@@ -195,6 +234,15 @@ perform reads asynchronously (default)
 .TP
 \fB\-o\fR sync_read
 perform reads synchronously
+.TP
+\fB\-o\fR atomic_o_trunc
+enable atomic open+truncate support
+.TP
+\fB\-o\fR big_writes
+enable larger than 4KB writes
+.TP
+\fB\-o\fR no_remote_lock
+disable remote file locking
 .SS "Module options:"
 .TP 
 [subdir]
