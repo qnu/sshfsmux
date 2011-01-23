@@ -3268,11 +3268,24 @@ static int sshfsm_unlink(const char *path)
 	
 	int err = 0, err2, err3 = 1, firsterr = 0;
 	unsigned int i, nthreads;
+	GPtrArray *serv_arr;
+	serv_t serv;
+
+	serv_arr = get_serv_arr(tree_lookup(path));
+	for (i = 0; i < serv_arr->len; i++) {
+		serv = g_ptr_array_index(serv_arr, i);
+		err = serv_unlink(serv, path);
+		if (!err)
+			return err;
+		if (!firsterr)
+			firsterr = err;
+	}
+	return firsterr;
+
+#if 0
 	pthread_t *threads;
 	pthread_attr_t attr;
 	struct unlink_thread_data *thread_dat;
-	GPtrArray *serv_arr;
-	
 	serv_arr = get_serv_arr(tree_lookup(path));
 	nthreads = serv_arr->len;
 	pthread_attr_init(&attr);
@@ -3310,6 +3323,7 @@ out:
 	g_free(thread_dat);
 	g_free(threads);
 	return err;
+#endif
 }
 
 /* rmdir */
@@ -3847,7 +3861,7 @@ static int sshfsm_utime(const char *path, struct utimbuf *ubuf)
 	int err = 0, firsterr = 0;
 
 	for (i = 0; i < serv_arr->len; i++) {
-		serv = g_ptr_array_index(serv_arr, 0);
+		serv = g_ptr_array_index(serv_arr, i);
 		err = serv_utime(serv, path, ubuf);
 		if (!err)
 			return err;
