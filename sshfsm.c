@@ -3248,30 +3248,16 @@ static int serv_unlink(serv_t serv, const char *path)
 	return serv->local ? unlink_local(serv, path) : unlink_remote(serv, path);
 }
 
-struct unlink_thread_data {
-	serv_t serv;
-	const char *path;
-	int err;
-};
-
-static void * unlink_thread_func(void *data)
-{
-	struct unlink_thread_data *p = (struct unlink_thread_data *) data;
-	p->err = serv_unlink(p->serv, p->path);
-	p->err ? pthread_exit((void *) -1) : pthread_exit((void *) 0);
-}
-
 static int sshfsm_unlink(const char *path)
 {
 	if (serv_num == 1)
 		return serv_unlink(serv_0, path);
 	
-	int err = 0, err2, err3 = 1, firsterr = 0;
-	unsigned int i, nthreads;
-	GPtrArray *serv_arr;
+	int err = 0, firsterr = 0;
+	unsigned int i;
 	serv_t serv;
 
-	serv_arr = get_serv_arr(tree_lookup(path));
+	GPtrArray *serv_arr = get_serv_arr(tree_lookup(path));
 	for (i = 0; i < serv_arr->len; i++) {
 		serv = g_ptr_array_index(serv_arr, i);
 		err = serv_unlink(serv, path);
@@ -3281,49 +3267,6 @@ static int sshfsm_unlink(const char *path)
 			firsterr = err;
 	}
 	return firsterr;
-
-#if 0
-	pthread_t *threads;
-	pthread_attr_t attr;
-	struct unlink_thread_data *thread_dat;
-	serv_arr = get_serv_arr(tree_lookup(path));
-	nthreads = serv_arr->len;
-	pthread_attr_init(&attr);
-	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-	thread_dat = g_new0(struct unlink_thread_data, serv_arr->len);
-	threads = g_new(pthread_t, serv_arr->len);
-	
-	for (i = 0; i < nthreads; i++) {
-		thread_dat[i].serv = g_ptr_array_index(serv_arr, i);
-		thread_dat[i].path = path;
-		err = pthread_create(&threads[i], &attr,
-				unlink_thread_func, &thread_dat[i]);
-		if (err) {
-			error2(err, "sshfsm_unlink: create thread failed"); 
-			err = -EIO;
-			goto out;
-		}
-	}
-	
-	for (i = 0; i < nthreads; i++) {
-		err = pthread_join(threads[i], (void *) &err2);
-		if (err) {
-			error2(err, "sshfsm_unlink: join thread failed");
-			err = -EIO;
-			goto out;
-		}
-		if (!firsterr)
-			firsterr = thread_dat[i].err;
-		err3 *= err2;
-	}
-	err = err3 ? firsterr : 0;
-
-out:
-	pthread_attr_destroy(&attr);
-	g_free(thread_dat);
-	g_free(threads);
-	return err;
-#endif
 }
 
 /* rmdir */
